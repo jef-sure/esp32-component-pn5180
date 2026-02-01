@@ -634,6 +634,11 @@ static nfc_uids_array_t *pn5180_14443_get_all_uids(pn5180_t *pn5180)
         uint8_t sak;
         if (pn5180_14443_resolve_full_uid_cascade(pn5180, full_uid, &full_uid_len, &sak)) {
             ESP_LOGI(TAG, "Found Card %d: UID Len %d", ++card_count, full_uid_len);
+            uint32_t agc_reg     = 0;
+            uint16_t current_agc = 0;
+            if (pn5180_readRegister(pn5180, RF_STATUS, &agc_reg)) {
+                current_agc = (uint16_t)(agc_reg & RF_STATUS_AGC_MASK);
+            }
             if (uids == NULL) {
                 uids = calloc(1, sizeof(nfc_uids_array_t));
                 if (uids == NULL) {
@@ -643,7 +648,7 @@ static nfc_uids_array_t *pn5180_14443_get_all_uids(pn5180_t *pn5180)
                     uids->uids_count         = 1;
                     uids->uids[0].uid_length = full_uid_len;
                     uids->uids[0].sak        = sak;
-                    uids->uids[0].agc        = 0;
+                    uids->uids[0].agc        = current_agc;
                     uids->uids[0].subtype    = PN5180_MIFARE_UNKNOWN;
                     memcpy(uids->uids[0].uid, full_uid, full_uid_len);
                 }
@@ -656,7 +661,7 @@ static nfc_uids_array_t *pn5180_14443_get_all_uids(pn5180_t *pn5180)
                     uids                                    = new_uids;
                     uids->uids[uids->uids_count].uid_length = full_uid_len;
                     uids->uids[uids->uids_count].sak        = sak;
-                    uids->uids[uids->uids_count].agc        = 0;
+                    uids->uids[uids->uids_count].agc        = current_agc;
                     uids->uids[uids->uids_count].subtype    = PN5180_MIFARE_UNKNOWN;
                     memcpy(uids->uids[uids->uids_count].uid, full_uid, full_uid_len);
                     uids->uids_count++;
