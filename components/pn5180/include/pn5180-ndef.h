@@ -114,8 +114,16 @@ bool ndef_message_add(ndef_message_t *msg, const ndef_record_t *rec);
  * @param payload Pointer to payload bytes
  * @param payload_len Length of payload
  */
-void ndef_record_init(ndef_record_t *rec, ndef_tnf_t tnf, const uint8_t *type, uint8_t type_len, const uint8_t *id, uint8_t id_len, const uint8_t *payload,
-                      uint32_t payload_len);
+void ndef_record_init(         //
+    ndef_record_t *rec,        //
+    ndef_tnf_t     tnf,        //
+    const uint8_t *type,       //
+    uint8_t        type_len,   //
+    const uint8_t *id,         //
+    uint8_t        id_len,     //
+    const uint8_t *payload,    //
+    uint32_t       payload_len //
+);
 
 /**
  * @brief Encode NDEF message to binary format
@@ -146,8 +154,15 @@ size_t ndef_encode_message(const ndef_message_t *msg, uint8_t *out, size_t out_l
  * @param payload_buf_len Size of payload buffer
  * @return true on success, false on failure
  */
-bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len, bool utf16, uint8_t *payload_buf,
-                           size_t payload_buf_len);
+bool ndef_make_text_record(        //
+    ndef_record_t *rec,            //
+    const char    *lang_code,      //
+    const uint8_t *text,           //
+    size_t         text_len,       //
+    bool           utf16,          //
+    uint8_t       *payload_buf,    //
+    size_t         payload_buf_len //
+);
 
 /**
  * @brief Build Well-known RTD URI record (TNF=Well-known, Type="U")
@@ -252,9 +267,16 @@ typedef int (*ndef_sector_id_callback_t)(int blockno, void *user_ctx);
  * @return NDEF_OK on success, error code on failure
  * @note Caller must free using ndef_free_parsed_message()
  */
-ndef_result_t ndef_read_from_selected_card(struct _pn5180_proto_t *proto, int start_block, int block_size, int max_blocks,
-                                           ndef_auth_callback_t auth_cb, ndef_sector_id_callback_t sector_cb, void *auth_ctx,
-                                           ndef_message_parsed_t **out_msg);
+ndef_result_t ndef_read_from_selected_card( //
+    struct _pn5180_proto_t   *proto,        //
+    int                       start_block,  //
+    int                       block_size,   //
+    int                       max_blocks,   //
+    ndef_auth_callback_t      auth_cb,      //
+    ndef_sector_id_callback_t sector_cb,    //
+    void                     *auth_ctx,     //
+    ndef_message_parsed_t   **out_msg       //
+);
 
 /**
  * @brief Write NDEF message to an already selected NFC card

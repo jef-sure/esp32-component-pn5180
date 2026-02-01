@@ -194,7 +194,9 @@ void read_ndef_message(pn5180_proto_t *proto)
     int block_size  = 16;  // 16 for MIFARE, 4 for ISO15693
 
     ndef_message_parsed_t *msg = NULL;
-    ndef_result_t result = ndef_read_from_selected_card(proto, start_block, block_size, 0, &msg);
+    // auth_cb + sector_cb are optional (NULL if not needed)
+    ndef_result_t result = ndef_read_from_selected_card(proto, start_block, block_size, 0,
+                                                        NULL, NULL, NULL, &msg);
 
     if (result != NDEF_OK || !msg) {
         ESP_LOGE(TAG, "NDEF read failed: %s", ndef_result_to_string(result));
@@ -264,9 +266,9 @@ void read_ndef_message(pn5180_proto_t *proto)
 - **Error handling**: The component detects RX errors (protocol/CRC/collision) and returns failure without automatic retries. Implement retries in your application.
 
 - **MIFARE Classic authentication**:
-  - After auth failure, you must HALT and re-select the card before retrying
-  - Use `proto->halt(proto)` followed by `proto->select_by_uid(proto, uid)`
-  - Authentication is per-sector; re-authenticate when crossing sector boundaries
+    - Authentication is per-sector; re-authenticate when crossing sector boundaries
+    - After auth failure, re-select the card before retrying
+    - Some tags/readers may require a HALT before re-select; apply only on failure if needed
 
 - **CRC policy (ISO14443A)**: Anticollision runs with CRC disabled; SELECT uses CRC enabled. After SELECT, CRC remains enabled.
 
@@ -281,8 +283,8 @@ void read_ndef_message(pn5180_proto_t *proto)
 | Issue | Solution |
 |-------|----------|
 | No cards detected | Check wiring, ensure 3.3V supply, verify RF field is on |
-| Auth timeout after first block | HALT and re-select before authenticating new sector |
-| WUPA timeout | Call `proto->halt()` before `select_by_uid()` |
+| Auth timeout after first block | Re-authenticate on sector change; re-select on auth failure |
+| WUPA timeout | Try HALT then re-select (only if selection fails) |
 | Corrupted reads | Check SPI wiring, reduce frequency, add decoupling capacitors |
 | WDT reset during multi-sector read | Add `vTaskDelay(pdMS_TO_TICKS(10))` between operations |
 
