@@ -18,7 +18,7 @@
 #include <stdint.h>
 
 /** @brief Enable debug logging for PN5180 component (comment out to disable) */
-#define PN5180_DEBUG
+// #define PN5180_DEBUG
 
 #ifdef PN5180_DEBUG
 /** @brief Debug log macro (enabled when PN5180_DEBUG is defined) */
