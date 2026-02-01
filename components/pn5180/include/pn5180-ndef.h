@@ -209,6 +209,31 @@ typedef struct
 } ndef_message_parsed_t;
 
 /**
+ * @brief Optional authentication callback used during NDEF read
+ *
+ * This callback is invoked before each block read. It can perform
+ * card-specific authentication (e.g., MIFARE Classic sector auth).
+ *
+ * @param proto Pointer to protocol interface
+ * @param blockno Block number that will be read next
+ * @param user_ctx User context pointer
+ * @return true to continue reading, false to abort
+ */
+typedef bool (*ndef_auth_callback_t)(struct _pn5180_proto_t *proto, int blockno, void *user_ctx);
+
+/**
+ * @brief Optional sector ID callback used to detect sector boundaries
+ *
+ * Returns a sector identifier for a given block. When provided, the
+ * auth callback is invoked only when the sector ID changes.
+ *
+ * @param blockno Block number that will be read next
+ * @param user_ctx User context pointer
+ * @return Sector identifier (any stable integer per sector)
+ */
+typedef int (*ndef_sector_id_callback_t)(int blockno, void *user_ctx);
+
+/**
  * @brief Read NDEF message from an already selected NFC card
  *
  * Reads blocks from card until complete NDEF TLV is found, allocates memory
@@ -220,11 +245,16 @@ typedef struct
  * @param start_block Starting block number for NDEF data
  * @param block_size Size of each block in bytes
  * @param max_blocks Maximum blocks to read (0 = no limit, uses default 256)
+ * @param auth_cb Optional authentication callback (can be NULL)
+ * @param sector_cb Optional sector ID callback for auth throttling (can be NULL)
+ * @param auth_ctx User context pointer passed to auth/sector callbacks (can be NULL)
  * @param out_msg Pointer to receive parsed message pointer
  * @return NDEF_OK on success, error code on failure
  * @note Caller must free using ndef_free_parsed_message()
  */
-ndef_result_t ndef_read_from_selected_card(struct _pn5180_proto_t *proto, int start_block, int block_size, int max_blocks, ndef_message_parsed_t **out_msg);
+ndef_result_t ndef_read_from_selected_card(struct _pn5180_proto_t *proto, int start_block, int block_size, int max_blocks,
+                                           ndef_auth_callback_t auth_cb, ndef_sector_id_callback_t sector_cb, void *auth_ctx,
+                                           ndef_message_parsed_t **out_msg);
 
 /**
  * @brief Write NDEF message to an already selected NFC card

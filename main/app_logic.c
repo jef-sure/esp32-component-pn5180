@@ -24,10 +24,6 @@
 
 static const char *TAG = "main";
 
-// Static globals for MIFARE Classic transparent authentication
-static nfc_uid_t         *g_current_uid      = NULL;
-static func_block_read_t *g_original_read    = NULL;
-static int                g_last_auth_sector = -1;
 
 enum
 {
@@ -117,6 +113,35 @@ static int get_sector_first_block(nfc_type_t subtype, int sector)
     }
 }
 
+typedef enum
+{
+    AUTH_RESULT_OK,
+    AUTH_RESULT_FAIL,
+    AUTH_RESULT_NO_CARD,
+} auth_result_t;
+
+static auth_result_t authenticate_sector_with_key(pn5180_proto_t *proto, nfc_uid_t *uid, int sector_block, const uint8_t *key, uint8_t key_type)
+{
+    if (!proto || !proto->authenticate) return AUTH_RESULT_FAIL;
+
+    // Feed WDT before potentially long operations
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // Try AUTH first; only reselect and retry on failure.
+    if (proto->authenticate(proto, key, key_type, uid, sector_block)) {
+        return AUTH_RESULT_OK;
+    }
+
+    if (proto->select_by_uid) {
+        if (!proto->select_by_uid(proto, uid)) {
+            return AUTH_RESULT_NO_CARD;
+        }
+        return proto->authenticate(proto, key, key_type, uid, sector_block) ? AUTH_RESULT_OK : AUTH_RESULT_FAIL;
+    }
+
+    return AUTH_RESULT_FAIL;
+}
+
 static bool authenticate_sector(pn5180_proto_t *proto, nfc_uid_t *uid, int sector_block)
 {
     if (proto->authenticate == NULL) {
@@ -126,54 +151,46 @@ static bool authenticate_sector(pn5180_proto_t *proto, nfc_uid_t *uid, int secto
     // Iterate through known keys to find a match
     for (size_t ki = 0; ki < ARRAY_SIZE(mifare_keys); ki++) {
         for (size_t kt = 0; kt < ARRAY_SIZE(key_types); kt++) {
-
-            // Feed WDT at start of iteration
-            vTaskDelay(pdMS_TO_TICKS(10));
-
-            // CRITICAL: Ensure card is in Selected state before every Authentication attempt.
-            // MIFARE Classic requires the AUTH command to immediately follow selection (or previous valid command).
-            // Any intervening operations (like failed reads or previous failed auths) can break the state.
-
-            // Clean state transition: HALT before Re-Selecting ensures WUPA works reliably
-            if (proto->halt) {
-                proto->halt(proto);
-            }
-
-            if (proto->select_by_uid && !proto->select_by_uid(proto, uid)) {
-                // If we can't select, we certainly can't authenticate.
-                continue;
-            }
-
-            if (proto->authenticate(proto, mifare_keys[ki], key_types[kt], uid, sector_block)) {
+            auth_result_t result = authenticate_sector_with_key(proto, uid, sector_block, mifare_keys[ki], key_types[kt]);
+            if (result == AUTH_RESULT_OK) {
                 int sector = get_sector_from_block(uid->subtype, sector_block);
-                ESP_LOGI(TAG, "Sector %2d authenticated with key %zu (%s)", sector, ki, (key_types[kt] == MIFARE_CLASSIC_KEYA) ? "KeyA" : "KeyB");
+                ESP_LOGI(TAG, "Sector %2d authenticated with key %zu (%s)", sector, ki,
+                         (key_types[kt] == MIFARE_CLASSIC_KEYA) ? "KeyA" : "KeyB");
                 return true;
             }
-            // If auth failed, loop continues. We must Re-Select in the next iteration.
+            if (result == AUTH_RESULT_NO_CARD) {
+                return false;
+            }
         }
     }
     return false;
 }
 
-// Wrapper to transparently authenticate sectors during NDEF read
-static bool smart_block_read(struct _pn5180_proto_t *proto, int blockno, uint8_t *buffer, size_t buffer_len)
+typedef struct
 {
-    if (g_current_uid && requires_authentication(g_current_uid->subtype)) {
-        int sector = get_sector_from_block(g_current_uid->subtype, blockno);
-        if (sector != g_last_auth_sector) {
-            int sector_block = get_sector_first_block(g_current_uid->subtype, sector);
-            if (authenticate_sector(proto, g_current_uid, sector_block)) {
-                g_last_auth_sector = sector;
-            } else {
-                ESP_LOGE(TAG, "SmartRead: Failed to authenticate sector %d", sector);
-                return false;
-            }
-        }
+    nfc_uid_t *uid;
+} ndef_auth_ctx_t;
+
+static bool ndef_auth_callback(pn5180_proto_t *proto, int blockno, void *user_ctx)
+{
+    ndef_auth_ctx_t *ctx = (ndef_auth_ctx_t *)user_ctx;
+    if (!ctx || !ctx->uid) return true;
+    if (!requires_authentication(ctx->uid->subtype)) return true;
+
+    int sector = get_sector_from_block(ctx->uid->subtype, blockno);
+    int sector_block = get_sector_first_block(ctx->uid->subtype, sector);
+    if (!authenticate_sector(proto, ctx->uid, sector_block)) {
+        ESP_LOGE(TAG, "NDEF auth: Failed to authenticate sector %d", sector);
+        return false;
     }
-    if (g_original_read) {
-        return g_original_read(proto, blockno, buffer, buffer_len);
-    }
-    return false;
+    return true;
+}
+
+static int ndef_sector_id_callback(int blockno, void *user_ctx)
+{
+    ndef_auth_ctx_t *ctx = (ndef_auth_ctx_t *)user_ctx;
+    if (!ctx || !ctx->uid) return blockno;
+    return get_sector_from_block(ctx->uid->subtype, blockno);
 }
 
 static void print_block_data(int block, const uint8_t *data, int size)
@@ -277,20 +294,13 @@ static void process_card(pn5180_proto_t *proto, nfc_uid_t *uid)
 
     int start_block = (uid->subtype == PN5180_15693) ? 1 : 4;
 
-    // Set up smart reader context
-    g_current_uid      = uid;
-    g_original_read    = proto->block_read;
-    g_last_auth_sector = -1;
-    // Swap reader
-    proto->block_read = smart_block_read;
+    ndef_auth_ctx_t auth_ctx = {
+        .uid = uid,
+    };
 
     ndef_message_parsed_t *msg;
-    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 256 /* NDEF_DEFAULT_MAX_BLOCKS*/, &msg);
-
-    // Restore reader
-    proto->block_read = g_original_read;
-    g_original_read   = NULL;
-    g_current_uid     = NULL;
+    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 256 /* NDEF_DEFAULT_MAX_BLOCKS*/,
+                                                                 ndef_auth_callback, ndef_sector_id_callback, &auth_ctx, &msg);
 
     if (result != NDEF_OK) {
         ESP_LOGE(TAG, "Failed to read NDEF message");

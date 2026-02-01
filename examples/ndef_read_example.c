@@ -21,7 +21,7 @@ void example_read_ndef_from_card(pn5180_proto_t *proto)
     ESP_LOGI(TAG, "Reading NDEF message from card...");
 
     ndef_message_parsed_t *msg    = NULL;
-    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 0, &msg);
+    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 0, NULL, NULL, NULL, &msg);
 
     if (result != NDEF_OK || !msg) {
         ESP_LOGE(TAG, "Failed to read NDEF message: %s", ndef_result_to_string(result));
@@ -130,7 +130,7 @@ void example_read_ndef_from_type5(pn5180_proto_t *proto)
     ESP_LOGI(TAG, "Reading NDEF message from Type 5 tag...");
 
     ndef_message_parsed_t *msg    = NULL;
-    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 0, &msg);
+    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 0, NULL, NULL, NULL, &msg);
 
     if (result != NDEF_OK || !msg) {
         ESP_LOGE(TAG, "Failed to read NDEF message from Type 5 tag: %s", ndef_result_to_string(result));

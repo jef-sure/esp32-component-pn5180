@@ -345,7 +345,16 @@ static size_t ndef_count_records(const uint8_t *data, size_t data_len)
 #define NDEF_DEFAULT_MAX_BLOCKS 256
 #define INIT_SIZES_COUNT        (sizeof(init_sizes) / sizeof(init_sizes[0]))
 
-ndef_result_t ndef_read_from_selected_card(pn5180_proto_t *proto, int start_block, int block_size, int max_blocks, ndef_message_parsed_t **out_msg)
+ndef_result_t ndef_read_from_selected_card( //
+    pn5180_proto_t           *proto,        //
+    int                       start_block,  //
+    int                       block_size,   //
+    int                       max_blocks,   //
+    ndef_auth_callback_t      auth_cb,      //
+    ndef_sector_id_callback_t sector_cb,    //
+    void                     *auth_ctx,     //
+    ndef_message_parsed_t   **out_msg       //
+)
 {
     if (!proto || !proto->block_read || block_size <= 0 || !out_msg) {
         return NDEF_ERR_INVALID_PARAM;
@@ -375,6 +384,9 @@ ndef_result_t ndef_read_from_selected_card(pn5180_proto_t *proto, int start_bloc
     bool   found   = false;
     bool   read_ok = true;
 
+    bool have_last_sector = false;
+    int  last_sector_id   = 0;
+
     for (int block = start_block; block - start_block < block_limit; block++) {
         if (len + block_size > capacity) {
             capacity *= 2;
@@ -384,6 +396,23 @@ ndef_result_t ndef_read_from_selected_card(pn5180_proto_t *proto, int start_bloc
                 return NDEF_ERR_NO_MEMORY;
             }
             buf = new_buf;
+        }
+
+        if (auth_cb) {
+            bool call_auth = true;
+            if (sector_cb) {
+                int sector_id = sector_cb(block, auth_ctx);
+                if (have_last_sector && sector_id == last_sector_id) {
+                    call_auth = false;
+                } else {
+                    have_last_sector = true;
+                    last_sector_id   = sector_id;
+                }
+            }
+            if (call_auth && !auth_cb(proto, block, auth_ctx)) {
+                read_ok = false;
+                break;
+            }
         }
 
         if (!proto->block_read(proto, block, buf + len, block_size)) {
