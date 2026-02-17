@@ -57,3 +57,6 @@ build/
 sdkconfig.old
 .vscode/settings.json
 .vscode/c_cpp_properties.json
+dist/
+**/dist/
+*.old
