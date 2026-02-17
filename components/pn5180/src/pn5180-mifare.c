@@ -36,7 +36,7 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
     }
 
     if (rxStatus & (RX_PROTOCOL_ERROR | RX_DATA_INTEGRITY_ERROR)) {
-        ESP_LOGD(TAG, "RX error during MIFARE block %d read (RX_STATUS=0x%08lX)", blockno, rxStatus);
+        PN5180_LOGD(TAG, "RX error during MIFARE block %d read (RX_STATUS=0x%08lX)", blockno, rxStatus);
         pn5180_clearAllIRQs(pn5180);
         return false;
     }

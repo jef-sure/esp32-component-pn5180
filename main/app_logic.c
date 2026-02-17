@@ -24,7 +24,6 @@
 
 static const char *TAG = "main";
 
-
 enum
 {
     PN5180_RST  = GPIO_NUM_12,
@@ -154,8 +153,7 @@ static bool authenticate_sector(pn5180_proto_t *proto, nfc_uid_t *uid, int secto
             auth_result_t result = authenticate_sector_with_key(proto, uid, sector_block, mifare_keys[ki], key_types[kt]);
             if (result == AUTH_RESULT_OK) {
                 int sector = get_sector_from_block(uid->subtype, sector_block);
-                ESP_LOGI(TAG, "Sector %2d authenticated with key %zu (%s)", sector, ki,
-                         (key_types[kt] == MIFARE_CLASSIC_KEYA) ? "KeyA" : "KeyB");
+                ESP_LOGI(TAG, "Sector %2d authenticated with key %zu (%s)", sector, ki, (key_types[kt] == MIFARE_CLASSIC_KEYA) ? "KeyA" : "KeyB");
                 return true;
             }
             if (result == AUTH_RESULT_NO_CARD) {
@@ -177,7 +175,7 @@ static bool ndef_auth_callback(pn5180_proto_t *proto, int blockno, void *user_ct
     if (!ctx || !ctx->uid) return true;
     if (!requires_authentication(ctx->uid->subtype)) return true;
 
-    int sector = get_sector_from_block(ctx->uid->subtype, blockno);
+    int sector       = get_sector_from_block(ctx->uid->subtype, blockno);
     int sector_block = get_sector_first_block(ctx->uid->subtype, sector);
     if (!authenticate_sector(proto, ctx->uid, sector_block)) {
         ESP_LOGE(TAG, "NDEF auth: Failed to authenticate sector %d", sector);
@@ -299,8 +297,8 @@ static void process_card(pn5180_proto_t *proto, nfc_uid_t *uid)
     };
 
     ndef_message_parsed_t *msg;
-    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 256 /* NDEF_DEFAULT_MAX_BLOCKS*/,
-                                                                 ndef_auth_callback, ndef_sector_id_callback, &auth_ctx, &msg);
+    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 256 /* NDEF_DEFAULT_MAX_BLOCKS*/, ndef_auth_callback,
+                                                                 ndef_sector_id_callback, &auth_ctx, &msg);
 
     if (result != NDEF_OK) {
         ESP_LOGE(TAG, "Failed to read NDEF message");
@@ -435,20 +433,6 @@ static void scan_protocol(pn5180_proto_t *proto, const char *label, uint8_t rf_c
     free(uids);
 }
 
-static void scan_loop(pn5180_proto_t *proto_14443, pn5180_proto_t *proto_15693)
-{
-    while (true) {
-        ESP_LOGD(TAG, "Free heap before scanning: %lu", esp_get_free_heap_size());
-
-        scan_protocol(proto_14443, "ISO14443A", 0x00);
-        scan_protocol(proto_15693, "ISO15693", PN5180_15693_26KASK100);
-
-        pn5180_delay_ms(2000);
-        ESP_LOGD(TAG, "Free heap after scanning: %lu", esp_get_free_heap_size());
-        assert(heap_caps_check_integrity_all(true));
-    }
-}
-
 void app_run(void)
 {
     pn5180_t *pn5180 = NULL;
@@ -473,5 +457,10 @@ void app_run(void)
     }
     ESP_LOGI(TAG, "ISO15693 protocol initialized successfully");
 
-    scan_loop(proto_14443, proto_15693);
+    while (true) {
+        scan_protocol(proto_14443, "ISO14443A", 0x00);
+        scan_protocol(proto_15693, "ISO15693", PN5180_15693_26KASK100);
+
+        pn5180_delay_ms(2000);
+    }
 }

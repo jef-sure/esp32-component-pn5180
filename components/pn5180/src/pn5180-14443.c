@@ -157,7 +157,7 @@ static bool _pn5180_14443_authenticate( //
 
     // Check authentication status (0x00 = success)
     if (auth_result != 0x00) {
-        ESP_LOGD(TAG, "MIFARE authentication rejected (status: 0x%02X)", auth_result);
+        PN5180_LOGD(TAG, "MIFARE authentication rejected (status: 0x%02X)", auth_result);
         // On failed authentication, disable Crypto1 and reset to clean state
         pn5180_writeRegisterWithAndMask(proto->pn5180, SYSTEM_CONFIG,
                                         SYSTEM_CONFIG_CLEAR_CRYPTO_MASK); // Clear MFC_CRYPTO_ON
@@ -991,7 +991,7 @@ static bool pn5180_iso14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_
 
     if (sw1 == 0x90 && sw2 == 0x00) return true;
 
-    ESP_LOGD(TAG, "Select failed with SW: %02X %02X", sw1, sw2);
+    PN5180_LOGD(TAG, "Select failed with SW: %02X %02X", sw1, sw2);
     return false;
 }
 
