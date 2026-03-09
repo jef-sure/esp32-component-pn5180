@@ -1,6 +1,8 @@
 #include "pn5180-mifare.h"
 #include "esp_log.h"
 #include "pn5180-internal.h"
+#include <string.h>
+#include <inttypes.h>
 
 static const char *TAG = "pn5180-mifare";
 

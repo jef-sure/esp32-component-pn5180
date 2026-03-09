@@ -363,7 +363,7 @@ static bool pn5180_14443_sendSelect(pn5180_t *pn5180, int cascade_level, uint8_t
     }
     uint32_t rxLen = pn5180_rxBytesReceived(pn5180);
     if (rxLen != 1) {
-        ESP_LOGE(TAG, "SAK frame error: expected 1 byte, got %d", rxLen);
+        ESP_LOGE(TAG, "SAK frame error: expected 1 byte, got %" PRIu32, rxLen);
         pn5180_disable_crc(pn5180);
         return false;
     }
@@ -424,13 +424,13 @@ static bool pn5180_14443_resolve_collision(pn5180_t *pn5180, uint8_t cascadeLeve
         // Send anticollision command
         PN5180_LOGD(TAG, "Collision retry: sending %d bytes, %d bits in last byte", cmd_len, bits_in_last_byte);
         if (!pn5180_sendData(pn5180, cmd_buf, cmd_len, bits_in_last_byte)) {
-            ESP_LOGE(TAG, "Failed to send anticollision retry at level %d", cascadeLevel);
+            ESP_LOGE(TAG, "Failed to send anticollision retry at level %" PRIu8, cascadeLevel);
             return false;
         }
 
         // Wait for response
         if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT | IDLE_IRQ_STAT, "collision retry", &irqStatus)) {
-            ESP_LOGE(TAG, "Timeout in collision retry at level %d", cascadeLevel);
+            ESP_LOGE(TAG, "Timeout in collision retry at level %" PRIu8, cascadeLevel);
             return false;
         }
 
@@ -438,7 +438,7 @@ static bool pn5180_14443_resolve_collision(pn5180_t *pn5180, uint8_t cascadeLeve
         if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
             uint32_t newRxStatus;
             if (!pn5180_readRegister(pn5180, RX_STATUS, &newRxStatus)) {
-                ESP_LOGE(TAG, "Failed to read RX_STATUS in collision retry at level %d", cascadeLevel);
+                ESP_LOGE(TAG, "Failed to read RX_STATUS in collision retry at level %" PRIu8, cascadeLevel);
                 pn5180_clearAllIRQs(pn5180);
                 return false;
             }
@@ -450,7 +450,7 @@ static bool pn5180_14443_resolve_collision(pn5180_t *pn5180, uint8_t cascadeLeve
 
                 if (newRxLen > 0 && newRxLen <= 5) {
                     if (!pn5180_readData(pn5180, newRxLen, active_uid)) {
-                        ESP_LOGE(TAG, "Failed to read partial UID in retry at level %d", cascadeLevel);
+                        ESP_LOGE(TAG, "Failed to read partial UID in retry at level %" PRIu8, cascadeLevel);
                         pn5180_clearAllIRQs(pn5180);
                         return false;
                     }
@@ -477,7 +477,7 @@ static bool pn5180_14443_resolve_collision(pn5180_t *pn5180, uint8_t cascadeLeve
 
         if (!pn5180_readData(pn5180, rxLen, cmd_buf)) {
             pn5180_clearAllIRQs(pn5180);
-            ESP_LOGE(TAG, "Failed to read UID+BCC after collision resolution at level %d", cascadeLevel);
+            ESP_LOGE(TAG, "Failed to read UID+BCC after collision resolution at level %" PRIu8, cascadeLevel);
             return false;
         }
 
@@ -487,7 +487,7 @@ static bool pn5180_14443_resolve_collision(pn5180_t *pn5180, uint8_t cascadeLeve
         if (rxLen == 5) {
             uint8_t bcc = cmd_buf[0] ^ cmd_buf[1] ^ cmd_buf[2] ^ cmd_buf[3];
             if (bcc != cmd_buf[4]) {
-                ESP_LOGE(TAG, "BCC check failed after resolution at level %d", cascadeLevel);
+                ESP_LOGE(TAG, "BCC check failed after resolution at level %" PRIu8, cascadeLevel);
                 return false;
             }
             *uidLen = 4;
@@ -496,7 +496,7 @@ static bool pn5180_14443_resolve_collision(pn5180_t *pn5180, uint8_t cascadeLeve
         }
     }
 
-    ESP_LOGE(TAG, "Failed to resolve collision at level %d after %d attempts", cascadeLevel, collision_attempts);
+    ESP_LOGE(TAG, "Failed to resolve collision at level %" PRIu8 " after %" PRIu8 " attempts", cascadeLevel, collision_attempts);
     return false;
 }
 
@@ -508,17 +508,17 @@ static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascadeLe
     cmd_buf[0] = sel;
     cmd_buf[1] = nvb;
 
-    PN5180_LOGD(TAG, "Sending Anti-collision command for cascade level %d", cascadeLevel);
+    PN5180_LOGD(TAG, "Sending Anti-collision command for cascade level %" PRIu8, cascadeLevel);
     PN5180_LOGD(TAG, "Anti-collision: SEL=0x%02X NVB=0x%02X", sel, nvb);
     if (!pn5180_sendData(pn5180, cmd_buf, 2, 0)) {
-        ESP_LOGE(TAG, "Failed to send Anti-collision command at level %d", cascadeLevel);
+        ESP_LOGE(TAG, "Failed to send Anti-collision command at level %" PRIu8, cascadeLevel);
         return false;
     }
 
     // Wait for response
     uint32_t irqStatus;
     if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | IDLE_IRQ_STAT, "anticollision response", &irqStatus)) {
-        ESP_LOGE(TAG, "Timeout waiting for anticollision response at level %d", cascadeLevel);
+        ESP_LOGE(TAG, "Timeout waiting for anticollision response at level %" PRIu8, cascadeLevel);
         return false;
     }
 
@@ -526,14 +526,14 @@ static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascadeLe
     uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
     if (rxLen == 0 || rxLen > 10) {
         pn5180_clearAllIRQs(pn5180);
-        ESP_LOGE(TAG, "Invalid response length %d at level %d", rxLen, cascadeLevel);
+        ESP_LOGE(TAG, "Invalid response length %" PRIu16 " at level %" PRIu8, rxLen, cascadeLevel);
         return false;
     }
 
     // Read response
     if (!pn5180_readData(pn5180, rxLen, cmd_buf)) {
         pn5180_clearAllIRQs(pn5180);
-        ESP_LOGE(TAG, "Failed to read response at level %d", cascadeLevel);
+        ESP_LOGE(TAG, "Failed to read response at level %" PRIu8, cascadeLevel);
         return false;
     }
 
@@ -543,13 +543,13 @@ static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascadeLe
     if ((irqStatus & GENERAL_ERROR_IRQ_STAT) == 0) {
         // No collision - validate and return
         if (rxLen != 5) {
-            PN5180_LOGD(TAG, "Unexpected response length %d at level %d (expected 5)", rxLen, cascadeLevel);
+            PN5180_LOGD(TAG, "Unexpected response length %" PRIu16 " at level %" PRIu8 " (expected 5)", rxLen, cascadeLevel);
             return false;
         }
 
         uint8_t bcc = cmd_buf[0] ^ cmd_buf[1] ^ cmd_buf[2] ^ cmd_buf[3];
         if (bcc != cmd_buf[4]) {
-            ESP_LOGE(TAG, "BCC check failed at level %d", cascadeLevel);
+            ESP_LOGE(TAG, "BCC check failed at level %" PRIu8, cascadeLevel);
             return false;
         }
 
@@ -561,12 +561,12 @@ static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascadeLe
     // Collision detected - resolve it
     uint32_t rxStatus;
     if (!pn5180_readRegister(pn5180, RX_STATUS, &rxStatus) || 0 == (rxStatus & (RX_COLLISION_DETECTED | RX_PROTOCOL_ERROR | RX_DATA_INTEGRITY_ERROR))) {
-        ESP_LOGE(TAG, "Failed to read RX_STATUS at level %d", cascadeLevel);
+        ESP_LOGE(TAG, "Failed to read RX_STATUS at level %" PRIu8, cascadeLevel);
         return false;
     }
 
     uint8_t collisionPos = (rxStatus >> RX_COLL_POS_START) & RX_COLL_POS_MASK;
-    PN5180_LOGD(TAG, "Collision at level %d, bit position %d", cascadeLevel, collisionPos);
+    PN5180_LOGD(TAG, "Collision at level %" PRIu8 ", bit position %" PRIu8, cascadeLevel, collisionPos);
 
     // Copy received partial UID
     uint8_t active_uid[5] = {0};
@@ -587,11 +587,11 @@ static bool pn5180_14443_resolve_full_uid_cascade(pn5180_t *pn5180, uint8_t *ful
         uint8_t level_data[5]; // UID + BCC
         uint8_t len;
         if (!pn5180_14443_anticollision_level(pn5180, cascade_level, level_data, &len)) {
-            PN5180_LOGD(TAG, "Anticollision failed at level %d", cascade_level);
+            PN5180_LOGD(TAG, "Anticollision failed at level %" PRIu8, cascade_level);
             return false;
         }
         if (!pn5180_14443_sendSelect(pn5180, cascade_level, level_data, sak)) {
-            ESP_LOGE(TAG, "Select command failed at level %d", cascade_level);
+            ESP_LOGE(TAG, "Select command failed at level %" PRIu8, cascade_level);
             return false;
         }
         // SAK Bit 3 (0x04) indicates if another cascade level follows
