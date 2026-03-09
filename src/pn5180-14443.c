@@ -717,7 +717,7 @@ static bool pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, nfc_type_t 
     // Read response
     uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
     if (rxLen < 8 || !pn5180_readData(pn5180, 8, response)) {
-        PN5180_LOGD(TAG, "GET_VERSION read failed (rxLen=%d) - assuming standard Ultralight", rxLen);
+        PN5180_LOGD(TAG, "GET_VERSION read failed (rxLen=%" PRIu16 ") - assuming standard Ultralight", rxLen);
         pn5180_clearAllIRQs(pn5180);
         pn5180_disable_crc(pn5180);
         return true;
@@ -798,7 +798,7 @@ static bool pn5180_14443_sendRATS(pn5180_t *pn5180)
     uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
     if (rxLen > 0) {
         pn5180_readData(pn5180, rxLen, ats);
-        PN5180_LOGD(TAG, "Received ATS (%d bytes)", rxLen);
+        PN5180_LOGD(TAG, "Received ATS (%" PRIu16 " bytes)", rxLen);
         // We are now in ISO 14443-4 Layer 4
         pn5180->iso14443_block_number = 0;
         return true;

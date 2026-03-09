@@ -4,6 +4,7 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "pn5180-internal.h"
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -197,7 +198,7 @@ static bool pn5180_iso15693_send_inventory_cmd(pn5180_t *pn5180, bool single_slo
         PN5180_LOGD(TAG, "inventory: send failed");
         return false;
     }
-    PN5180_LOGD(TAG, "inventory: sent (%s) mask_len=%d val=%llx", single_slot ? "single-slot" : "16-slot", mask_len, mask_val);
+    PN5180_LOGD(TAG, "inventory: sent (%s) mask_len=%u val=%" PRIx64, single_slot ? "single-slot" : "16-slot", (unsigned)mask_len, mask_val);
     return true;
 }
 
@@ -257,8 +258,8 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, nfc_uids_array_
         bool     collision    = (rx_status & RX_COLLISION_DETECTED) != 0;
         bool     protocol_err = (rx_status & RX_PROTOCOL_ERROR) != 0;
 
-        PN5180_LOGD(TAG, "scan %d: rx_status=0x%08lx len=%d val=0x%llx collision=%d bytes=%u", scan_count, rx_status, current.len, current.val, collision,
-                    num_bytes);
+        PN5180_LOGD(TAG, "scan %d: rx_status=0x%08" PRIx32 " len=%u val=0x%" PRIx64 " collision=%d bytes=%u", scan_count, rx_status,
+                (unsigned)current.len, current.val, collision, (unsigned)num_bytes);
 
         if (collision) {
             // Check for "Noise" vs "Real Collision"
@@ -335,7 +336,7 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, nfc_uids_array_
                     uint32_t agc_reg = 0;
                     pn5180_readRegister(pn5180, RF_STATUS, &agc_reg);
                     uint16_t current_agc = (uint16_t)(agc_reg & RF_STATUS_AGC_MASK);
-                    ESP_LOGI(TAG, "AGC Value: %u", current_agc);
+                    ESP_LOGI(TAG, "AGC Value: %u", (unsigned)current_agc);
 
                     bool is_new = pn5180_iso15693_collect_uid(uids, uid_ptr, 8, current_agc);
                     if (is_new) {
@@ -519,7 +520,7 @@ static bool pn5180_iso15693_block_read(pn5180_t *pn5180, int blockno, uint8_t *b
         return false;
     }
     if (num_bytes < 2) {
-        PN5180_LOGD(TAG, "block_read: rx too short (%u)", num_bytes);
+        PN5180_LOGD(TAG, "block_read: rx too short (%u)", (unsigned)num_bytes);
         return false;
     }
 

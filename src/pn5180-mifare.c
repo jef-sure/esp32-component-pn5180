@@ -38,7 +38,7 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
     }
 
     if (rxStatus & (RX_PROTOCOL_ERROR | RX_DATA_INTEGRITY_ERROR)) {
-        PN5180_LOGD(TAG, "RX error during MIFARE block %d read (RX_STATUS=0x%08lX)", blockno, rxStatus);
+        PN5180_LOGD(TAG, "RX error during MIFARE block %d read (RX_STATUS=0x%08" PRIX32 ")", blockno, rxStatus);
         pn5180_clearAllIRQs(pn5180);
         return false;
     }
@@ -47,11 +47,11 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
     // TODO: If Ultralight field issues resurface, re-check whether some readers return
     // 16 bytes here with only the first 4 bytes valid and the trailing bytes undefined.
     if (rxLen != 16 && rxLen != 4) {
-        ESP_LOGE(TAG, "MIFARE block %d read returned incorrect length: %d (expected 16 for Classic or 4 for Ultralight)", blockno, rxLen);
+        ESP_LOGE(TAG, "MIFARE block %d read returned incorrect length: %u (expected 16 for Classic or 4 for Ultralight)", blockno, (unsigned)rxLen);
         pn5180_clearAllIRQs(pn5180);
         return false;
     } else {
-        PN5180_LOGD(TAG, "MIFARE block %d read returned %d bytes", blockno, rxLen);
+        PN5180_LOGD(TAG, "MIFARE block %d read returned %u bytes", blockno, (unsigned)rxLen);
     }
 
     uint8_t  temp_buffer[16];
@@ -64,7 +64,8 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
     }
 
     if (rxLen > buffer_len) {
-        PN5180_LOGD(TAG, "MIFARE block %d read returned %d bytes, but buffer is only %zu bytes, return required length", blockno, rxLen, buffer_len);
+        PN5180_LOGD(TAG, "MIFARE block %d read returned %u bytes, but buffer is only %zu bytes, return required length", blockno, (unsigned)rxLen,
+                    buffer_len);
         memcpy(buffer, temp_buffer, buffer_len);
     }
 
@@ -101,7 +102,7 @@ int pn5180_mifare_block_write(pn5180_t *pn5180, int blockno, const uint8_t *buff
 
     uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
     if (rxLen != 1) {
-        ESP_LOGE(TAG, "MIFARE block %d write ACK returned incorrect length: %d", blockno, rxLen);
+        ESP_LOGE(TAG, "MIFARE block %d write ACK returned incorrect length: %u", blockno, (unsigned)rxLen);
         pn5180_clearAllIRQs(pn5180);
         return -2;
     }
@@ -139,7 +140,7 @@ int pn5180_mifare_block_write(pn5180_t *pn5180, int blockno, const uint8_t *buff
 
     rxLen = pn5180_rxBytesReceived(pn5180);
     if (rxLen != 1) {
-        ESP_LOGE(TAG, "MIFARE block %d write final ACK returned incorrect length: %d", blockno, rxLen);
+        ESP_LOGE(TAG, "MIFARE block %d write final ACK returned incorrect length: %u", blockno, (unsigned)rxLen);
         pn5180_clearAllIRQs(pn5180);
         return -6;
     }

@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "pn5180-ndef.h"
 #include "pn5180.h"
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -36,9 +37,9 @@ void example_read_ndef_from_card(pn5180_proto_t *proto)
         ndef_record_t *rec = &msg->records[i];
 
         ESP_LOGI(TAG, "\nRecord %zu:", i + 1);
-        ESP_LOGI(TAG, "  TNF: 0x%02X", rec->tnf);
-        ESP_LOGI(TAG, "  Type length: %u", rec->type_len);
-        ESP_LOGI(TAG, "  Payload length: %u", rec->payload_len);
+        ESP_LOGI(TAG, "  TNF: 0x%02X", (unsigned)rec->tnf);
+        ESP_LOGI(TAG, "  Type length: %u", (unsigned)rec->type_len);
+        ESP_LOGI(TAG, "  Payload length: %" PRIu32, rec->payload_len);
 
         if (rec->type_len > 0) {
             ESP_LOG_BUFFER_HEX_LEVEL(TAG, rec->type, rec->type_len, ESP_LOG_INFO);

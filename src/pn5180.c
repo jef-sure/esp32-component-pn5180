@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "pn5180-internal.h"
+#include <inttypes.h>
 #include <string.h>
 
 // PN5180 1-Byte Direct Commands
@@ -557,7 +558,7 @@ bool pn5180_clearIRQStatus(pn5180_t *pn5180, uint32_t irqMask)
 {
     bool ret = pn5180_writeRegister(pn5180, IRQ_CLEAR, irqMask);
     if (!ret) {
-        ESP_LOGE(TAG, "Failed to clear IRQ status with mask 0x%" PRIu32 "08X", irqMask);
+        ESP_LOGE(TAG, "Failed to clear IRQ status with mask 0x%08" PRIX32, irqMask);
     }
     return ret;
 }
