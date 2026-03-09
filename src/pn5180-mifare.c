@@ -44,6 +44,8 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
     }
 
     uint16_t rxLen = rxStatus & RX_BYTES_RECEIVED_MASK;
+    // TODO: If Ultralight field issues resurface, re-check whether some readers return
+    // 16 bytes here with only the first 4 bytes valid and the trailing bytes undefined.
     if (rxLen != 16 && rxLen != 4) {
         ESP_LOGE(TAG, "MIFARE block %d read returned incorrect length: %d (expected 16 for Classic or 4 for Ultralight)", blockno, rxLen);
         pn5180_clearAllIRQs(pn5180);

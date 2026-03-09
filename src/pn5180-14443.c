@@ -920,11 +920,15 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
             // It is an I-Block.
             // Toggle local block number ONLY if the received block number matches what we sent?
             // Standard says: Acknowledge valid I-Block by toggle.
+            // TODO: If Type 4 or DESFire exchange issues are ever reported, validate the
+            // received block number before toggling the local sequence bit.
             pn5180->iso14443_block_number = !pn5180->iso14443_block_number;
         } else if ((rx_pcb & 0xC0) == 0x80) {
             // R-Block (ACK/NAK)
             // If we receive an ACK, we might need to retransmit or fetch next.
             // This simple implementation does not handle chaining/retries yet.
+            // TODO: If Layer 4 communication becomes flaky, implement R-Block handling
+            // instead of treating every R-Block as a hard failure.
             ESP_LOGW(TAG, "Received R-Block (0x%02X), not fully supported", rx_pcb);
             // We can treat it as failure for now or try to extract data if any.
             // R-Block has no INF usually.
@@ -933,6 +937,8 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
             // S-Block (WTX, DESELECT)
             // WTX is crucial for slow operations.
             if ((rx_pcb & 0x30) == 0x30) { // WTX
+                // TODO: If cards request more processing time in the field, implement WTX
+                // response handling here instead of failing the transaction.
                 ESP_LOGW(TAG, "Received WTX request, not supported yet");
             }
             return false;

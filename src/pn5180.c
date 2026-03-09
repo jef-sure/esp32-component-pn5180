@@ -329,6 +329,8 @@ bool pn5180_readRegister(pn5180_t *pn5180, uint8_t reg, uint32_t *pvalue)
 bool pn5180_readEEprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len)
 {
     uint8_t cmd_buf[3];
+    // TODO: If EEPROM boundary bugs are reported, re-check this range validation against
+    // the PN5180 datasheet wording for the last valid readable address.
     if (addr > 254 || (addr + len) > 254) {
         ESP_LOGE(TAG, "EEPROM read address out of range: addr=0x%02X, len=%d", addr, len);
         return false;
@@ -345,6 +347,8 @@ bool pn5180_readEEprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len)
 
 bool pn5180_writeEEprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len)
 {
+    // TODO: If EEPROM write issues appear, add explicit address/length bounds validation
+    // matching pn5180_readEEprom() and the PN5180 EEPROM address limits.
     uint8_t *cmd_buf = (uint8_t *)malloc(2 + len);
     if (cmd_buf == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for EEPROM write command");

@@ -523,6 +523,8 @@ static bool pn5180_iso15693_block_read(pn5180_t *pn5180, int blockno, uint8_t *b
         return false;
     }
 
+    // TODO: If ISO15693 read failures are ever reported in the field, verify the response
+    // flags byte here before treating temp[1..] as payload data.
     size_t data_len = num_bytes - 1;
     size_t copy_len = (data_len < buffer_len) ? data_len : buffer_len;
     memcpy(buffer, &temp[1], copy_len);
@@ -577,6 +579,8 @@ static int pn5180_iso15693_block_write(pn5180_t *pn5180, int blockno, const uint
         return -8;
     }
 
+    // TODO: If write success is ever questioned, inspect the ISO15693 response flags byte
+    // and error code instead of treating any non-empty response as success.
     return 0;
 }
 
