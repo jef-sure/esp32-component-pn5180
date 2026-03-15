@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "pn5180-internal.h"
+#include "freertos/task.h"
 #include <inttypes.h>
 #include <string.h>
 
