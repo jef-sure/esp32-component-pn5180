@@ -376,206 +376,179 @@ static bool pn5180_14443_sendSelect(pn5180_t *pn5180, int cascade_level, uint8_t
     return true;
 }
 
-// Helper function to resolve collisions in anticollision sequence
-static bool pn5180_14443_resolve_collision(pn5180_t *pn5180, uint8_t cascadeLevel, uint8_t sel, uint8_t collisionPos, uint8_t rxLen, uint8_t *active_uid,
-                                           uint8_t *temp_uid, uint8_t *uidLen)
+// Configure RX bit alignment for anticollision split-byte reception.
+// When align > 0, also enables VALUES_AFTER_COLLISION so received bits
+// up to the collision point retain their sampled value.
+static void pn5180_set_rx_align(pn5180_t *pn5180, uint8_t align)
 {
-    // Force the initial collision bit to 1 (choose the higher UID branch)
-    uint8_t byte_idx = collisionPos / 8;
-    uint8_t bit_idx  = collisionPos % 8;
-    active_uid[byte_idx] |= (1 << bit_idx);
-
-    uint8_t  known_bits         = collisionPos + 1;
-    uint8_t  collision_attempts = 0;
-    uint32_t irqStatus;
-    uint8_t  cmd_buf[12];
-
-    while (known_bits < 32 && collision_attempts < 64) {
-        collision_attempts++;
-
-        // Calculate NVB with +2 for SEL and NVB header bytes
-        uint8_t bytes_count       = known_bits / 8;
-        uint8_t bits_in_last_byte = known_bits % 8;
-        uint8_t current_nvb       = ((bytes_count + 2) << 4) | bits_in_last_byte;
-
-        PN5180_LOGD(TAG, "Collision retry %d: known_bits=%d, NVB=0x%02X", collision_attempts, known_bits, current_nvb);
-
-        // Re-force the collision bit (may have been overwritten by new data reads)
-        uint8_t forced_byte_idx = (known_bits - 1) / 8;
-        uint8_t forced_bit_idx  = (known_bits - 1) % 8;
-        active_uid[forced_byte_idx] |= (1 << forced_bit_idx);
-
-        // Build command: SEL + NVB + known UID bits
-        cmd_buf[0] = sel;
-        cmd_buf[1] = current_nvb;
-
-        if (bytes_count > 0) {
-            memcpy(&cmd_buf[2], active_uid, bytes_count);
-        }
-
-        // Mask partial byte
-        if (bits_in_last_byte > 0) {
-            uint8_t mask             = (1 << bits_in_last_byte) - 1;
-            cmd_buf[2 + bytes_count] = active_uid[bytes_count] & mask;
-        }
-
-        int cmd_len = 2 + bytes_count + (bits_in_last_byte > 0 ? 1 : 0);
-
-        // Send anticollision command
-        PN5180_LOGD(TAG, "Collision retry: sending %d bytes, %d bits in last byte", cmd_len, bits_in_last_byte);
-        if (!pn5180_sendData(pn5180, cmd_buf, cmd_len, bits_in_last_byte)) {
-            ESP_LOGE(TAG, "Failed to send anticollision retry at level %" PRIu8, cascadeLevel);
-            return false;
-        }
-
-        // Wait for response
-        if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT | IDLE_IRQ_STAT, "collision retry", &irqStatus)) {
-            ESP_LOGE(TAG, "Timeout in collision retry at level %" PRIu8, cascadeLevel);
-            return false;
-        }
-
-        // Check for collision
-        if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
-            uint32_t newRxStatus;
-            if (!pn5180_readRegister(pn5180, RX_STATUS, &newRxStatus)) {
-                ESP_LOGE(TAG, "Failed to read RX_STATUS in collision retry at level %" PRIu8, cascadeLevel);
-                pn5180_clearAllIRQs(pn5180);
-                return false;
-            }
-
-            if (newRxStatus & (RX_COLLISION_DETECTED | RX_PROTOCOL_ERROR | RX_DATA_INTEGRITY_ERROR)) {
-                // Still colliding - extract new position and retry
-                uint8_t  newCollisionPos = (newRxStatus >> RX_COLL_POS_START) & RX_COLL_POS_MASK;
-                uint16_t newRxLen        = pn5180_rxBytesReceived(pn5180);
-
-                if (newRxLen > 0 && newRxLen <= 5) {
-                    if (!pn5180_readData(pn5180, newRxLen, active_uid)) {
-                        ESP_LOGE(TAG, "Failed to read partial UID in retry at level %" PRIu8, cascadeLevel);
-                        pn5180_clearAllIRQs(pn5180);
-                        return false;
-                    }
-                }
-
-                pn5180_clearAllIRQs(pn5180);
-
-                // Force new collision bit and continue
-                uint8_t new_byte_idx = newCollisionPos / 8;
-                uint8_t new_bit_idx  = newCollisionPos % 8;
-                active_uid[new_byte_idx] |= (1 << new_bit_idx);
-                known_bits = newCollisionPos + 1;
-                continue;
-            }
-        }
-
-        // No collision - read complete response
-        rxLen = pn5180_rxBytesReceived(pn5180);
-        if (rxLen == 0 || rxLen > 10) {
-            pn5180_clearAllIRQs(pn5180);
-            ESP_LOGE(TAG, "Invalid response length %d after collision resolution", rxLen);
-            return false;
-        }
-
-        if (!pn5180_readData(pn5180, rxLen, cmd_buf)) {
-            pn5180_clearAllIRQs(pn5180);
-            ESP_LOGE(TAG, "Failed to read UID+BCC after collision resolution at level %" PRIu8, cascadeLevel);
-            return false;
-        }
-
-        pn5180_clearAllIRQs(pn5180);
-
-        // Validate BCC and return
-        if (rxLen == 5) {
-            uint8_t bcc = cmd_buf[0] ^ cmd_buf[1] ^ cmd_buf[2] ^ cmd_buf[3];
-            if (bcc != cmd_buf[4]) {
-                ESP_LOGE(TAG, "BCC check failed after resolution at level %" PRIu8, cascadeLevel);
-                return false;
-            }
-            *uidLen = 4;
-            memcpy(temp_uid, cmd_buf, 5);
-            return true;
-        }
+    // Clear RX_BIT_ALIGN and VALUES_AFTER_COLLISION
+    pn5180_writeRegisterWithAndMask(pn5180, CRC_RX_CONFIG,
+                                    ~(CRC_RX_CONFIG_RX_BIT_ALIGN_MASK | CRC_RX_CONFIG_VALUES_AFTER_COLLISION_MASK));
+    if (align > 0) {
+        // Set new RX_BIT_ALIGN value and enable VALUES_AFTER_COLLISION
+        pn5180_writeRegisterWithOrMask(pn5180, CRC_RX_CONFIG,
+                                       ((uint32_t)align << CRC_RX_CONFIG_RX_BIT_ALIGN_POS) | CRC_RX_CONFIG_VALUES_AFTER_COLLISION_MASK);
     }
-
-    ESP_LOGE(TAG, "Failed to resolve collision at level %" PRIu8 " after %" PRIu8 " attempts", cascadeLevel, collision_attempts);
-    return false;
 }
 
+// Merge received FIFO bytes into uid_cl at the correct byte offset,
+// handling the split-byte overlap when known_extra_bits > 0.
+static void pn5180_merge_rx_uid(uint8_t *uid_cl, uint8_t known_bytes, uint8_t known_extra_bits, const uint8_t *rx_buf, uint8_t rx_count)
+{
+    if (rx_count == 0) return;
+    if (known_extra_bits > 0) {
+        // Split-byte merge: keep known low bits, take received high bits
+        uid_cl[known_bytes] = (uid_cl[known_bytes] & (uint8_t)((1u << known_extra_bits) - 1u)) |
+                              (rx_buf[0] & (uint8_t)(0xFFu << known_extra_bits));
+    } else {
+        uid_cl[known_bytes] = rx_buf[0];
+    }
+    for (uint8_t i = 1; i < rx_count && (known_bytes + i) < 5; i++) {
+        uid_cl[known_bytes + i] = rx_buf[i];
+    }
+}
+
+// ISO 14443-3A anticollision for a single cascade level.
+// Iteratively narrows the UID by setting RXALIGN, sending partial prefixes,
+// merging received continuation bytes, and resolving collisions bit-by-bit.
 static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascadeLevel, uint8_t temp_uid[5], uint8_t *uidLen)
 {
-    uint8_t sel = 0x93 + (2 * (cascadeLevel - 1));
-    uint8_t nvb = 0x20;
-    uint8_t cmd_buf[12];
-    cmd_buf[0] = sel;
-    cmd_buf[1] = nvb;
+    uint8_t sel       = 0x93 + (2 * (cascadeLevel - 1));
+    uint8_t uid_cl[5] = {0}; // 4 UID bytes + BCC for this cascade level
+    uint8_t known_bits      = 0;
+    uint8_t collision_count = 0;
 
-    PN5180_LOGD(TAG, "Sending Anti-collision command for cascade level %" PRIu8, cascadeLevel);
-    PN5180_LOGD(TAG, "Anti-collision: SEL=0x%02X NVB=0x%02X", sel, nvb);
-    if (!pn5180_sendData(pn5180, cmd_buf, 2, 0)) {
-        ESP_LOGE(TAG, "Failed to send Anti-collision command at level %" PRIu8, cascadeLevel);
-        return false;
-    }
+    while (known_bits < 40 && collision_count < 32) {
+        uint8_t known_bytes      = known_bits / 8;
+        uint8_t known_extra_bits = known_bits % 8;
 
-    // Wait for response
-    uint32_t irqStatus;
-    if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | IDLE_IRQ_STAT, "anticollision response", &irqStatus)) {
-        ESP_LOGE(TAG, "Timeout waiting for anticollision response at level %" PRIu8, cascadeLevel);
-        return false;
-    }
+        // Build anticollision frame: SEL + NVB + known UID bits
+        uint8_t cmd_buf[9];
+        cmd_buf[0] = sel;
+        cmd_buf[1] = ((known_bytes + 2) << 4) | known_extra_bits;
+        if (known_bytes > 0) {
+            memcpy(&cmd_buf[2], uid_cl, known_bytes);
+        }
+        if (known_extra_bits > 0) {
+            cmd_buf[2 + known_bytes] = uid_cl[known_bytes] & (uint8_t)((1u << known_extra_bits) - 1u);
+        }
+        uint8_t cmd_len = 2 + known_bytes + (known_extra_bits > 0 ? 1 : 0);
 
-    // Get response length
-    uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
-    if (rxLen == 0 || rxLen > 10) {
-        pn5180_clearAllIRQs(pn5180);
-        ESP_LOGE(TAG, "Invalid response length %" PRIu16 " at level %" PRIu8, rxLen, cascadeLevel);
-        return false;
-    }
+        // Tell the receiver where to place the first incoming bit within the FIFO byte
+        pn5180_set_rx_align(pn5180, known_extra_bits);
 
-    // Read response
-    if (!pn5180_readData(pn5180, rxLen, cmd_buf)) {
-        pn5180_clearAllIRQs(pn5180);
-        ESP_LOGE(TAG, "Failed to read response at level %" PRIu8, cascadeLevel);
-        return false;
-    }
+        PN5180_LOGD(TAG, "Anticollision CL%" PRIu8 ": known=%" PRIu8 " NVB=0x%02X", cascadeLevel, known_bits, cmd_buf[1]);
 
-    pn5180_clearAllIRQs(pn5180);
-
-    // Check for collision
-    if ((irqStatus & GENERAL_ERROR_IRQ_STAT) == 0) {
-        // No collision - validate and return
-        if (rxLen != 5) {
-            PN5180_LOGD(TAG, "Unexpected response length %" PRIu16 " at level %" PRIu8 " (expected 5)", rxLen, cascadeLevel);
+        if (!pn5180_sendData(pn5180, cmd_buf, cmd_len, known_extra_bits)) {
+            pn5180_set_rx_align(pn5180, 0);
+            ESP_LOGE(TAG, "Failed to send anticollision at level %" PRIu8, cascadeLevel);
             return false;
         }
 
-        uint8_t bcc = cmd_buf[0] ^ cmd_buf[1] ^ cmd_buf[2] ^ cmd_buf[3];
-        if (bcc != cmd_buf[4]) {
-            ESP_LOGE(TAG, "BCC check failed at level %" PRIu8, cascadeLevel);
+        uint32_t irqStatus;
+        if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | IDLE_IRQ_STAT | GENERAL_ERROR_IRQ_STAT,
+                                 "anticollision", &irqStatus)) {
+            pn5180_set_rx_align(pn5180, 0);
+            ESP_LOGE(TAG, "Timeout in anticollision at level %" PRIu8, cascadeLevel);
+            return false;
+        }
+
+        // Reset RX alignment before any further register access
+        pn5180_set_rx_align(pn5180, 0);
+
+        // Read RX_STATUS for collision info and byte count
+        uint32_t rxStatus;
+        if (!pn5180_readRegister(pn5180, RX_STATUS, &rxStatus)) {
+            pn5180_clearAllIRQs(pn5180);
+            ESP_LOGE(TAG, "Failed to read RX_STATUS at level %" PRIu8, cascadeLevel);
+            return false;
+        }
+        uint16_t rxBytes  = rxStatus & RX_BYTES_RECEIVED_MASK;
+        bool     has_coll = (rxStatus & RX_COLLISION_DETECTED) != 0;
+
+        // --- Collision path ---
+        if (has_coll) {
+            // RX_COLL_POS includes the RX_BIT_ALIGN offset, so it is relative to
+            // the first FIFO byte (not the first received bit on the air).
+            // Total UID bits resolved = known_bytes * 8 + coll_pos.
+            uint8_t coll_pos = (rxStatus >> RX_COLL_POS_START) & RX_COLL_POS_MASK;
+
+            // Read available FIFO data (may include bytes past collision)
+            uint8_t rx_buf[5] = {0};
+            uint8_t to_read   = (rxBytes > 5) ? 5 : (uint8_t)rxBytes;
+            if (to_read > 0) {
+                if (!pn5180_readData(pn5180, to_read, rx_buf)) {
+                    pn5180_clearAllIRQs(pn5180);
+                    return false;
+                }
+            }
+            pn5180_clearAllIRQs(pn5180);
+
+            // Merge received data at the correct byte offset
+            pn5180_merge_rx_uid(uid_cl, known_bytes, known_extra_bits, rx_buf, to_read);
+
+            // Advance known_bits to the collision point
+            known_bits = known_bytes * 8 + coll_pos;
+
+            // Force the collision bit to 1 (choose higher UID branch) and advance
+            if (known_bits / 8 < 5) {
+                uid_cl[known_bits / 8] |= (uint8_t)(1u << (known_bits % 8));
+            }
+            known_bits++;
+            collision_count++;
+
+            PN5180_LOGD(TAG, "Collision at CL%" PRIu8 " bit %" PRIu8 ", resolved %" PRIu8 " bits",
+                        cascadeLevel, (uint8_t)(known_bits - 1), known_bits);
+            continue;
+        }
+
+        // --- Error without collision flag ---
+        if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
+            pn5180_clearAllIRQs(pn5180);
+            ESP_LOGE(TAG, "General error during anticollision at level %" PRIu8, cascadeLevel);
+            return false;
+        }
+
+        // --- Success path (no collision) ---
+        if (rxBytes == 0 || rxBytes > 5) {
+            pn5180_clearAllIRQs(pn5180);
+            ESP_LOGE(TAG, "Invalid response length %" PRIu16 " at level %" PRIu8, rxBytes, cascadeLevel);
+            return false;
+        }
+
+        uint8_t rx_buf[5] = {0};
+        if (!pn5180_readData(pn5180, rxBytes, rx_buf)) {
+            pn5180_clearAllIRQs(pn5180);
+            ESP_LOGE(TAG, "Failed to read anticollision response at level %" PRIu8, cascadeLevel);
+            return false;
+        }
+        pn5180_clearAllIRQs(pn5180);
+
+        // Merge received data at the correct byte offset
+        pn5180_merge_rx_uid(uid_cl, known_bytes, known_extra_bits, rx_buf, (uint8_t)rxBytes);
+
+        // We need 5 bytes total (4 UID + BCC)
+        if (known_bytes + rxBytes < 5) {
+            ESP_LOGE(TAG, "Incomplete UID at level %" PRIu8 ": got %" PRIu16 " bytes at offset %" PRIu8,
+                     cascadeLevel, rxBytes, known_bytes);
+            return false;
+        }
+
+        // BCC check
+        uint8_t bcc = uid_cl[0] ^ uid_cl[1] ^ uid_cl[2] ^ uid_cl[3];
+        if (bcc != uid_cl[4]) {
+            ESP_LOGE(TAG, "BCC check failed at level %" PRIu8 " (computed 0x%02X, got 0x%02X)",
+                     cascadeLevel, bcc, uid_cl[4]);
             return false;
         }
 
         *uidLen = 4;
-        memcpy(temp_uid, cmd_buf, 5);
+        memcpy(temp_uid, uid_cl, 5);
         return true;
     }
 
-    // Collision detected - resolve it
-    uint32_t rxStatus;
-    if (!pn5180_readRegister(pn5180, RX_STATUS, &rxStatus) || 0 == (rxStatus & (RX_COLLISION_DETECTED | RX_PROTOCOL_ERROR | RX_DATA_INTEGRITY_ERROR))) {
-        ESP_LOGE(TAG, "Failed to read RX_STATUS at level %" PRIu8, cascadeLevel);
-        return false;
-    }
-
-    uint8_t collisionPos = (rxStatus >> RX_COLL_POS_START) & RX_COLL_POS_MASK;
-    PN5180_LOGD(TAG, "Collision at level %" PRIu8 ", bit position %" PRIu8, cascadeLevel, collisionPos);
-
-    // Copy received partial UID
-    uint8_t active_uid[5] = {0};
-    if (rxLen > 0 && rxLen <= 5) {
-        memcpy(active_uid, cmd_buf, rxLen);
-    }
-
-    // Resolve collision iteratively
-    return pn5180_14443_resolve_collision(pn5180, cascadeLevel, sel, collisionPos, rxLen, active_uid, temp_uid, uidLen);
+    ESP_LOGE(TAG, "Anticollision failed at level %" PRIu8 " after %" PRIu8 " collisions", cascadeLevel, collision_count);
+    return false;
 }
 
 static bool pn5180_14443_resolve_full_uid_cascade(pn5180_t *pn5180, uint8_t *full_uid, int8_t *full_uid_len, uint8_t *sak)

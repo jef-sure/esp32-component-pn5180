@@ -79,6 +79,12 @@
 #define SYSTEM_CONFIG_TX_MODE_TRANSCEIVE 0x00000003
 #define SYSTEM_CONFIG_CLEAR_CRYPTO_MASK  0xFFFFFFBF // ~(1<<6) - Clear MFC_CRYPTO_ON bit
 #define SYSTEM_CONFIG_CLEAR_TX_MODE_MASK 0xFFFFFFF8 // ~0x07 - Clear transceiver state bits
+
+// CRC_RX_CONFIG register bit masks (register 0x12)
+#define CRC_RX_CONFIG_RX_BIT_ALIGN_POS               6u
+#define CRC_RX_CONFIG_RX_BIT_ALIGN_MASK              0x000001C0u  // Bits [8:6] - RX bit alignment
+#define CRC_RX_CONFIG_VALUES_AFTER_COLLISION_MASK     0x00000200u  // Bit 9 - Keep bit values after collision
+
 #define TIMER1_RELOAD                    (0x0c)
 #define TIMER1_CONFIG                    (0x0f)
 #define RX_WAIT_CONFIG                   (0x11)
