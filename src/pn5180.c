@@ -2,8 +2,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "pn5180-internal.h"
 #include "freertos/task.h"
+#include "pn5180-internal.h"
 #include <inttypes.h>
 #include <string.h>
 
@@ -750,37 +750,38 @@ bool pn5180_setRF_on(pn5180_t *pn5180)
     uint8_t  cmd_buf[] = {PN5180_RF_ON, 0};
     uint32_t rfStatus  = 0;
     uint32_t irqStatus = 0;
-    bool     rc        = false;
 
     for (int attempt = 0; attempt < 3; attempt++) {
-        pn5180_clearAllIRQs(pn5180);
-        rc = transceive_command(pn5180, cmd_buf, sizeof(cmd_buf), NULL, 0);
-        if (!rc) {
-            ESP_LOGE(TAG, "Failed to set RF on");
+        // Clear RF-related IRQs before sending FIELD_ON
+        pn5180_clearIRQStatus(pn5180, RF_ACTIVE_ERROR_IRQ_STAT | TX_RFON_IRQ_STAT | TX_RFOFF_IRQ_STAT | RFON_DET_IRQ_STAT | RFOFF_DET_IRQ_STAT);
+
+        if (!transceive_command(pn5180, cmd_buf, sizeof(cmd_buf), NULL, 0)) {
+            ESP_LOGE(TAG, "RF_ON SPI command failed");
+            pn5180_delay_ms(10);
+            continue;
         }
 
-        int64_t rf_on_deadline = esp_timer_get_time() + (1000LL * pn5180->timeout_ms);
-        rfStatus               = 0;
-        while (esp_timer_get_time() < rf_on_deadline) {
-            irqStatus = pn5180_getIRQStatus(pn5180);
-            if (irqStatus & (RFON_DET_IRQ_STAT | TX_RFON_IRQ_STAT)) {
-                pn5180_clearIRQStatus(pn5180, (RFON_DET_IRQ_STAT | TX_RFON_IRQ_STAT));
-                break; // RF on detected by IRQ
-            }
-            if (pn5180_readRegister(pn5180, RF_STATUS, &rfStatus)) {
-                if (rfStatus & 0x01) {
-                    break; // RF is on
-                }
-            }
-            esp_rom_delay_us(10);
+        // FIELD_ON is synchronous — when SPI BUSY goes low the result is final.
+        // Just read RF_STATUS once to check the outcome.
+        if (!pn5180_readRegister(pn5180, RF_STATUS, &rfStatus)) {
+            ESP_LOGE(TAG, "Failed to read RF_STATUS after RF_ON");
+            pn5180_delay_ms(10);
+            continue;
         }
 
-        if ((rfStatus & 0x01) != 0 || (irqStatus & (RFON_DET_IRQ_STAT | TX_RFON_IRQ_STAT))) {
+        if (rfStatus & RF_STATUS_TX_RF_STATUS_MASK) {
             pn5180->is_rf_on = true;
             return true;
         }
 
-        pn5180_delay_ms(10); // brief delay before retry
+        // Field didn't come up — check why
+        irqStatus = pn5180_getIRQStatus(pn5180);
+        if (irqStatus & RF_ACTIVE_ERROR_IRQ_STAT) {
+            ESP_LOGW(TAG, "RF_ON blocked by external RF field (RFCA)");
+        } else {
+            ESP_LOGW(TAG, "RF_ON failed, RF_STATUS=0x%08" PRIx32 " IRQ=0x%08" PRIx32, rfStatus, irqStatus);
+        }
+        pn5180_delay_ms(10);
     }
 
     ESP_LOGE(TAG, "RF field is NOT on! RF_STATUS=0x%08" PRIx32 " IRQ_STATUS=0x%08" PRIx32, rfStatus, irqStatus);

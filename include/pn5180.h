@@ -70,7 +70,9 @@
 #define SYSTEM_STATUS      (0x24)
 #define TEMP_CONTROL       (0x25)
 #define AGC_REF_CONFIG     (0x26)
-#define RF_STATUS_AGC_MASK 0x000003FFu
+#define RF_STATUS_AGC_MASK            0x000003FFu
+#define RF_STATUS_TX_RF_STATUS_MASK   0x00020000u  // Bit 17 - TX RF drivers on (RF field created)
+#define RF_STATUS_RF_DET_STATUS_MASK  0x00010000u  // Bit 16 - External RF field detected
 
 // SYSTEM_CONFIG register bit masks
 #define SYSTEM_CONFIG_MFC_CRYPTO_ON      (1 << 6)   // Bit 6 - MIFARE Crypto1 enabled
