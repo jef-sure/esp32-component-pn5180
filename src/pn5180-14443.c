@@ -52,7 +52,7 @@ static bool pn5180_iso14443_4_receive_frame(pn5180_t *pn5180, const char *operat
         pn5180->timeout_ms = timeout_ms;
     }
 
-    bool ok = pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, operation, &irqStatus);
+    bool ok            = pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, operation, &irqStatus);
     pn5180->timeout_ms = saved_timeout_ms;
     if (!ok) {
         return false;
@@ -109,6 +109,10 @@ static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, ui
         }
 
         if (t0 & 0x10) {
+            if (idx >= ats[0]) {
+                ESP_LOGE(TAG, "ATS missing TA1");
+                return false;
+            }
             idx++;
         }
         if (t0 & 0x20) {
@@ -120,6 +124,10 @@ static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, ui
             idx++;
         }
         if (t0 & 0x40) {
+            if (idx >= ats[0]) {
+                ESP_LOGE(TAG, "ATS missing TC1");
+                return false;
+            }
             idx++;
         }
     }
@@ -133,8 +141,7 @@ static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, ui
         pn5180->iso14443_fwt_ms = 1;
     }
 
-    PN5180_LOGD(TAG, "ATS applied: FSCI=%u frame=%u FWI=%u FWT=%" PRId64 "ms", fsci, pn5180->iso14443_frame_size, fwi,
-                pn5180->iso14443_fwt_ms);
+    PN5180_LOGD(TAG, "ATS applied: FSCI=%u frame=%u FWI=%u FWT=%" PRId64 "ms", fsci, pn5180->iso14443_frame_size, fwi, pn5180->iso14443_fwt_ms);
     return true;
 }
 
@@ -496,12 +503,10 @@ static bool pn5180_14443_sendSelect(pn5180_t *pn5180, int cascade_level, uint8_t
 static void pn5180_set_rx_align(pn5180_t *pn5180, uint8_t align)
 {
     // Clear RX_BIT_ALIGN and VALUES_AFTER_COLLISION
-    pn5180_writeRegisterWithAndMask(pn5180, CRC_RX_CONFIG,
-                                    ~(CRC_RX_CONFIG_RX_BIT_ALIGN_MASK | CRC_RX_CONFIG_VALUES_AFTER_COLLISION_MASK));
+    pn5180_writeRegisterWithAndMask(pn5180, CRC_RX_CONFIG, ~(CRC_RX_CONFIG_RX_BIT_ALIGN_MASK | CRC_RX_CONFIG_VALUES_AFTER_COLLISION_MASK));
     if (align > 0) {
         // Set new RX_BIT_ALIGN value and enable VALUES_AFTER_COLLISION
-        pn5180_writeRegisterWithOrMask(pn5180, CRC_RX_CONFIG,
-                                       ((uint32_t)align << CRC_RX_CONFIG_RX_BIT_ALIGN_POS) | CRC_RX_CONFIG_VALUES_AFTER_COLLISION_MASK);
+        pn5180_writeRegisterWithOrMask(pn5180, CRC_RX_CONFIG, ((uint32_t)align << CRC_RX_CONFIG_RX_BIT_ALIGN_POS) | CRC_RX_CONFIG_VALUES_AFTER_COLLISION_MASK);
     }
 }
 
@@ -512,8 +517,7 @@ static void pn5180_merge_rx_uid(uint8_t *uid_cl, uint8_t known_bytes, uint8_t kn
     if (rx_count == 0) return;
     if (known_extra_bits > 0) {
         // Split-byte merge: keep known low bits, take received high bits
-        uid_cl[known_bytes] = (uid_cl[known_bytes] & (uint8_t)((1u << known_extra_bits) - 1u)) |
-                              (rx_buf[0] & (uint8_t)(0xFFu << known_extra_bits));
+        uid_cl[known_bytes] = (uid_cl[known_bytes] & (uint8_t)((1u << known_extra_bits) - 1u)) | (rx_buf[0] & (uint8_t)(0xFFu << known_extra_bits));
     } else {
         uid_cl[known_bytes] = rx_buf[0];
     }
@@ -527,8 +531,8 @@ static void pn5180_merge_rx_uid(uint8_t *uid_cl, uint8_t known_bytes, uint8_t kn
 // merging received continuation bytes, and resolving collisions bit-by-bit.
 static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascadeLevel, uint8_t temp_uid[5], uint8_t *uidLen)
 {
-    uint8_t sel       = 0x93 + (2 * (cascadeLevel - 1));
-    uint8_t uid_cl[5] = {0}; // 4 UID bytes + BCC for this cascade level
+    uint8_t sel             = 0x93 + (2 * (cascadeLevel - 1));
+    uint8_t uid_cl[5]       = {0}; // 4 UID bytes + BCC for this cascade level
     uint8_t known_bits      = 0;
     uint8_t collision_count = 0;
 
@@ -560,8 +564,7 @@ static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascadeLe
         }
 
         uint32_t irqStatus;
-        if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | IDLE_IRQ_STAT | GENERAL_ERROR_IRQ_STAT,
-                                 "anticollision", &irqStatus)) {
+        if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | IDLE_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "anticollision", &irqStatus)) {
             pn5180_set_rx_align(pn5180, 0);
             ESP_LOGE(TAG, "Timeout in anticollision at level %" PRIu8, cascadeLevel);
             return false;
@@ -611,8 +614,7 @@ static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascadeLe
             known_bits++;
             collision_count++;
 
-            PN5180_LOGD(TAG, "Collision at CL%" PRIu8 " bit %" PRIu8 ", resolved %" PRIu8 " bits",
-                        cascadeLevel, (uint8_t)(known_bits - 1), known_bits);
+            PN5180_LOGD(TAG, "Collision at CL%" PRIu8 " bit %" PRIu8 ", resolved %" PRIu8 " bits", cascadeLevel, (uint8_t)(known_bits - 1), known_bits);
             continue;
         }
 
@@ -643,16 +645,14 @@ static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascadeLe
 
         // We need 5 bytes total (4 UID + BCC)
         if (known_bytes + rxBytes < 5) {
-            ESP_LOGE(TAG, "Incomplete UID at level %" PRIu8 ": got %" PRIu16 " bytes at offset %" PRIu8,
-                     cascadeLevel, rxBytes, known_bytes);
+            ESP_LOGE(TAG, "Incomplete UID at level %" PRIu8 ": got %" PRIu16 " bytes at offset %" PRIu8, cascadeLevel, rxBytes, known_bytes);
             return false;
         }
 
         // BCC check
         uint8_t bcc = uid_cl[0] ^ uid_cl[1] ^ uid_cl[2] ^ uid_cl[3];
         if (bcc != uid_cl[4]) {
-            ESP_LOGE(TAG, "BCC check failed at level %" PRIu8 " (computed 0x%02X, got 0x%02X)",
-                     cascadeLevel, bcc, uid_cl[4]);
+            ESP_LOGE(TAG, "BCC check failed at level %" PRIu8 " (computed 0x%02X, got 0x%02X)", cascadeLevel, bcc, uid_cl[4]);
             return false;
         }
 
@@ -992,9 +992,10 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
     }
 
     uint8_t rx_buf[260];
-    int64_t base_timeout_ms = pn5180->iso14443_fwt_ms > 0 ? pn5180->iso14443_fwt_ms : pn5180->timeout_ms;
-    int     retransmits     = 0;
-    size_t  total_payload   = 0;
+    int64_t initial_timeout_ms = pn5180->iso14443_fwt_ms > 0 ? pn5180->iso14443_fwt_ms : pn5180->timeout_ms;
+    int64_t base_timeout_ms    = initial_timeout_ms;
+    int     retransmits        = 0;
+    size_t  total_payload      = 0;
 
     while (retransmits < 3) {
         uint16_t received = 0;
@@ -1041,15 +1042,23 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
         }
 
         if ((rx_pcb & 0xC0) == 0x80) {
-            ESP_LOGW(TAG, "Received R-Block (0x%02X), retransmitting I-Block", rx_pcb);
             retransmits++;
             if (retransmits >= 3) {
                 free(frame);
                 return false;
             }
-            if (!pn5180_sendData(pn5180, frame, frame_len, 0)) {
-                free(frame);
-                return false;
+            if (total_payload > 0) {
+                ESP_LOGW(TAG, "Received R-Block (0x%02X) during chaining, retransmitting R(ACK)", rx_pcb);
+                if (!pn5180_iso14443_4_send_r_ack(pn5180)) {
+                    free(frame);
+                    return false;
+                }
+            } else {
+                ESP_LOGW(TAG, "Received R-Block (0x%02X), retransmitting I-Block", rx_pcb);
+                if (!pn5180_sendData(pn5180, frame, frame_len, 0)) {
+                    free(frame);
+                    return false;
+                }
             }
             continue;
         }
@@ -1066,7 +1075,7 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
                     free(frame);
                     return false;
                 }
-                base_timeout_ms *= wtxm;
+                base_timeout_ms = initial_timeout_ms * wtxm;
                 if (base_timeout_ms < 1) {
                     base_timeout_ms = 1;
                 }
