@@ -46,33 +46,37 @@ Adjust the GPIO assignments or the SPI host (`VSPI_HOST` by default) to match yo
    - `pn5180-mifare.h` - MIFARE Classic authentication helpers
 3. Build and flash with `idf.py build flash monitor`.
 
-**Note**: The `main/` directory contains an example application. The `examples/` directory has standalone examples you can reference.
+**Note**: The `examples/` directory contains the sample application and standalone reference examples.
 
 ## API Reference
 
 ### Core Types
 
 ```c
-// Card type enumeration (detected via SAK analysis)
+// Card type enumeration (subset)
 typedef enum {
-    NFC_TYPE_UNKNOWN,           // Unknown or unsupported
-    NFC_TYPE_MIFARE_CLASSIC_1K, // MIFARE Classic 1K (SAK 0x08)
-    NFC_TYPE_MIFARE_CLASSIC_4K, // MIFARE Classic 4K (SAK 0x18)
-    NFC_TYPE_MIFARE_ULTRALIGHT, // MIFARE Ultralight/NTAG (SAK 0x00)
-    NFC_TYPE_NTAG,              // NTAG21x series
-    NFC_TYPE_ISO14443_4,        // ISO14443-4 compliant (DESFire, etc.)
+    PN5180_MIFARE_UNKNOWN,
+    PN5180_MIFARE_CLASSIC_1K,
+    PN5180_MIFARE_CLASSIC_MINI,
+    PN5180_MIFARE_CLASSIC_4K,
+    PN5180_MIFARE_ULTRALIGHT,
+    PN5180_MIFARE_NTAG213,
+    PN5180_MIFARE_DESFIRE,
+    PN5180_15693,
     // ... see pn5180.h for complete list
 } nfc_type_t;
 
 // Protocol interface - all protocols implement this
 typedef struct {
-    func_setup_rf_t        setup_rf;        // Configure RF field
-    funct_get_all_uids_t   get_all_uids;    // Enumerate all cards
-    func_select_by_uid_t   select_by_uid;   // Select specific card
-    func_authenticate_t    authenticate;    // Auth (MIFARE Classic)
-    func_block_read_t      block_read;      // Read block
-    func_block_write_t     block_write;     // Write block
-    func_halt_t            halt;            // HALT selected card
+    pn5180_t                 *pn5180;
+    func_setup_rf_t          *setup_rf;
+    funct_get_all_uids_t     *get_all_uids;
+    func_select_by_uid_t     *select_by_uid;
+    func_authenticate_t      *authenticate;
+    func_block_read_t        *block_read;
+    func_block_write_t       *block_write;
+    funct_detect_card_type_t *detect_card_type_and_capacity;
+    func_halt_t              *halt;
     // ...
 } pn5180_proto_t;
 ```
@@ -107,7 +111,7 @@ void app_main(void)
     if (uids) {
         for (int i = 0; i < uids->uids_count; i++) {
             nfc_uid_t *uid = &uids->uids[i];
-            printf("Card %d: Type=%d, UID len=%d\n", i, uid->type, uid->uid_len);
+            printf("Card %d: Type=%d, UID len=%d\n", i, uid->subtype, uid->uid_length);
         }
         free(uids);
     }
@@ -136,14 +140,14 @@ void read_mifare_classic(pn5180_proto_t *proto, nfc_uid_t *uid)
     uint8_t key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // Default key
     int block = 4;  // First block of sector 1
 
-    if (!proto->authenticate(proto, block, 0, key)) {  // 0 = Key A
+    if (!proto->authenticate(proto, key, MIFARE_CLASSIC_KEYA, uid, block)) {
         ESP_LOGE(TAG, "Authentication failed");
         return;
     }
 
     // Read authenticated block
     uint8_t data[16];
-    if (proto->block_read(proto, block, data, sizeof(data)) > 0) {
+    if (proto->block_read(proto, block, data, sizeof(data))) {
         ESP_LOGI(TAG, "Block %d data:", block);
         ESP_LOG_BUFFER_HEX(TAG, data, 16);
     }
@@ -169,7 +173,7 @@ void read_iso15693_tags(pn5180_t *pn5180)
         if (iso15693->select_by_uid(iso15693, &uids->uids[0])) {
             // Read block 0
             uint8_t data[4];
-            if (iso15693->block_read(iso15693, 0, data, sizeof(data)) > 0) {
+            if (iso15693->block_read(iso15693, 0, data, sizeof(data))) {
                 ESP_LOG_BUFFER_HEX(TAG, data, 4);
             }
         }
@@ -263,7 +267,7 @@ void read_ndef_message(pn5180_proto_t *proto)
 
 - **Blocking calls & timeouts**: All APIs are synchronous and wait for hardware completion using `BUSY`, IRQ, and transceiver-state polling. Operations respect internal timeouts and return promptly on error.
 
-- **Error handling**: The component detects RX errors (protocol/CRC/collision) and returns failure without automatic retries. Implement retries in your application.
+- **Error handling**: The component detects RX errors and performs limited automatic recovery where implemented, including ISO14443-4 receive retries for timeout/protocol errors. Applications should still handle persistent failures and card removal.
 
 - **MIFARE Classic authentication**:
     - Authentication is per-sector; re-authenticate when crossing sector boundaries
@@ -272,7 +276,9 @@ void read_ndef_message(pn5180_proto_t *proto)
 
 - **CRC policy (ISO14443A)**: Anticollision runs with CRC disabled; SELECT uses CRC enabled. After SELECT, CRC remains enabled.
 
-- **RF field control**: Toggle RF off/on between scans (`pn5180_rf_off()` / `pn5180_rf_on()`) and allow ~5 ms for tags to return to IDLE.
+- **RF field control**: Toggle RF off/on between scans (`pn5180_setRF_off()` / `pn5180_setRF_on()`) and allow ~5 ms for tags to return to IDLE.
+
+- **Initialization checks**: `pn5180_init()` validates the detected firmware version and fails early if the reader does not meet the minimum supported revision.
 
 - **UID enumeration**: `get_all_uids()` returns a heap-allocated array (max 14 cards). Always free after use; returns NULL if no cards detected.
 
