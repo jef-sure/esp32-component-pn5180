@@ -9,6 +9,13 @@ static const char *TAG = "pn5180-14443";
 
 static const uint16_t pn5180_iso14443_4_fs_table[] = {16, 24, 32, 40, 48, 64, 96, 128, 256, 512, 1024, 2048, 4096};
 
+typedef enum {
+    RX_RESULT_OK,
+    RX_RESULT_TIMEOUT,
+    RX_RESULT_PROTOCOL_ERROR,
+    RX_RESULT_FATAL,
+} rx_result_t;
+
 static nfc_uids_array_t *pn5180_14443_get_all_uids(pn5180_t *pn5180);
 
 static bool pn5180_mifare_halt(pn5180_t *pn5180);
@@ -20,8 +27,8 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
 static bool pn5180_iso14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len);
 static bool pn5180_14443_setupRF(pn5180_t *pn5180);
 static void pn5180_iso14443_4_reset_state(pn5180_t *pn5180);
-static bool pn5180_iso14443_4_receive_frame(pn5180_t *pn5180, const char *operation, int64_t timeout_ms, uint8_t *rx_buf, size_t rx_buf_size,
-                                            uint16_t *received);
+static rx_result_t pn5180_iso14443_4_receive_frame(pn5180_t *pn5180, const char *operation, int64_t timeout_ms, uint8_t *rx_buf, size_t rx_buf_size,
+                                                   uint16_t *received);
 static bool pn5180_iso14443_4_send_r_ack(pn5180_t *pn5180);
 static bool pn5180_iso14443_4_send_s_wtx(pn5180_t *pn5180, uint8_t wtxm);
 static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, uint16_t ats_len);
@@ -42,8 +49,8 @@ static void pn5180_iso14443_4_reset_state(pn5180_t *pn5180)
     pn5180->iso14443_ndef_detected = false;
 }
 
-static bool pn5180_iso14443_4_receive_frame(pn5180_t *pn5180, const char *operation, int64_t timeout_ms, uint8_t *rx_buf, size_t rx_buf_size,
-                                            uint16_t *received)
+static rx_result_t pn5180_iso14443_4_receive_frame(pn5180_t *pn5180, const char *operation, int64_t timeout_ms, uint8_t *rx_buf, size_t rx_buf_size,
+                                                   uint16_t *received)
 {
     uint32_t irqStatus        = 0;
     int64_t  saved_timeout_ms = pn5180->timeout_ms;
@@ -55,24 +62,24 @@ static bool pn5180_iso14443_4_receive_frame(pn5180_t *pn5180, const char *operat
     bool ok            = pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, operation, &irqStatus);
     pn5180->timeout_ms = saved_timeout_ms;
     if (!ok) {
-        return false;
+        return RX_RESULT_TIMEOUT;
     }
     if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
-        ESP_LOGE(TAG, "%s failed with protocol/general error", operation);
-        return false;
+        ESP_LOGW(TAG, "%s: protocol/general error (IRQ=0x%08" PRIx32 ")", operation, irqStatus);
+        return RX_RESULT_PROTOCOL_ERROR;
     }
 
     uint16_t rx_len = pn5180_rxBytesReceived(pn5180);
     if (rx_len == 0 || rx_len > rx_buf_size) {
         ESP_LOGE(TAG, "%s returned invalid frame length %" PRIu16, operation, rx_len);
-        return false;
+        return RX_RESULT_PROTOCOL_ERROR;
     }
     if (!pn5180_readData(pn5180, rx_len, rx_buf)) {
-        return false;
+        return RX_RESULT_FATAL;
     }
 
     *received = rx_len;
-    return true;
+    return RX_RESULT_OK;
 }
 
 static bool pn5180_iso14443_4_send_r_ack(pn5180_t *pn5180)
@@ -998,11 +1005,34 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
     size_t  total_payload      = 0;
 
     while (retransmits < 3) {
-        uint16_t received = 0;
-        if (!pn5180_iso14443_4_receive_frame(pn5180, "T4T Transceive", base_timeout_ms, rx_buf, sizeof(rx_buf), &received)) {
-            ESP_LOGE(TAG, "Timeout waiting for T4T Transceive (PCB=0x%02X)", pcb);
+        uint16_t   received = 0;
+        rx_result_t rx_rc   = pn5180_iso14443_4_receive_frame(pn5180, "T4T Transceive", base_timeout_ms, rx_buf, sizeof(rx_buf), &received);
+
+        if (rx_rc == RX_RESULT_FATAL) {
             free(frame);
             return false;
+        }
+
+        if (rx_rc == RX_RESULT_TIMEOUT || rx_rc == RX_RESULT_PROTOCOL_ERROR) {
+            retransmits++;
+            if (retransmits >= 3) {
+                ESP_LOGE(TAG, "T4T Transceive failed after %d retries", retransmits);
+                free(frame);
+                return false;
+            }
+            ESP_LOGW(TAG, "Receive error (rc=%d), retransmitting (attempt %d)", rx_rc, retransmits);
+            if (total_payload > 0) {
+                if (!pn5180_iso14443_4_send_r_ack(pn5180)) {
+                    free(frame);
+                    return false;
+                }
+            } else {
+                if (!pn5180_sendData(pn5180, frame, frame_len, 0)) {
+                    free(frame);
+                    return false;
+                }
+            }
+            continue;
         }
 
         uint8_t rx_pcb = rx_buf[0];
