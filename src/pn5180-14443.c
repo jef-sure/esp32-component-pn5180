@@ -7,6 +7,8 @@
 
 static const char *TAG = "pn5180-14443";
 
+static const uint16_t pn5180_iso14443_4_fs_table[] = {16, 24, 32, 40, 48, 64, 96, 128, 256, 512, 1024, 2048, 4096};
+
 static nfc_uids_array_t *pn5180_14443_get_all_uids(pn5180_t *pn5180);
 
 static bool pn5180_mifare_halt(pn5180_t *pn5180);
@@ -17,12 +19,124 @@ static void pn5180_14443_detect_desfire_capacity(pn5180_t *pn5180, int *blocks_c
 static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t *rx_len);
 static bool pn5180_iso14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len);
 static bool pn5180_14443_setupRF(pn5180_t *pn5180);
+static void pn5180_iso14443_4_reset_state(pn5180_t *pn5180);
+static bool pn5180_iso14443_4_receive_frame(pn5180_t *pn5180, const char *operation, int64_t timeout_ms, uint8_t *rx_buf, size_t rx_buf_size,
+                                            uint16_t *received);
+static bool pn5180_iso14443_4_send_r_ack(pn5180_t *pn5180);
+static bool pn5180_iso14443_4_send_s_wtx(pn5180_t *pn5180, uint8_t wtxm);
+static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, uint16_t ats_len);
 static bool _pn5180_14443_detect_card_type_and_capacity( //
     pn5180_t  *pn5180,                                   //
     nfc_uid_t *uid,                                      //
     int       *blocks_count,                             //
     int       *block_size                                //
 );
+
+static void pn5180_iso14443_4_reset_state(pn5180_t *pn5180)
+{
+    pn5180->iso14443_layer4_active = false;
+    pn5180->iso14443_block_number  = 0;
+    pn5180->iso14443_frame_size    = 0;
+    pn5180->iso14443_fwt_ms        = 0;
+    pn5180->iso14443_ndef_checked  = false;
+    pn5180->iso14443_ndef_detected = false;
+}
+
+static bool pn5180_iso14443_4_receive_frame(pn5180_t *pn5180, const char *operation, int64_t timeout_ms, uint8_t *rx_buf, size_t rx_buf_size,
+                                            uint16_t *received)
+{
+    uint32_t irqStatus        = 0;
+    int64_t  saved_timeout_ms = pn5180->timeout_ms;
+
+    if (timeout_ms > pn5180->timeout_ms) {
+        pn5180->timeout_ms = timeout_ms;
+    }
+
+    bool ok = pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, operation, &irqStatus);
+    pn5180->timeout_ms = saved_timeout_ms;
+    if (!ok) {
+        return false;
+    }
+    if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
+        ESP_LOGE(TAG, "%s failed with protocol/general error", operation);
+        return false;
+    }
+
+    uint16_t rx_len = pn5180_rxBytesReceived(pn5180);
+    if (rx_len == 0 || rx_len > rx_buf_size) {
+        ESP_LOGE(TAG, "%s returned invalid frame length %" PRIu16, operation, rx_len);
+        return false;
+    }
+    if (!pn5180_readData(pn5180, rx_len, rx_buf)) {
+        return false;
+    }
+
+    *received = rx_len;
+    return true;
+}
+
+static bool pn5180_iso14443_4_send_r_ack(pn5180_t *pn5180)
+{
+    uint8_t r_ack[1] = {(uint8_t)(0xA2 | (pn5180->iso14443_block_number & 0x01))};
+    return pn5180_sendData(pn5180, r_ack, sizeof(r_ack), 0);
+}
+
+static bool pn5180_iso14443_4_send_s_wtx(pn5180_t *pn5180, uint8_t wtxm)
+{
+    uint8_t s_wtx[2] = {0xF2, (uint8_t)(wtxm & 0x3F)};
+    return pn5180_sendData(pn5180, s_wtx, sizeof(s_wtx), 0);
+}
+
+static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, uint16_t ats_len)
+{
+    uint8_t  fsci = 2;
+    uint8_t  fwi  = 4;
+    uint16_t idx  = 1;
+
+    if (ats == NULL || ats_len < 1) {
+        return false;
+    }
+    if (ats[0] > ats_len) {
+        ESP_LOGE(TAG, "ATS length mismatch: TL=%u rx=%" PRIu16, ats[0], ats_len);
+        return false;
+    }
+    if (ats[0] >= 2) {
+        uint8_t t0 = ats[idx++];
+        fsci       = (uint8_t)(t0 & 0x0F);
+        if (fsci >= (sizeof(pn5180_iso14443_4_fs_table) / sizeof(pn5180_iso14443_4_fs_table[0]))) {
+            ESP_LOGE(TAG, "Unsupported ATS FSCI %u", fsci);
+            return false;
+        }
+
+        if (t0 & 0x10) {
+            idx++;
+        }
+        if (t0 & 0x20) {
+            if (idx >= ats[0]) {
+                ESP_LOGE(TAG, "ATS missing TB1");
+                return false;
+            }
+            fwi = (uint8_t)((ats[idx] >> 4) & 0x0F);
+            idx++;
+        }
+        if (t0 & 0x40) {
+            idx++;
+        }
+    }
+
+    pn5180->iso14443_frame_size = (uint16_t)(pn5180_iso14443_4_fs_table[fsci] - 2u);
+    if (fwi > 14) {
+        fwi = 14;
+    }
+    pn5180->iso14443_fwt_ms = (((302LL << fwi) + 3625LL) + 999LL) / 1000LL;
+    if (pn5180->iso14443_fwt_ms < 1) {
+        pn5180->iso14443_fwt_ms = 1;
+    }
+
+    PN5180_LOGD(TAG, "ATS applied: FSCI=%u frame=%u FWI=%u FWT=%" PRId64 "ms", fsci, pn5180->iso14443_frame_size, fwi,
+                pn5180->iso14443_fwt_ms);
+    return true;
+}
 
 static bool _pn5180_14443_setupRF(pn5180_proto_t *proto)
 {
@@ -770,9 +884,13 @@ static bool pn5180_14443_sendRATS(pn5180_t *pn5180)
     uint8_t  ats[64];
     uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
     if (rxLen > 0) {
-        pn5180_readData(pn5180, rxLen, ats);
+        if (!pn5180_readData(pn5180, rxLen, ats)) {
+            return false;
+        }
         PN5180_LOGD(TAG, "Received ATS (%" PRIu16 " bytes)", rxLen);
-        // We are now in ISO 14443-4 Layer 4
+        if (!pn5180_iso14443_4_apply_ats(pn5180, ats, rxLen)) {
+            return false;
+        }
         pn5180->iso14443_block_number = 0;
         return true;
     }
@@ -835,10 +953,19 @@ static bool pn5180_activate_layer4_ndef(pn5180_t *pn5180)
 
 static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t *rx_len)
 {
+    if (pn5180 == NULL || tx == NULL || rx == NULL || rx_len == NULL || *rx_len == 0) {
+        return false;
+    }
+
     // Wrap APDU in I-Block (PCB | INF)
     // PCB I-Block: 0000001b (0x02) or 00000011b (0x03)
     // Bit 1 toggles (Block Number)
     uint8_t pcb = 0x02 | (pn5180->iso14443_block_number & 0x01);
+
+    if (pn5180->iso14443_frame_size != 0 && (tx_len + 1) > pn5180->iso14443_frame_size) {
+        ESP_LOGE(TAG, "Layer 4 APDU too large for current FSC: tx=%zu frame=%u", tx_len + 1, pn5180->iso14443_frame_size);
+        return false;
+    }
 
     // Allocate temp buffer for Frame (PCB + INF)
     uint16_t frame_len = tx_len + 1;
@@ -860,72 +987,78 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
 
     if (!ret) return false;
 
-    uint32_t irqStatus = 0;
-    // Standard T=CL wait: RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT
-    // Note: ISO 14443-4 cards can take time. Increase timeout if needed in caller logic
-    // (but pn5180_wait_for_irq handles the configured timeout).
-    if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "T4T Transceive", &irqStatus)) {
-        ESP_LOGE(TAG, "Timeout waiting for T4T Transceive (PCB=0x%02X)", pcb);
-        return false;
-    }
-
-    if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
-        ESP_LOGE(TAG, "Layer 4 Protocol Error (IRQ=0x%08" PRIx32 ")", irqStatus);
-        return false;
-    }
-
-    uint16_t received = pn5180_rxBytesReceived(pn5180);
-
-    // Read raw response (PCB + INF + CRC dropped by HW usually)
     uint8_t rx_buf[260];
-    if (received > sizeof(rx_buf)) received = sizeof(rx_buf);
+    int64_t base_timeout_ms = pn5180->iso14443_fwt_ms > 0 ? pn5180->iso14443_fwt_ms : pn5180->timeout_ms;
+    int     retransmits     = 0;
 
-    if (received > 0) {
-        pn5180_readData(pn5180, received, rx_buf);
-
-        // Response format: [PCB] [INF...] [CRC? No, HW usually strips it]
-
-        // Check PCB
-        uint8_t rx_pcb = rx_buf[0];
-
-        // Basic check: is it an I-Block? (00xxxxxx)
-        if ((rx_pcb & 0xC0) == 0x00) {
-            // It is an I-Block.
-            // Toggle local block number ONLY if the received block number matches what we sent?
-            // Standard says: Acknowledge valid I-Block by toggle.
-            // TODO: If Type 4 or DESFire exchange issues are ever reported, validate the
-            // received block number before toggling the local sequence bit.
-            pn5180->iso14443_block_number = !pn5180->iso14443_block_number;
-        } else if ((rx_pcb & 0xC0) == 0x80) {
-            // R-Block (ACK/NAK)
-            // If we receive an ACK, we might need to retransmit or fetch next.
-            // This simple implementation does not handle chaining/retries yet.
-            // TODO: If Layer 4 communication becomes flaky, implement R-Block handling
-            // instead of treating every R-Block as a hard failure.
-            ESP_LOGW(TAG, "Received R-Block (0x%02X), not fully supported", rx_pcb);
-            // We can treat it as failure for now or try to extract data if any.
-            // R-Block has no INF usually.
-            return false;
-        } else if ((rx_pcb & 0xC0) == 0xC0) {
-            // S-Block (WTX, DESELECT)
-            // WTX is crucial for slow operations.
-            if ((rx_pcb & 0x30) == 0x30) { // WTX
-                // TODO: If cards request more processing time in the field, implement WTX
-                // response handling here instead of failing the transaction.
-                ESP_LOGW(TAG, "Received WTX request, not supported yet");
-            }
+    while (retransmits < 3) {
+        uint16_t received = 0;
+        if (!pn5180_iso14443_4_receive_frame(pn5180, "T4T Transceive", base_timeout_ms, rx_buf, sizeof(rx_buf), &received)) {
+            ESP_LOGE(TAG, "Timeout waiting for T4T Transceive (PCB=0x%02X)", pcb);
             return false;
         }
 
-        // Copy payload (skip PCB)
-        if (received >= 1) {
+        uint8_t rx_pcb = rx_buf[0];
+        if ((rx_pcb & 0xC0) == 0x00) {
+            if ((rx_pcb & 0x01) != (pn5180->iso14443_block_number & 0x01)) {
+                ESP_LOGE(TAG, "Unexpected I-Block number: got=%u expected=%u", rx_pcb & 0x01, pn5180->iso14443_block_number & 0x01);
+                return false;
+            }
+            if ((rx_pcb & 0x10) != 0) {
+                ESP_LOGW(TAG, "Received chained I-Block, not supported yet");
+                return false;
+            }
+            if (received < 1) {
+                return false;
+            }
+
             size_t payload_len = received - 1;
-            if (rx_len && payload_len > *rx_len) payload_len = *rx_len;
+            if (payload_len > *rx_len) {
+                ESP_LOGE(TAG, "Layer 4 response too large: %zu > %zu", payload_len, *rx_len);
+                return false;
+            }
             memcpy(rx, &rx_buf[1], payload_len);
-            if (rx_len) *rx_len = payload_len;
+            *rx_len = payload_len;
+            pn5180->iso14443_block_number ^= 0x01;
             return true;
         }
+
+        if ((rx_pcb & 0xC0) == 0x80) {
+            ESP_LOGW(TAG, "Received R-Block (0x%02X), retransmitting I-Block", rx_pcb);
+            retransmits++;
+            if (retransmits >= 3) {
+                return false;
+            }
+            if (!pn5180_sendData(pn5180, frame, frame_len, 0)) {
+                return false;
+            }
+            continue;
+        }
+
+        if ((rx_pcb & 0xC0) == 0xC0) {
+            if ((rx_pcb & 0x30) == 0x30) {
+                uint8_t wtxm = (received >= 2) ? (uint8_t)(rx_buf[1] & 0x3F) : 0;
+                if (wtxm == 0) {
+                    ESP_LOGE(TAG, "Invalid WTX frame received");
+                    return false;
+                }
+                if (!pn5180_iso14443_4_send_s_wtx(pn5180, wtxm)) {
+                    return false;
+                }
+                base_timeout_ms *= wtxm;
+                if (base_timeout_ms < 1) {
+                    base_timeout_ms = 1;
+                }
+                continue;
+            }
+            ESP_LOGE(TAG, "Unsupported S-Block 0x%02X", rx_pcb);
+            return false;
+        }
+
+        ESP_LOGE(TAG, "Unknown ISO14443-4 PCB 0x%02X", rx_pcb);
+        return false;
     }
+
     return false;
 }
 
@@ -1076,10 +1209,7 @@ static bool pn5180_14443_select_by_uid( //
     uint8_t atqa[2];
 
     // Reset Layer 4 state for new selection
-    pn5180->iso14443_layer4_active = false;
-    pn5180->iso14443_block_number  = 0;
-    pn5180->iso14443_ndef_checked  = false;
-    pn5180->iso14443_ndef_detected = false;
+    pn5180_iso14443_4_reset_state(pn5180);
 
     prepare_14443A_activation(pn5180);
     if (!pn5180_14443_sendWUPA(pn5180, atqa)) {
@@ -1180,6 +1310,6 @@ static bool pn5180_mifare_halt(pn5180_t *pn5180)
     pn5180_disable_crc(pn5180);
     pn5180_set_transceiver_idle(pn5180);
     pn5180_writeRegisterWithAndMask(pn5180, SYSTEM_CONFIG, SYSTEM_CONFIG_CLEAR_CRYPTO_MASK);
-    pn5180->iso14443_layer4_active = false;
+    pn5180_iso14443_4_reset_state(pn5180);
     return ret;
 }

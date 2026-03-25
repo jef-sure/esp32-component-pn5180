@@ -134,6 +134,8 @@ typedef struct _pn5180_t
     // ISO14443-4 State
     uint8_t iso14443_current_card_type; // Maps to nfc_type_t, but using uint8_t to avoid circular dependency if valid
     uint8_t iso14443_block_number;      // PCB toggle
+    uint16_t iso14443_frame_size;       // Max ISO14443-4 frame size excluding CRC bytes
+    int64_t  iso14443_fwt_ms;           // Frame waiting time derived from ATS
     bool    iso14443_layer4_active;
     bool    iso14443_ndef_checked;  // Cache for NDEF Application presence check
     bool    iso14443_ndef_detected; // Result of NDEF Application presence check

@@ -13,6 +13,20 @@ static const char *TAG = "pn5180-15693";
 
 static bool pn5180_iso15693_stay_quiet(pn5180_t *pn5180, uint8_t *uid);
 
+static bool pn5180_iso15693_check_response(const char *operation, const uint8_t *buffer, uint16_t num_bytes)
+{
+    if (buffer == NULL || num_bytes == 0) {
+        ESP_LOGE(TAG, "%s: empty response", operation);
+        return false;
+    }
+    if ((buffer[0] & 0x01) != 0) {
+        uint8_t error_code = (num_bytes > 1) ? buffer[1] : 0x00;
+        ESP_LOGW(TAG, "%s: ISO15693 error flags=0x%02X code=0x%02X", operation, buffer[0], error_code);
+        return false;
+    }
+    return true;
+}
+
 /*
 | **26 kbit/s**    | 0x0D | 0x8D | ISO 15693 (ASK100)             |
 | **26 kbit/s**    | 0x0E | 0x8E | ISO 15693 (ASK10)              |
@@ -401,8 +415,11 @@ static bool pn5180_iso15693_select_by_uid( //
     }
     uint16_t num_bytes = 0;
     uint8_t  rx_buf[8];
-    if (!pn5180_wait_read_rx(pn5180, RX_IRQ_STAT | TIMER2_IRQ_STAT, "ISO15693 Select", rx_buf, sizeof(rx_buf), &num_bytes, NULL)) {
+    if (!pn5180_wait_read_rx(pn5180, RX_IRQ_STAT | TIMER2_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "ISO15693 Select", rx_buf, sizeof(rx_buf), &num_bytes, NULL)) {
         PN5180_LOGD(TAG, "select_by_uid: wait/read failed");
+        return false;
+    }
+    if (!pn5180_iso15693_check_response("select_by_uid", rx_buf, num_bytes)) {
         return false;
     }
 
@@ -476,6 +493,9 @@ static bool pn5180_iso15693_get_system_info(pn5180_t *pn5180, uint8_t *buf, size
         PN5180_LOGD(TAG, "sysinfo: wait/read failed");
         return false;
     }
+    if (!pn5180_iso15693_check_response("sysinfo", buf, num_bytes)) {
+        return false;
+    }
     if (num_bytes == 0) {
         PN5180_LOGD(TAG, "sysinfo: no data");
         return false;
@@ -524,9 +544,10 @@ static bool pn5180_iso15693_block_read(pn5180_t *pn5180, int blockno, uint8_t *b
         PN5180_LOGD(TAG, "block_read: rx too short (%u)", (unsigned)num_bytes);
         return false;
     }
+    if (!pn5180_iso15693_check_response("block_read", temp, num_bytes)) {
+        return false;
+    }
 
-    // TODO: If ISO15693 read failures are ever reported in the field, verify the response
-    // flags byte here before treating temp[1..] as payload data.
     size_t data_len = num_bytes - 1;
     size_t copy_len = (data_len < buffer_len) ? data_len : buffer_len;
     memcpy(buffer, &temp[1], copy_len);
@@ -580,9 +601,10 @@ static int pn5180_iso15693_block_write(pn5180_t *pn5180, int blockno, const uint
         PN5180_LOGD(TAG, "block_write: no response");
         return -8;
     }
+    if (!pn5180_iso15693_check_response("block_write", temp, num_bytes)) {
+        return -9;
+    }
 
-    // TODO: If write success is ever questioned, inspect the ISO15693 response flags byte
-    // and error code instead of treating any non-empty response as success.
     return 0;
 }
 
