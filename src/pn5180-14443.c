@@ -957,6 +957,9 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
         return false;
     }
 
+    size_t rx_capacity = *rx_len;
+    *rx_len            = 0;
+
     // Wrap APDU in I-Block (PCB | INF)
     // PCB I-Block: 0000001b (0x02) or 00000011b (0x03)
     // Bit 1 toggles (Block Number)
@@ -983,18 +986,21 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
     // Transceive (CMD 0x09)
     // PN5180 transmits exactly what we give it (plus CRC)
     bool ret = pn5180_sendData(pn5180, frame, frame_len, 0);
-    free(frame);
-
-    if (!ret) return false;
+    if (!ret) {
+        free(frame);
+        return false;
+    }
 
     uint8_t rx_buf[260];
     int64_t base_timeout_ms = pn5180->iso14443_fwt_ms > 0 ? pn5180->iso14443_fwt_ms : pn5180->timeout_ms;
     int     retransmits     = 0;
+    size_t  total_payload   = 0;
 
     while (retransmits < 3) {
         uint16_t received = 0;
         if (!pn5180_iso14443_4_receive_frame(pn5180, "T4T Transceive", base_timeout_ms, rx_buf, sizeof(rx_buf), &received)) {
             ESP_LOGE(TAG, "Timeout waiting for T4T Transceive (PCB=0x%02X)", pcb);
+            free(frame);
             return false;
         }
 
@@ -1002,24 +1008,35 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
         if ((rx_pcb & 0xC0) == 0x00) {
             if ((rx_pcb & 0x01) != (pn5180->iso14443_block_number & 0x01)) {
                 ESP_LOGE(TAG, "Unexpected I-Block number: got=%u expected=%u", rx_pcb & 0x01, pn5180->iso14443_block_number & 0x01);
-                return false;
-            }
-            if ((rx_pcb & 0x10) != 0) {
-                ESP_LOGW(TAG, "Received chained I-Block, not supported yet");
+                free(frame);
                 return false;
             }
             if (received < 1) {
+                free(frame);
                 return false;
             }
 
             size_t payload_len = received - 1;
-            if (payload_len > *rx_len) {
-                ESP_LOGE(TAG, "Layer 4 response too large: %zu > %zu", payload_len, *rx_len);
+            if ((total_payload + payload_len) > rx_capacity) {
+                ESP_LOGE(TAG, "Layer 4 response too large: %zu > %zu", total_payload + payload_len, rx_capacity);
+                free(frame);
                 return false;
             }
-            memcpy(rx, &rx_buf[1], payload_len);
-            *rx_len = payload_len;
+            memcpy(&rx[total_payload], &rx_buf[1], payload_len);
+            total_payload += payload_len;
             pn5180->iso14443_block_number ^= 0x01;
+
+            if ((rx_pcb & 0x10) != 0) {
+                if (!pn5180_iso14443_4_send_r_ack(pn5180)) {
+                    free(frame);
+                    return false;
+                }
+                retransmits = 0;
+                continue;
+            }
+
+            *rx_len = total_payload;
+            free(frame);
             return true;
         }
 
@@ -1027,9 +1044,11 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
             ESP_LOGW(TAG, "Received R-Block (0x%02X), retransmitting I-Block", rx_pcb);
             retransmits++;
             if (retransmits >= 3) {
+                free(frame);
                 return false;
             }
             if (!pn5180_sendData(pn5180, frame, frame_len, 0)) {
+                free(frame);
                 return false;
             }
             continue;
@@ -1040,9 +1059,11 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
                 uint8_t wtxm = (received >= 2) ? (uint8_t)(rx_buf[1] & 0x3F) : 0;
                 if (wtxm == 0) {
                     ESP_LOGE(TAG, "Invalid WTX frame received");
+                    free(frame);
                     return false;
                 }
                 if (!pn5180_iso14443_4_send_s_wtx(pn5180, wtxm)) {
+                    free(frame);
                     return false;
                 }
                 base_timeout_ms *= wtxm;
@@ -1052,13 +1073,16 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
                 continue;
             }
             ESP_LOGE(TAG, "Unsupported S-Block 0x%02X", rx_pcb);
+            free(frame);
             return false;
         }
 
         ESP_LOGE(TAG, "Unknown ISO14443-4 PCB 0x%02X", rx_pcb);
+        free(frame);
         return false;
     }
 
+    free(frame);
     return false;
 }
 
