@@ -47,6 +47,10 @@
 #define FIRMWARE_VERSION (0x12)
 #define EEPROM_VERSION   (0x14)
 #define IRQ_PIN_CONFIG   (0x1A)
+#define PN5180_EEPROM_MIN_ADDR      0x16u
+#define PN5180_EEPROM_MAX_ADDR      0xFDu
+#define PN5180_MIN_FIRMWARE_VERSION 0x0304u
+#define PN5180_MAX_WAKEUP_COUNTER_MS 2690u
 
 // PN5180 EEPROM Addresses - LPCD (Low Power Card Detection)
 #define DPC_XI (0x5C) // DPC AGC Trim Value

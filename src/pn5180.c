@@ -36,6 +36,48 @@
 
 static const char TAG[] = "PN5180";
 
+static bool pn5180_validate_eeprom_read(uint8_t addr, int len)
+{
+    if (len <= 0 || len > 0xFF) {
+        return false;
+    }
+    if (addr > PN5180_EEPROM_MAX_ADDR) {
+        return false;
+    }
+
+    return (uint32_t)len <= ((uint32_t)PN5180_EEPROM_MAX_ADDR - (uint32_t)addr + 1u);
+}
+
+static bool pn5180_validate_eeprom_write(uint8_t addr, int len)
+{
+    if (len <= 0 || len > 0xFF) {
+        return false;
+    }
+    if (addr < PN5180_EEPROM_MIN_ADDR || addr > PN5180_EEPROM_MAX_ADDR) {
+        return false;
+    }
+
+    return (uint32_t)len <= ((uint32_t)PN5180_EEPROM_MAX_ADDR - (uint32_t)addr + 1u);
+}
+
+static bool pn5180_read_firmware_version(pn5180_t *pn5180, uint16_t *fw_version)
+{
+    uint8_t eeprom_data[2];
+
+    if (fw_version == NULL) {
+        return false;
+    }
+    if (!pn5180_readEEprom(pn5180, FIRMWARE_VERSION, eeprom_data, sizeof(eeprom_data))) {
+        return false;
+    }
+    if (eeprom_data[0] == 0xFF && eeprom_data[1] == 0xFF) {
+        return false;
+    }
+
+    *fw_version = (uint16_t)((uint16_t)eeprom_data[1] << 8) | eeprom_data[0];
+    return true;
+}
+
 void pn5180_delay_ms(int ms)
 {
     int64_t start = esp_timer_get_time();
@@ -158,11 +200,24 @@ pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_n
         pn5180_deinit(ret, false);
         return NULL;
     }
-    uint8_t eeprom_data[2];
-    if (!pn5180_readEEprom(ret, MFC_AUTH_TIMEOUT, eeprom_data, sizeof(eeprom_data))) {
+    uint16_t firmware_version = 0;
+    if (!pn5180_read_firmware_version(ret, &firmware_version)) {
+        ESP_LOGE(TAG, "Failed to read PN5180 firmware version");
+        pn5180_deinit(ret, false);
+        return NULL;
+    }
+    if (firmware_version < PN5180_MIN_FIRMWARE_VERSION) {
+        ESP_LOGE(TAG, "Unsupported PN5180 firmware version 0x%04X", firmware_version);
+        pn5180_deinit(ret, false);
+        return NULL;
+    }
+
+    uint8_t auth_timeout[2];
+    if (!pn5180_readEEprom(ret, MFC_AUTH_TIMEOUT, auth_timeout, sizeof(auth_timeout))) {
         ESP_LOGW(TAG, "Failed to set MFC_AUTH_TIMEOUT to maximum");
     } else {
-        PN5180_LOGD(TAG, "Current MFC_AUTH_TIMEOUT: 0x%02X 0x%02X", eeprom_data[0], eeprom_data[1]);
+        PN5180_LOGD(TAG, "PN5180 firmware version: 0x%04X", firmware_version);
+        PN5180_LOGD(TAG, "Current MFC_AUTH_TIMEOUT: 0x%02X 0x%02X", auth_timeout[0], auth_timeout[1]);
     }
 
     return ret;
@@ -331,9 +386,7 @@ bool pn5180_readRegister(pn5180_t *pn5180, uint8_t reg, uint32_t *pvalue)
 bool pn5180_readEEprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len)
 {
     uint8_t cmd_buf[3];
-    // TODO: If EEPROM boundary bugs are reported, re-check this range validation against
-    // the PN5180 datasheet wording for the last valid readable address.
-    if (addr > 254 || (addr + len) > 254) {
+    if (buffer == NULL || !pn5180_validate_eeprom_read(addr, len)) {
         ESP_LOGE(TAG, "EEPROM read address out of range: addr=0x%02X, len=%d", addr, len);
         return false;
     }
@@ -349,8 +402,11 @@ bool pn5180_readEEprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len)
 
 bool pn5180_writeEEprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len)
 {
-    // TODO: If EEPROM write issues appear, add explicit address/length bounds validation
-    // matching pn5180_readEEprom() and the PN5180 EEPROM address limits.
+    if (buffer == NULL || !pn5180_validate_eeprom_write(addr, len)) {
+        ESP_LOGE(TAG, "EEPROM write address out of range: addr=0x%02X, len=%d", addr, len);
+        return false;
+    }
+
     uint8_t *cmd_buf = (uint8_t *)malloc(2 + len);
     if (cmd_buf == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for EEPROM write command");
@@ -566,6 +622,11 @@ bool pn5180_clearIRQStatus(pn5180_t *pn5180, uint32_t irqMask)
 
 bool pn5180_switchToLPCD(pn5180_t *pn5180, uint16_t wakeupCounterInMs)
 {
+    if (wakeupCounterInMs == 0 || wakeupCounterInMs > PN5180_MAX_WAKEUP_COUNTER_MS) {
+        ESP_LOGE(TAG, "Invalid LPCD wakeup counter: %u ms", (unsigned)wakeupCounterInMs);
+        return false;
+    }
+
     pn5180_clearAllIRQs(pn5180);
     pn5180_writeRegister(                      //
         pn5180,                                //
@@ -627,7 +688,41 @@ int16_t pn5180_mifareAuthenticate(pn5180_t *pn5180, uint8_t blockno, const uint8
     }
     PN5180_LOGD(TAG, "AUTH response byte: 0x%02X", rcvBuffer[0]);
 
-    // Check response code first - if not 0x00, authentication failed
+    if ((rcvBuffer[0] & 0x01) != 0) {
+        PN5180_LOGD(TAG, "Authentication rejected by PN5180 (response: 0x%02X)", rcvBuffer[0]);
+    } else if ((rcvBuffer[0] & 0x02) != 0) {
+        PN5180_LOGW(TAG, "Authentication timed out (response: 0x%02X)", rcvBuffer[0]);
+    } else if (rcvBuffer[0] != 0x00) {
+        PN5180_LOGW(TAG, "Authentication returned unexpected response 0x%02X", rcvBuffer[0]);
+    } else {
+        uint32_t systemConfig = 0;
+        if (!pn5180_readRegister(pn5180, SYSTEM_CONFIG, &systemConfig)) {
+            ESP_LOGE(TAG, "Failed to verify MIFARE authentication state");
+            pn5180_writeRegisterWithAndMask(pn5180, SYSTEM_CONFIG, SYSTEM_CONFIG_CLEAR_CRYPTO_MASK);
+            pn5180_set_transceiver_idle(pn5180);
+            pn5180_clearAllIRQs(pn5180);
+            return -4;
+        }
+        if ((systemConfig & SYSTEM_CONFIG_MFC_CRYPTO_ON) != 0) {
+            pn5180_transceive_state_t tstate;
+
+            int64_t deadline = esp_timer_get_time() + 50 * 1000; // 50ms max
+            do {
+                tstate = pn5180_getTransceiveState(pn5180);
+                if (tstate == PN5180_TS_WaitTransmit || tstate == PN5180_TS_Idle) {
+                    break;
+                }
+                esp_rom_delay_us(10);
+            } while (esp_timer_get_time() < deadline);
+
+            pn5180_clearAllIRQs(pn5180);
+            return 0x00;
+        }
+
+        PN5180_LOGW(TAG, "Authentication response was success but MFC_CRYPTO_ON is not set");
+        rcvBuffer[0] = 0x01;
+    }
+
     if (rcvBuffer[0] != 0x00) {
         PN5180_LOGD(TAG, "Authentication failed (response: 0x%02X) - resetting transceiver state", rcvBuffer[0]);
         // Clear Crypto1 bit and reset transceiver to clean state
@@ -659,21 +754,6 @@ int16_t pn5180_mifareAuthenticate(pn5180_t *pn5180, uint8_t blockno, const uint8
 
         return rcvBuffer[0];
     }
-
-    // Authentication response is 0x00 (success) - wait briefly for transceiver readiness
-    // Avoid long IRQ polling; prefer checking transceive state
-    pn5180_transceive_state_t tstate;
-
-    int64_t deadline = esp_timer_get_time() + 50 * 1000; // 50ms max
-    do {
-        tstate = pn5180_getTransceiveState(pn5180);
-        if (tstate == PN5180_TS_WaitTransmit || tstate == PN5180_TS_Idle) {
-            break;
-        }
-        esp_rom_delay_us(10);
-    } while (esp_timer_get_time() < deadline);
-
-    pn5180_clearAllIRQs(pn5180);
 
     return 0x00;
 }
@@ -792,32 +872,35 @@ bool pn5180_setRF_off(pn5180_t *pn5180)
 {
     uint32_t rfStatus = 0;
     if (pn5180_readRegister(pn5180, RF_STATUS, &rfStatus)) {
-        if ((rfStatus & 0x01) == 0) {
+        if ((rfStatus & RF_STATUS_TX_RF_STATUS_MASK) == 0) {
             pn5180->is_rf_on = false;
             return true;
         }
     }
+
+    pn5180_clearIRQStatus(pn5180, TX_RFOFF_IRQ_STAT | RFOFF_DET_IRQ_STAT);
+
     uint8_t cmd_buf[] = {PN5180_RF_OFF, 0};
     bool    rc        = transceive_command(pn5180, cmd_buf, sizeof(cmd_buf), NULL, 0);
     if (!rc) {
         ESP_LOGE(TAG, "Failed to set RF off");
+        return false;
     }
+
     int64_t deadline = esp_timer_get_time() + (1000LL * pn5180->timeout_ms);
-    while (0 == (TX_RFOFF_IRQ_STAT & pn5180_getIRQStatus(pn5180))) {
+    while (esp_timer_get_time() <= deadline) {
         if (pn5180_readRegister(pn5180, RF_STATUS, &rfStatus)) {
-            if ((rfStatus & 0x01) == 0) {
-                break; // RF already off
+            if ((rfStatus & RF_STATUS_TX_RF_STATUS_MASK) == 0) {
+                pn5180->is_rf_on = false;
+                pn5180_clearIRQStatus(pn5180, TX_RFOFF_IRQ_STAT | RFOFF_DET_IRQ_STAT);
+                return true;
             }
         }
-        if (esp_timer_get_time() > deadline) {
-            ESP_LOGE(TAG, "Timeout waiting for RF off");
-            return false;
-        }
-        pn5180_delay_ms(10); // brief delay before retry
+        esp_rom_delay_us(50);
     }
-    pn5180->is_rf_on = false;
-    pn5180_clearIRQStatus(pn5180, TX_RFOFF_IRQ_STAT);
-    return true;
+
+    ESP_LOGE(TAG, "Timeout waiting for RF off, RF_STATUS=0x%08" PRIx32, rfStatus);
+    return false;
 }
 
 bool pn5180_sendCommand(pn5180_t *pn5180, uint8_t *sendBuffer, size_t sendBufferLen, uint8_t *recvBuffer, size_t recvBufferLen)
