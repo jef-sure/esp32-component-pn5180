@@ -1,8 +1,8 @@
 #include "pn5180-mifare.h"
 #include "esp_log.h"
 #include "pn5180-internal.h"
-#include <string.h>
 #include <inttypes.h>
+#include <string.h>
 
 static const char *TAG = "pn5180-mifare";
 
@@ -64,8 +64,7 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
     }
 
     if (rxLen > buffer_len) {
-        PN5180_LOGD(TAG, "MIFARE block %d read returned %u bytes, but buffer is only %zu bytes, return required length", blockno, (unsigned)rxLen,
-                    buffer_len);
+        PN5180_LOGD(TAG, "MIFARE block %d read returned %u bytes, but buffer is only %zu bytes, return required length", blockno, (unsigned)rxLen, buffer_len);
         memcpy(buffer, temp_buffer, buffer_len);
     }
 

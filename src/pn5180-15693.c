@@ -3,8 +3,8 @@
 #include "esp_random.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
-#include "pn5180-internal.h"
 #include "freertos/task.h"
+#include "pn5180-internal.h"
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -273,8 +273,8 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, nfc_uids_array_
         bool     collision    = (rx_status & RX_COLLISION_DETECTED) != 0;
         bool     protocol_err = (rx_status & RX_PROTOCOL_ERROR) != 0;
 
-        PN5180_LOGD(TAG, "scan %d: rx_status=0x%08" PRIx32 " len=%u val=0x%" PRIx64 " collision=%d bytes=%u", scan_count, rx_status,
-                (unsigned)current.len, current.val, collision, (unsigned)num_bytes);
+        PN5180_LOGD(TAG, "scan %d: rx_status=0x%08" PRIx32 " len=%u val=0x%" PRIx64 " collision=%d bytes=%u", scan_count, rx_status, (unsigned)current.len,
+                    current.val, collision, (unsigned)num_bytes);
 
         if (collision) {
             // Check for "Noise" vs "Real Collision"

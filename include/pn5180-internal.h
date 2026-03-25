@@ -30,6 +30,9 @@
     } while (0)
 #endif
 
+/** @brief Warning log macro (always enabled) */
+#define PN5180_LOGW(tag, format, ...) ESP_LOGW(tag, format, ##__VA_ARGS__)
+
 /**
  * @brief Wait for RX IRQ and read received data into a buffer
  * @param pn5180 Pointer to PN5180 device structure

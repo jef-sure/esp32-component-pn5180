@@ -9,7 +9,8 @@ static const char *TAG = "pn5180-14443";
 
 static const uint16_t pn5180_iso14443_4_fs_table[] = {16, 24, 32, 40, 48, 64, 96, 128, 256, 512, 1024, 2048, 4096};
 
-typedef enum {
+typedef enum
+{
     RX_RESULT_OK,
     RX_RESULT_TIMEOUT,
     RX_RESULT_PROTOCOL_ERROR,
@@ -20,19 +21,19 @@ static nfc_uids_array_t *pn5180_14443_get_all_uids(pn5180_t *pn5180);
 
 static bool pn5180_mifare_halt(pn5180_t *pn5180);
 
-static bool pn5180_14443_select_by_uid(pn5180_t *pn5180, nfc_uid_t *uid);
-static bool pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, nfc_type_t *subtype, int *blocks_count);
-static void pn5180_14443_detect_desfire_capacity(pn5180_t *pn5180, int *blocks_count);
-static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t *rx_len);
-static bool pn5180_iso14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len);
-static bool pn5180_14443_setupRF(pn5180_t *pn5180);
-static void pn5180_iso14443_4_reset_state(pn5180_t *pn5180);
+static bool        pn5180_14443_select_by_uid(pn5180_t *pn5180, nfc_uid_t *uid);
+static bool        pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, nfc_type_t *subtype, int *blocks_count);
+static void        pn5180_14443_detect_desfire_capacity(pn5180_t *pn5180, int *blocks_count);
+static bool        pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t *rx_len);
+static bool        pn5180_iso14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len);
+static bool        pn5180_14443_setupRF(pn5180_t *pn5180);
+static void        pn5180_iso14443_4_reset_state(pn5180_t *pn5180);
 static rx_result_t pn5180_iso14443_4_receive_frame(pn5180_t *pn5180, const char *operation, int64_t timeout_ms, uint8_t *rx_buf, size_t rx_buf_size,
                                                    uint16_t *received);
-static bool pn5180_iso14443_4_send_r_ack(pn5180_t *pn5180);
-static bool pn5180_iso14443_4_send_s_wtx(pn5180_t *pn5180, uint8_t wtxm);
-static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, uint16_t ats_len);
-static bool _pn5180_14443_detect_card_type_and_capacity( //
+static bool        pn5180_iso14443_4_send_r_ack(pn5180_t *pn5180);
+static bool        pn5180_iso14443_4_send_s_wtx(pn5180_t *pn5180, uint8_t wtxm);
+static bool        pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, uint16_t ats_len);
+static bool        _pn5180_14443_detect_card_type_and_capacity( //
     pn5180_t  *pn5180,                                   //
     nfc_uid_t *uid,                                      //
     int       *blocks_count,                             //
@@ -1005,8 +1006,8 @@ static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, si
     size_t  total_payload      = 0;
 
     while (retransmits < 3) {
-        uint16_t   received = 0;
-        rx_result_t rx_rc   = pn5180_iso14443_4_receive_frame(pn5180, "T4T Transceive", base_timeout_ms, rx_buf, sizeof(rx_buf), &received);
+        uint16_t    received = 0;
+        rx_result_t rx_rc    = pn5180_iso14443_4_receive_frame(pn5180, "T4T Transceive", base_timeout_ms, rx_buf, sizeof(rx_buf), &received);
 
         if (rx_rc == RX_RESULT_FATAL) {
             free(frame);
