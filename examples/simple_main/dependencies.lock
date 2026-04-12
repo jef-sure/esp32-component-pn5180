@@ -1,0 +1,18 @@
+dependencies:
+  idf:
+    source:
+      type: idf
+    version: 6.0.0
+  jef-sure/pn5180:
+    dependencies:
+    - name: idf
+      version: '>=5.0.0'
+    source:
+      path: ../..
+      type: local
+    version: 0.1.0
+direct_dependencies:
+- jef-sure/pn5180
+manifest_hash: 6b92a6daf24a4a789e4344d86e08cceb81a1d532a4bc4d03d3bb123992e9f7e4
+target: esp32c3
+version: 3.0.0

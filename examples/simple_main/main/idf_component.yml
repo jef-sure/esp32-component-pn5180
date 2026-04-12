@@ -1,0 +1,4 @@
+dependencies:
+  jef-sure/pn5180:
+    version: "*"
+    override_path: '../../../'
