@@ -26,12 +26,12 @@ static const char *TAG = "main";
 
 enum
 {
-    PN5180_RST  = GPIO_NUM_12,
-    PN5180_SCK  = GPIO_NUM_18,
-    PN5180_MOSI = GPIO_NUM_23,
-    PN5180_MISO = GPIO_NUM_19,
-    PN5180_NSS  = GPIO_NUM_5,
-    PN5180_BUSY = GPIO_NUM_21,
+    PN5180_RST  = GPIO_NUM_4,
+    PN5180_SCK  = GPIO_NUM_6,
+    PN5180_MOSI = GPIO_NUM_7,
+    PN5180_MISO = GPIO_NUM_8,
+    PN5180_NSS  = GPIO_NUM_9,
+    PN5180_BUSY = GPIO_NUM_5,
     PN5180_FREQ = 7000000,
 };
 
@@ -373,7 +373,7 @@ static bool read_version(pn5180_t *pn5180, uint8_t addr, const char *name)
 
 static bool init_pn5180_hardware(pn5180_t **pn5180_out)
 {
-    pn5180_spi_t *spi = pn5180_spi_init(VSPI_HOST, PN5180_SCK, PN5180_MISO, PN5180_MOSI, PN5180_FREQ);
+    pn5180_spi_t *spi = pn5180_spi_init(SPI3_HOST, PN5180_SCK, PN5180_MISO, PN5180_MOSI, PN5180_FREQ);
     if (spi == NULL) {
         ESP_LOGE(TAG, "Failed to initialize PN5180 SPI");
         return false;
@@ -463,4 +463,8 @@ void app_run(void)
 
         pn5180_delay_ms(2000);
     }
+}
+
+void app_main(void) {
+    app_run();
 }
