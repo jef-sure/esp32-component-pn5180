@@ -60,3 +60,8 @@ sdkconfig.old
 dist/
 **/dist/
 *.old
+
+# generated files
+dependencies.lock
+sdkconfig
+

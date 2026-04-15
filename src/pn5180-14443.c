@@ -835,23 +835,18 @@ static bool pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, nfc_type_t 
         *subtype      = PN5180_MIFARE_ULTRALIGHT_EV1;
         *blocks_count = 41;
         break;
-    case 0x0F: // NTAG variant with ~142 bytes (45 pages)
-        PN5180_LOGD(TAG, "Detected NTAG variant (storage_size=0x0F, ~142 bytes, 45 pages)");
+    case 0x0F: // NTAG variant with 180 bytes (45 pages)
+        PN5180_LOGD(TAG, "Detected NTAG variant (180 bytes total, 45 pages)");
         *subtype      = PN5180_MIFARE_NTAG213;
         *blocks_count = 45;
         break;
-    case 0x11: // NTAG213 180 bytes total (45 pages)
-        PN5180_LOGD(TAG, "Detected NTAG213 (180 bytes total, 45 pages)");
-        *subtype      = PN5180_MIFARE_NTAG213;
-        *blocks_count = 45;
-        break;
-    case 0x13: // NTAG215 540 bytes total (135 pages)
+    case 0x11: // NTAG215 540 bytes total (135 pages)
         PN5180_LOGD(TAG, "Detected NTAG215 (540 bytes total, 135 pages)");
         *subtype      = PN5180_MIFARE_NTAG215;
         *blocks_count = 135;
         break;
-    case 0x15: // NTAG216 924 bytes total (231 pages)
-        PN5180_LOGD(TAG, "Detected NTAG216 (924 bytes total, 231 pages)");
+    case 0x13: // NTAG216 924 bytes total (231 pages)
+        PN5180_LOGD(TAG, "Detected NTAG215 (924 bytes total, 231 pages)");
         *subtype      = PN5180_MIFARE_NTAG216;
         *blocks_count = 231;
         break;

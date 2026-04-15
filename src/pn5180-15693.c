@@ -3,6 +3,7 @@
 #include "esp_random.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "pn5180-internal.h"
 #include <inttypes.h>
