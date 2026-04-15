@@ -1,5 +1,18 @@
 # Changelog
 
+## v 0.1.1 - 2026-04-15 
+
+### ESP-IDF 6.0 compatibility, example refresh and tag detection fixes
+
+Changes in this release are credited to [Garag](https://github.com/Garag).
+
+- Reorganized the examples into standalone ESP-IDF apps under `examples/app_logic`, `examples/simple_main`, and `examples/ndef` with their own build files and component manifests.
+- Added ESP-IDF 6.0 compatibility fixes across the examples and core sources, including the include and project layout updates needed by newer IDF builds.
+- Added `app_main()` to the application logic example and updated the default pin mapping and SPI host selection for ESP32-S3 boards.
+- Fixed NTAG21x capacity detection so NTAG213, NTAG215, and NTAG216 storage sizes map to the correct variant.
+- Corrected example component manifest naming and ignored generated example artifacts.
+- Added missing FreeRTOS includes in the driver sources used by the refreshed examples.
+
 ## v 0.1.0 - 2026-03-25
 
 ### Driver and protocol hardening
