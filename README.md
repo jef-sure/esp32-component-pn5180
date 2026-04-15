@@ -311,7 +311,7 @@ void read_ndef_message(pn5180_proto_t *proto)
 
 - **CRC policy (ISO14443A)**: Anticollision runs with CRC disabled; SELECT uses CRC enabled. After SELECT, CRC remains enabled.
 
-- **RF field control**: Toggle RF off/on between scans (`pn5180_setRF_off()` / `pn5180_setRF_on()`) and allow ~5 ms for tags to return to IDLE.
+- **RF field control**: Toggle RF off/on between scans (`pn5180_setRF_off()` / `pn5180_setRF_on()`) and allow 5.1 ms for tags to return to IDLE.
 
 - **Initialization checks**: `pn5180_init()` validates the detected firmware version and fails early if the reader does not meet the minimum supported revision.
 
