@@ -2,7 +2,7 @@
 
 ## Overview
 
-ESP-IDF component for the NXP PN5180 NFC/RFID reader. This implementation provides a robust multi-protocol NFC reader with comprehensive support for ISO14443A, ISO15693, MIFARE Classic/Ultralight, and NDEF message parsing.
+ESP-IDF component for the NXP PN5180 NFC/RFID reader. This implementation provides a robust multi-protocol NFC reader with comprehensive support for ISO14443A, ISO15693, MIFARE Classic/Ultralight, NTAG21x, and NDEF message parsing, and is compatible with ESP-IDF 5.x and 6.0.
 
 ### Features
 - ✅ **ISO14443A** - Anticollision, multi-cascade UID enumeration, card selection
@@ -13,10 +13,15 @@ ESP-IDF component for the NXP PN5180 NFC/RFID reader. This implementation provid
 - ✅ **Multi-card** - Enumerate up to 14 cards in field
 - ✅ **Error detection** - RX/CRC/collision error handling with clean recovery
 - ✅ **SPI** - Tested at 7 MHz with BUSY line synchronization
+- ✅ **ESP-IDF 6.0** - Updated examples and core sources for current ESP-IDF builds
 
 ## Hardware
 
-Default wiring used in the sample app:
+The repository now ships multiple standalone examples. Their default wiring differs by target board.
+
+### `examples/simple_main`
+
+Default wiring for a classic ESP32 board:
 
 | Signal | ESP32 GPIO | Description |
 | ------ | ---------- | ----------- |
@@ -27,26 +32,53 @@ Default wiring used in the sample app:
 | NSS    | 5          | SPI chip select (active low) |
 | BUSY   | 21         | PN5180 busy indicator |
 
-Adjust the GPIO assignments or the SPI host (`VSPI_HOST` by default) to match your board.
+Uses `VSPI_HOST` in the example source.
+
+### `examples/app_logic`
+
+Default wiring for the ESP32-S3 setup used by the richer example app:
+
+| Signal | ESP32-S3 GPIO | Description |
+| ------ | ------------- | ----------- |
+| RST    | 4             | Hardware reset (active low) |
+| SCK    | 6             | SPI clock |
+| MOSI   | 7             | SPI data to PN5180 |
+| MISO   | 8             | SPI data from PN5180 |
+| NSS    | 9             | SPI chip select (active low) |
+| BUSY   | 5             | PN5180 busy indicator |
+
+Uses `SPI3_HOST` in the example source.
+
+Adjust the GPIO assignments and SPI host to match your board.
 
 ## Requirements
 
-- ESP-IDF v5.x (tested) with an ESP32 target.
+- ESP-IDF 5.x or 6.0.
 - 3.3 V PN5180 breakout wired for SPI and BUSY/RST lines.
 - Enough DMA-capable heap for the driver buffers (two 512-byte buffers are allocated).
 
 ## Getting Started
 
-1. Place this repository under your project's `components/` directory (or add it as a git submodule).
-2. Include the headers you need:
+1. Add the component with the ESP-IDF Component Manager:
+
+```bash
+idf.py add-dependency "jef-sure/esp32-component-pn5180^0.1.1"
+```
+
+2. Or place this repository under your project's `components/` directory.
+3. Include the headers you need:
    - `pn5180.h` - Core driver and shared types
    - `pn5180-14443.h` - ISO14443A protocol (MIFARE, NTAG, etc.)
    - `pn5180-15693.h` - ISO15693 protocol (vicinity tags)
    - `pn5180-ndef.h` - NDEF message reading and parsing
    - `pn5180-mifare.h` - MIFARE Classic authentication helpers
-3. Build and flash with `idf.py build flash monitor`.
+4. Build and flash with `idf.py build flash monitor`.
 
-**Note**: The `examples/` directory contains the sample application and standalone reference examples.
+## Examples
+
+- `examples/simple_main` - Minimal scanning example for ISO14443A and ISO15693.
+- `examples/app_logic` - More complete application example with card classification, auth helpers, and ESP32-S3 default pin mapping.
+- `examples/ndef` - Focused NDEF parsing helpers and test code.
 
 ## API Reference
 
@@ -98,6 +130,9 @@ enum {
     PN5180_BUSY = GPIO_NUM_21,
     PN5180_FREQ = 7000000,
 };
+
+// Adjust pins and SPI host to match your board. See the example apps above
+// for the current ESP32 and ESP32-S3 defaults.
 
 void app_main(void)
 {
