@@ -63,6 +63,8 @@ static bool pn5180_15693_setup_rf(pn5180_t *pn5180, uint8_t rf_config)
     pn5180_set_transceiver_idle(pn5180);
     if (pn5180->is_rf_on) {
         pn5180_set_rf_off(pn5180);
+        // Tags drop their Quiet and Selected state only after the field was off long enough.
+        pn5180_delay_us(PN5180_RF_OFF_TIME_US);
     }
     bool ret = pn5180_load_rf_config(pn5180, rf_config);
     if (!ret) {

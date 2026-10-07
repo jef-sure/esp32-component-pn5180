@@ -1,5 +1,13 @@
 # Changelog
 
+## v 0.4.2 - 2026-10-07
+
+### Field-off time of 5.1 ms
+
+- New constant `PN5180_RF_OFF_TIME_US` (5100) and public `pn5180_delay_us()`: the time the RF field has to stay off between scans so that halted cards return to their idle state. 5 ms is not enough.
+- The examples and the README use it; `simple_main` waited exactly 5 ms before.
+- `setup_rf()` waits this time itself when it has to switch the field off to change the RF configuration (switching between ISO14443A and ISO15693, and between the two ISO15693 modulations during inventory). It used to switch the field back on at once, so cards and tags could keep their halted or quiet state.
+
 ## v 0.4.1 - 2026-10-07
 
 ### Fixes from a review of 0.4.0

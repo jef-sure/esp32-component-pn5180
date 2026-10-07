@@ -82,7 +82,7 @@ static bool pn5180_read_firmware_version(pn5180_t *pn5180, uint16_t *fw_version)
 }
 
 // Microsecond delay: sleeps whole ticks and busy-waits the remainder.
-static void pn5180_delay_us(uint32_t us)
+void pn5180_delay_us(uint32_t us)
 {
     int64_t end     = esp_timer_get_time() + us;
     int64_t tick_us = (int64_t)portTICK_PERIOD_MS * 1000;

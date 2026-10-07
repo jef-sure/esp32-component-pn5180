@@ -273,6 +273,8 @@ static bool pn5180_14443_setup_rf(pn5180_t *pn5180)
             return true;
         }
         pn5180_set_rf_off(pn5180);
+        // Cards return to their idle state only after the field was off long enough.
+        pn5180_delay_us(PN5180_RF_OFF_TIME_US);
     }
     bool ret = pn5180_load_rf_config(pn5180, PN5180_14443A_RF_CONFIG);
     if (!ret) {

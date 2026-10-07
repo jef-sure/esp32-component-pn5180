@@ -65,7 +65,8 @@ static void scan_protocol(pn5180_proto_t *proto, const char *label) {
   ESP_LOGI(TAG, "Scanning for %s cards...", label);
 
   pn5180_set_rf_off(proto->pn5180);
-  pn5180_delay_ms(5);
+  // Cards return to their idle state only after the field was off for 5.1 ms.
+  pn5180_delay_us(PN5180_RF_OFF_TIME_US);
   if (!proto->setup_rf(proto)) {
     ESP_LOGE(TAG, "Failed to set up RF for %s", label);
     return;

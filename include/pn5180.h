@@ -697,6 +697,23 @@ pn5180_transceive_state_t pn5180_get_transceive_state(pn5180_t *pn5180);
 void pn5180_delay_ms(int ms);
 
 /**
+ * @brief Delay execution for specified microseconds
+ *
+ * Whole FreeRTOS ticks are slept, the remainder is a busy wait.
+ *
+ * @param us Microseconds to delay
+ */
+void pn5180_delay_us(uint32_t us);
+
+/**
+ * @brief Time the RF field has to stay off for cards to return to their idle state, in microseconds
+ *
+ * Use it between pn5180_set_rf_off() and the next setup_rf(): halted cards answer a new poll only
+ * after the field was off this long. 5 ms is not enough.
+ */
+#define PN5180_RF_OFF_TIME_US 5100u
+
+/**
  * @brief Wait for specific IRQ flag(s) with timeout
  * @param pn5180 Pointer to PN5180 device structure
  * @param irq_mask IRQ flags to wait for

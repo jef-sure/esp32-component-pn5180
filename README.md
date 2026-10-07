@@ -17,7 +17,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/esp32-component-pn5180^0.4.1"
+idf.py add-dependency "jef-sure/esp32-component-pn5180^0.4.2"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.x or 6.0 is required.
@@ -67,7 +67,7 @@ void app_main(void)
     while (true) {
         /* Restart the field so that cards halted by the previous scan answer again. */
         pn5180_set_rf_off(pn5180);
-        pn5180_delay_ms(6);
+        pn5180_delay_us(PN5180_RF_OFF_TIME_US); /* 5.1 ms */
         nfc->setup_rf(nfc);
 
         pn5180_poll_status_t status;
@@ -124,7 +124,7 @@ Each RF protocol is a `pn5180_proto_t` object with the same set of callbacks; on
 
 Every protocol is then used the same way through its callbacks: `setup_rf`, `get_all_uids`, `select_by_uid`, `detect_card_type_and_capacity`, `block_read`, `block_write`, `authenticate`, `halt`. The object is allocated on the heap; release it with `free()`.
 
-- **Switching protocols.** Call the other protocol's `setup_rf()`: it loads its own RF configuration. Switch the field off for about 5 ms between scans (`pn5180_set_rf_off()`), so that cards return to their idle state.
+- **Switching protocols.** Call the other protocol's `setup_rf()`: it loads its own RF configuration. Switch the field off for at least 5.1 ms between scans (`pn5180_set_rf_off()`, then `pn5180_delay_us(PN5180_RF_OFF_TIME_US)`), so that cards return to their idle state.
 - **ISO15693 modulation.** `PN5180_15693_26KASK100` suits most tags; the inventory tries ASK 10 % first and falls back to ASK 100 % on its own.
 
 ## Sample Apps
@@ -312,7 +312,7 @@ A PN5180 command is two SPI transfers, each framed by NSS. The driver holds the 
 
 - **`pn5180_init()` returns NULL** — the PN5180 did not boot or did not report a supported firmware. Check power (5 V and 3.3 V on the usual breakout), ground, and the NSS, BUSY and RST pins. Try a lower SPI clock.
 - **`PN5180 ... timeout waiting for busy level`** — the BUSY line does not follow the SPI transfers: wrong BUSY pin, or NSS not reaching the module.
-- **No cards found, `PN5180_POLL_NO_TARGET`** — check that the field comes up (`setup_rf()` returns true) and that the antenna is not on a metal surface. A card that was halted by the previous scan answers again only after the field was off for about 5 ms.
+- **No cards found, `PN5180_POLL_NO_TARGET`** — check that the field comes up (`setup_rf()` returns true) and that the antenna is not on a metal surface. A card that was halted by the previous scan answers again only after the field was off for at least 5.1 ms (`PN5180_RF_OFF_TIME_US`); 5 ms is too short.
 - **`RF_ON blocked by external RF field (RFCA)`** — another reader's field is present. `pn5180_set_rfca(pn5180, false)` switches the field on regardless.
 - **`select_by_uid()` fails on a card that was just read** — the card is still selected and ignores the wake-up. Call `halt()` first, then `select_by_uid()`.
 - **Reads fail after one refused command** — Ultralight and NTAG cards leave the selected state after any NAK (for example a read beyond the last page), MIFARE Classic after a refused authentication. Select the card again.
@@ -467,7 +467,7 @@ The tests cover polling, selection, card identification, NDEF reading and writin
 - NDEF writing: `pn5180_ndef_make_text_record()`, `pn5180_ndef_make_uri_record()`, `pn5180_ndef_make_mime_record()`, `pn5180_ndef_make_external_record()`, `pn5180_ndef_message_init()`, `pn5180_ndef_message_add()`, `pn5180_ndef_encode_message()`, `pn5180_ndef_write_to_selected_card()`
 - Low power card detection: `pn5180_lpcd_prepare()`, `pn5180_lpcd_enter()`, `pn5180_lpcd_wait()`
 - Raw access: `pn5180_rf_transceive()`, `pn5180_send_data()`, `pn5180_read_data()`, `pn5180_send_command()`, register and EEPROM functions, `pn5180_get_irq_status()`, `pn5180_clear_irq_status()`
-- Timing: `pn5180_set_hw_rx_timeout()`, `pn5180_delay_ms()`
+- Timing: `pn5180_set_hw_rx_timeout()`, `pn5180_delay_ms()`, `pn5180_delay_us()`, `PN5180_RF_OFF_TIME_US`
 
 ## License
 

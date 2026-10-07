@@ -147,6 +147,11 @@ void pn5180_delay_ms(int ms)
     s_time_us += (int64_t)ms * 1000;
 }
 
+void pn5180_delay_us(uint32_t us)
+{
+    s_time_us += us;
+}
+
 /* ---- ESP-IDF functions used by the protocol sources ---- */
 
 int64_t esp_timer_get_time(void)
