@@ -343,23 +343,6 @@ bool pn5180_ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, p
     return ndef_decode_next_ex(in, in_len, offset, out_rec, is_begin, is_end, NULL);
 }
 
-size_t pn5180_ndef_decode_message(const uint8_t *in, size_t in_len, pn5180_ndef_record_t *records, size_t capacity)
-{
-    if (!in || !records || capacity == 0) return 0;
-    size_t pos   = 0;
-    size_t count = 0;
-    while (count < capacity) {
-        bool mb = false, me = false;
-        if (!pn5180_ndef_decode_next(in, in_len, &pos, &records[count], &mb, &me)) {
-            return 0;
-        }
-        count++;
-        if (me) break;
-        if (pos >= in_len) break;
-    }
-    return count;
-}
-
 typedef struct
 {
     size_t logical_record_count;
@@ -437,6 +420,31 @@ static bool ndef_plan_decode(const uint8_t *data, size_t data_len, ndef_decode_p
     }
 
     return message_ended && !in_chunk && plan->logical_record_count > 0;
+}
+
+size_t pn5180_ndef_decode_message(const uint8_t *in, size_t in_len, pn5180_ndef_record_t *records, size_t capacity)
+{
+    if (!in || !records || capacity == 0) return 0;
+
+    // Same structural rules as for a message read from a card
+    ndef_decode_plan_t plan;
+    if (!ndef_plan_decode(in, in_len, &plan)) return 0;
+
+    size_t pos   = 0;
+    size_t count = 0;
+    for (;;) {
+        if (count == capacity) {
+            // More records than the caller has room for: a part of a message is not a message.
+            return 0;
+        }
+        bool me = false;
+        if (!pn5180_ndef_decode_next(in, in_len, &pos, &records[count], NULL, &me)) {
+            return 0;
+        }
+        count++;
+        if (me) break;
+    }
+    return count;
 }
 
 // Second pass: fills the logical records; chunked payloads are concatenated into chunk_payload.

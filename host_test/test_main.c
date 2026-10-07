@@ -259,6 +259,27 @@ static void test_ndef_encoder_refuses_what_the_parser_rejects(void)
     pn5180_ndef_free_parsed_message(parsed);
 }
 
+static void test_ndef_decode_message_follows_the_message_rules(void)
+{
+    pn5180_ndef_record_t records[2];
+
+    const uint8_t good[] = {0x91, 0x01, 0x02, 'U', 0x04, 'x', 0x51, 0x01, 0x03, 'T', 0x00, 'h', 'i'};
+    TEST_ASSERT_EQUAL(2, pn5180_ndef_decode_message(good, sizeof(good), records, 2));
+    // Two records do not fit an array of one: no part of the message is returned
+    TEST_ASSERT_EQUAL(0, pn5180_ndef_decode_message(good, sizeof(good), records, 1));
+
+    const uint8_t no_begin[] = {0x51, 0x01, 0x02, 'U', 0x04, 'x'};
+    TEST_ASSERT_EQUAL(0, pn5180_ndef_decode_message(no_begin, sizeof(no_begin), records, 2));
+    const uint8_t no_end[] = {0x91, 0x01, 0x02, 'U', 0x04, 'x'};
+    TEST_ASSERT_EQUAL(0, pn5180_ndef_decode_message(no_end, sizeof(no_end), records, 2));
+    const uint8_t trailing[] = {0xD1, 0x01, 0x02, 'U', 0x04, 'x', 0x00};
+    TEST_ASSERT_EQUAL(0, pn5180_ndef_decode_message(trailing, sizeof(trailing), records, 2));
+
+    // Chunks come as separate records
+    const uint8_t chunked[] = {0xB1, 0x01, 0x01, 'T', 0x00, 0x56, 0x00, 0x01, 'a'};
+    TEST_ASSERT_EQUAL(2, pn5180_ndef_decode_message(chunked, sizeof(chunked), records, 2));
+}
+
 static void test_ndef_smartposter_follows_the_message_rules(void)
 {
     pn5180_ndef_record_t poster;
@@ -726,6 +747,57 @@ static void test_type2_write_keeps_the_tlvs_in_front_of_the_message(void)
     memcpy(&s_card_a.memory[16], with_reserved, sizeof(with_reserved));
     uri[24 + 10] = '\0';
     TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&records[0], uri, true, payload, sizeof(payload)));
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_UNSUPPORTED, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
+}
+
+static void test_type2_write_stays_inside_the_user_memory(void)
+{
+    // The capability container promises 160 bytes, an NTAG213 has 144: pages 40..43 hold the
+    // dynamic lock bytes and the configuration, and a write must not reach them.
+    sim_a_init_ntag213(&s_card_a);
+    s_card_a.memory[3 * 4 + 2] = 0x14;
+    pn5180_uid_t uid           = activate_card_a();
+
+    char uri[200];
+    strcpy(uri, "https://www.example.com/");
+    memset(uri + 24, 'x', 126);
+    uri[24 + 126] = '\0';
+    pn5180_ndef_record_t  record;
+    pn5180_ndef_record_t  records[1];
+    pn5180_ndef_message_t message;
+    uint8_t               payload[200];
+    TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&record, uri, true, payload, sizeof(payload)));
+    pn5180_ndef_message_init(&message, records, 1);
+    TEST_ASSERT_TRUE(pn5180_ndef_message_add(&message, &record));
+    uint8_t tail[16];
+    memcpy(tail, &s_card_a.memory[40 * 4], sizeof(tail));
+
+    // T, L and the message take 145 bytes
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_CARD_FULL, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
+    TEST_ASSERT_EQUAL_MEMORY(tail, &s_card_a.memory[40 * 4], sizeof(tail));
+
+    // The same message, one byte shorter, fills the user memory
+    uri[24 + 125] = '\0';
+    TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&records[0], uri, true, payload, sizeof(payload)));
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
+    TEST_ASSERT_EQUAL_MEMORY(tail, &s_card_a.memory[40 * 4], sizeof(tail));
+}
+
+static void test_type2_control_tlv_size_zero_means_256(void)
+{
+    // Memory Control TLV: reserved bytes from page 20 on, size 00h. That is 256 bytes, not none.
+    sim_a_init_ntag213(&s_card_a);
+    const uint8_t with_reserved[8] = {0x02, 0x03, 0x50, 0x00, 0x04, 0x03, 0x00, 0xFE};
+    memcpy(&s_card_a.memory[16], with_reserved, sizeof(with_reserved));
+    pn5180_uid_t uid = activate_card_a();
+
+    pn5180_ndef_record_t  record;
+    pn5180_ndef_record_t  records[1];
+    pn5180_ndef_message_t message;
+    uint8_t               payload[64];
+    TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&record, "https://www.example.com/", true, payload, sizeof(payload)));
+    pn5180_ndef_message_init(&message, records, 1);
+    TEST_ASSERT_TRUE(pn5180_ndef_message_add(&message, &record));
     TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_UNSUPPORTED, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
 }
 
@@ -1278,6 +1350,7 @@ int main(void)
     RUN_TEST(test_ndef_rejects_malformed_messages);
     RUN_TEST(test_ndef_encode_rejects_records_without_storage);
     RUN_TEST(test_ndef_encoder_refuses_what_the_parser_rejects);
+    RUN_TEST(test_ndef_decode_message_follows_the_message_rules);
     RUN_TEST(test_ndef_smartposter_follows_the_message_rules);
     RUN_TEST(test_apdu_parse_and_build);
     RUN_TEST(test_poll_without_card_reports_no_target);
@@ -1295,6 +1368,8 @@ int main(void)
     RUN_TEST(test_ndef_write_is_refused_for_classic_and_type4);
     RUN_TEST(test_type2_write_follows_the_capability_container);
     RUN_TEST(test_type2_write_keeps_the_tlvs_in_front_of_the_message);
+    RUN_TEST(test_type2_write_stays_inside_the_user_memory);
+    RUN_TEST(test_type2_control_tlv_size_zero_means_256);
     RUN_TEST(test_classic_ndef_sector_trailer_is_checked);
     RUN_TEST(test_classic_mad_crc_is_checked);
     RUN_TEST(test_classic_without_mad_has_no_ndef);

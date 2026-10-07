@@ -214,16 +214,17 @@ bool pn5180_ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, p
 /**
  * @brief Decode complete NDEF message from buffer
  *
- * Convenience function that decodes up to 'capacity' records.
- * Stops when ME flag is encountered or capacity exhausted. It does not check the message
- * structure (Message Begin, Message End, chunk sequences) and returns chunks as separate
- * records; use pn5180_ndef_parse_message() for data read from a card.
+ * Decodes the records into the caller's array; they point into the input buffer. The message
+ * structure is checked as in pn5180_ndef_parse_message(): Message Begin on the first record
+ * only, Message End on the last one, nothing after it, valid chunk sequences. A message with
+ * more records than 'capacity' returns 0. Chunks are returned as separate records; use
+ * pn5180_ndef_parse_message() to get them assembled, as for data read from a card.
  *
  * @param in Input buffer containing encoded NDEF data
  * @param in_len Length of input buffer
  * @param records Array to store decoded records
- * @param capacity Maximum number of records to decode
- * @return Number of records decoded, 0 on error
+ * @param capacity Size of the records array
+ * @return Number of records decoded, 0 on error or if the array is too small
  */
 size_t pn5180_ndef_decode_message(const uint8_t *in, size_t in_len, pn5180_ndef_record_t *records, size_t capacity);
 
@@ -474,12 +475,12 @@ bool pn5180_ndef_make_external_record(pn5180_ndef_record_t *rec, const char *typ
  * This function decodes those nested records; they point into the payload of rec. The nested
  * message is checked like a message read from a card: a payload without Message End, with a
  * second Message Begin or with data after the last record returns 0, and so does a nested
- * message with chunked records.
+ * message with chunked records or with more records than 'capacity'.
  *
  * @param rec Pointer to Smart Poster record
  * @param records Array to store decoded nested records
- * @param capacity Maximum number of records to decode
- * @return Number of nested records decoded (at most capacity), 0 on error
+ * @param capacity Size of the records array
+ * @return Number of nested records decoded, 0 on error or if the array is too small
  */
 size_t pn5180_ndef_decode_smartposter(const pn5180_ndef_record_t *rec, pn5180_ndef_record_t *records, size_t capacity);
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## v 0.5.1 - 2026-10-07
+
+### Fixes from a review of 0.5.0
+
+Behaviour change to be aware of:
+
+- `pn5180_ndef_decode_message()` and `pn5180_ndef_decode_smartposter()` return 0 for a message with more records than the array holds. They used to return the first `capacity` records without a sign that the rest was missing.
+
+NDEF:
+
+- Type 2: the data area ends with the user memory of the detected tag (page 15 of an Ultralight, NTAG210 and the small Ultralight EV1, 35 of an NTAG212 and the large Ultralight EV1, 39 of an Ultralight C and NTAG213, 129 of an NTAG215, 225 of an NTAG216). It was bounded by the number of pages, so on a tag whose capability container promises more than the tag has, a long message reached the lock, configuration and password pages.
+- Type 2: a Lock Control or Memory Control TLV with the size `00` names 256 bits or bytes; it was taken as an empty area. If these bytes lie inside the data area the tag is `PN5180_NDEF_ERR_UNSUPPORTED`, as for any other size.
+- `pn5180_ndef_decode_message()` checks the message structure like `pn5180_ndef_parse_message()`: Message Begin on the first record only, Message End on the last one, nothing after it, valid chunk sequences. It used to accept a message without Message Begin or Message End. Chunks are still returned as separate records.
+
+ISO15693:
+
+- The CRC is switched on for every request. Select, Reset to Ready (`halt`), Stay Quiet and Get System Information relied on an inventory or a block read having done it before.
+
 ## v 0.5.0 - 2026-10-07
 
 ### NDEF writing reworked and NDEF checks aligned with the NXP reader library; fixes from two comparisons with the PN532 component and from an external review

@@ -17,7 +17,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/esp32-component-pn5180^0.5.0"
+idf.py add-dependency "jef-sure/esp32-component-pn5180^0.5.1"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.x or 6.0 is required.
@@ -482,7 +482,7 @@ The tests cover polling, selection, card identification, NDEF reading for all fo
 - APDU utilities: `pn5180_apdu_parse_command()`, `pn5180_apdu_parse_response()`, `pn5180_apdu_build_response()`, `pn5180_apdu_get_status()`
 - MIFARE raw access: `pn5180_mifare_authenticate()`, `pn5180_mifare_block_read()`, `pn5180_mifare_block_write()`, value operations
 - NDEF reading: `pn5180_ndef_read_card_auto()`, `pn5180_ndef_read_from_selected_card()`, `pn5180_ndef_parse_message()`, `pn5180_ndef_free_parsed_message()`
-- NDEF records: `pn5180_ndef_extract_text()`, `pn5180_ndef_extract_uri()`, `pn5180_ndef_get_record_type()`, `pn5180_ndef_record_is_text()` / `_uri()` / `_smartposter()`, `pn5180_ndef_decode_smartposter()`
+- NDEF records: `pn5180_ndef_extract_text()`, `pn5180_ndef_extract_uri()`, `pn5180_ndef_get_record_type()`, `pn5180_ndef_record_is_text()` / `_uri()` / `_smartposter()`, `pn5180_ndef_decode_smartposter()`; `pn5180_ndef_decode_message()` and `pn5180_ndef_decode_smartposter()` return 0 if the message has more records than the array holds
 - NDEF writing: `pn5180_ndef_make_text_record()`, `pn5180_ndef_make_uri_record()`, `pn5180_ndef_make_mime_record()`, `pn5180_ndef_make_external_record()`, `pn5180_ndef_message_init()`, `pn5180_ndef_message_add()`, `pn5180_ndef_encode_message()`, `pn5180_ndef_write_card_auto()`
 - Low power card detection: `pn5180_lpcd_prepare()`, `pn5180_lpcd_enter()`, `pn5180_lpcd_wait()`
 - Raw access: `pn5180_rf_transceive()`, `pn5180_send_data()`, `pn5180_read_data()`, `pn5180_send_command()`, register and EEPROM functions, `pn5180_get_irq_status()`, `pn5180_clear_irq_status()`

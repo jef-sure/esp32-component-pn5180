@@ -82,6 +82,10 @@ static bool pn5180_15693_setup_rf(pn5180_t *pn5180, uint8_t rf_config)
 static bool pn5180_iso15693_exchange(pn5180_t *pn5180, const uint8_t *cmd, size_t cmd_len, uint8_t *rx, size_t rx_size, uint16_t *num_bytes,
                                      uint32_t timeout_us)
 {
+    // Not left to the caller's history: Select, Reset to Ready and Get System Information can be
+    // the first frame after the RF configuration was loaded.
+    pn5180_enable_crc(pn5180);
+
     size_t             rx_len = 0;
     pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, cmd, cmd_len, 0, rx, rx_size, &rx_len, timeout_us, NULL);
     *num_bytes                = (uint16_t)rx_len;
@@ -367,6 +371,7 @@ static bool pn5180_iso15693_stay_quiet(pn5180_t *pn5180, uint8_t *uid)
         PN5180_LOGD(TAG, "stay_quiet: build failed");
         return false;
     }
+    pn5180_enable_crc(pn5180);
     // Stay Quiet has no response: the frame is done once the transmission has ended.
     return pn5180_rf_transceive(pn5180, quiet_cmd, cmd_len, 0, NULL, 0, NULL, 0, NULL) == PN5180_RF_OK;
 }
@@ -477,8 +482,6 @@ static bool pn5180_iso15693_block_read(pn5180_t *pn5180, int blockno, uint8_t *b
         return false;
     }
 
-    pn5180_enable_crc(pn5180);
-
     uint8_t cmd[4];
     size_t  cmd_len = 0;
 
@@ -524,8 +527,6 @@ static int pn5180_iso15693_block_write(pn5180_t *pn5180, int blockno, const uint
         PN5180_LOGD(TAG, "block_write: invalid args");
         return -1;
     }
-
-    pn5180_enable_crc(pn5180);
 
     if (buffer_len == 0 || buffer_len > 32) {
         PN5180_LOGD(TAG, "block_write: unsupported block size %zu", buffer_len);

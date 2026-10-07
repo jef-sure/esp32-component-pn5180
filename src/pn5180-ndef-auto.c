@@ -224,7 +224,10 @@ static pn5180_ndef_result_t area_find_ndef_tlv(pn5180_proto_t *proto, ndef_area_
             const uint8_t *value                    = &stream->data[pos + 1 + length_size];
             size_t         bytes_per_page           = (size_t)1 << (value[2] & 0x0F);
             ctx->reserved[ctx->reserved_count].addr = (size_t)(value[0] >> 4) * bytes_per_page + (value[0] & 0x0F);
-            ctx->reserved[ctx->reserved_count].size = (type == 0x01) ? ((size_t)value[1] + 7u) / 8u : value[1];
+            // A size of 00h stands for 256 (bits or bytes). The NXP library takes it as 0; reading it
+            // as 256 is the careful side: at worst a tag is refused as unsupported.
+            size_t size                             = (value[1] != 0) ? value[1] : 256u;
+            ctx->reserved[ctx->reserved_count].size = (type == 0x01) ? (size + 7u) / 8u : size;
             ctx->reserved_count++;
         }
         pos += 1 + length_size + length;
@@ -401,6 +404,40 @@ done:
 
 /* ---- Type 2: Ultralight, NTAG ---- */
 
+// Address of the first byte behind the user memory of a detected Type 2 tag: the dynamic lock
+// bytes, the configuration pages or the end of the tag follow there. 0 if the tag was not detected.
+static size_t type2_user_memory_end(const pn5180_uid_t *uid)
+{
+    size_t end_page = 0;
+    switch (uid->subtype) {
+    case PN5180_MIFARE_ULTRALIGHT:
+    case PN5180_MIFARE_NTAG210:
+        end_page = 16;
+        break;
+    case PN5180_MIFARE_ULTRALIGHT_EV1: // MF0UL11 with 20 pages, MF0UL21 with 41
+        end_page = (uid->blocks_count > 20) ? 36 : 16;
+        break;
+    case PN5180_MIFARE_NTAG212:
+        end_page = 36;
+        break;
+    case PN5180_MIFARE_ULTRALIGHT_C:
+    case PN5180_MIFARE_NTAG213:
+        end_page = 40;
+        break;
+    case PN5180_MIFARE_NTAG215:
+        end_page = 130;
+        break;
+    case PN5180_MIFARE_NTAG216:
+        end_page = 226;
+        break;
+    default:
+        // Type not known: the number of pages is all there is to go by.
+        end_page = (uid->blocks_count >= 4 + 12) ? (size_t)uid->blocks_count : 0;
+        break;
+    }
+    return end_page * 4u;
+}
+
 // Reads the capability container and describes the data area. The stream receives the bytes of
 // the data area that came along with the capability container.
 static pn5180_ndef_result_t type2_open_area(pn5180_proto_t *proto, const pn5180_uid_t *uid, bool for_write, ndef_area_t *ctx, ndef_stream_t *stream)
@@ -432,9 +469,11 @@ static pn5180_ndef_result_t type2_open_area(pn5180_proto_t *proto, const pn5180_
     // The size excludes pages 0..3 and the lock and configuration pages at the end, so it bounds
     // how far reads and writes may go.
     *ctx = (ndef_area_t){.stream_base = 16, .area_start = 16, .area_end = 16u + (size_t)first[2] * 8u, .block_size = 4, .type2 = true};
-    if (uid->blocks_count >= 4 + 12 && ctx->area_end > (size_t)uid->blocks_count * 4u) {
-        // A capability container must not promise more than the tag has.
-        ctx->area_end = (size_t)uid->blocks_count * 4u;
+    size_t user_end = type2_user_memory_end(uid);
+    if (user_end != 0 && ctx->area_end > user_end) {
+        // A capability container must not promise more than the tag has: a write would reach the
+        // lock, configuration and password pages.
+        ctx->area_end = user_end;
     }
     return stream_append(stream, &first[4], 12) ? PN5180_NDEF_OK : PN5180_NDEF_ERR_NO_MEMORY;
 }
