@@ -685,6 +685,25 @@ static pn5180_uids_array_t *_pn5180_15693_get_all_uids(pn5180_proto_t *proto)
     return pn5180_15693_get_all_uids(proto->pn5180);
 }
 
+pn5180_uids_array_t *pn5180_15693_get_all_uids_ex(pn5180_proto_t *proto, pn5180_poll_status_t *status)
+{
+    pn5180_poll_status_t local_status = PN5180_POLL_INVALID_ARGUMENT;
+    pn5180_uids_array_t *uids         = NULL;
+    if (proto != NULL && proto->pn5180 != NULL) {
+        uids = pn5180_15693_get_all_uids(proto->pn5180);
+        if (uids != NULL) {
+            local_status = PN5180_POLL_FOUND;
+        } else {
+            // The inventory tries two RF configurations; if the field is still off, none could be set up.
+            local_status = proto->pn5180->is_rf_on ? PN5180_POLL_NO_TARGET : PN5180_POLL_TRANSPORT_ERROR;
+        }
+    }
+    if (status != NULL) {
+        *status = local_status;
+    }
+    return uids;
+}
+
 pn5180_proto_t *pn5180_15693_init(pn5180_t *pn5180, pn5180_15693_rf_config_t rf_config)
 {
     PN5180_LOGD(TAG, "init: rf_config=0x%02x", rf_config);

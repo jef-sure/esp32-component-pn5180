@@ -1,10 +1,46 @@
 # Changelog
 
+## v 0.4.0 - 2026-10-07
+
+### ISO14443-4 rework and public APDU API, automatic NDEF reading for all tag types, host tests
+
+Breaking changes:
+
+- `select_by_uid()` no longer selects the NDEF application on ISO14443-4 cards; it only activates ISO14443-4 (RATS). `detect_card_type_and_capacity()` reports such cards as byte-addressed with unknown size (`block_size` 1, `blocks_count` 0) instead of assuming 4096 bytes. Code that read a Type 4 tag through `block_read()` right after selecting has to select the files itself, or use `pn5180_ndef_read_card_auto()`.
+- Cards that emulate MIFARE Classic on an ISO14443-4 chip (SAK 0x28 / 0x38) are not activated as ISO14443-4 any more, so MIFARE authentication works on them. Set the subtype to `PN5180_MIFARE_DESFIRE` before `select_by_uid()` to use their ISO14443-4 side.
+- `pn5180_uid_t` has a new `atqa` field and `pn5180_card_type_t` two new values (`PN5180_MIFARE_NTAG210`, `PN5180_MIFARE_NTAG212`); `pn5180_t` lost the `iso14443_ndef_checked` / `iso14443_ndef_detected` fields.
+- NDEF parsing is stricter: a reserved TNF (0x07), an unknown-type record with a type, an empty record with content, a missing Message End flag and malformed chunk sequences are rejected.
+
+New:
+
+- **`pn5180_ndef_read_card_auto()`** reads the NDEF message of the selected card by its type: Type 2 (Ultralight, NTAG) bounded by the capability container, MIFARE Classic through the MIFARE Application Directory (MAD1 / MAD2) with the public keys, Type 4 (NDEF application, capability container file, NDEF file) and Type 5 (ISO15693). A failed read is retried once after selecting the card again.
+- **`pn5180_ndef_parse_message()`** parses an encoded message and reassembles chunked records. `PN5180_NDEF_ERR_UNSUPPORTED` for card types without NDEF mapping.
+- **Public ISO14443-4 API**: `pn5180_14443_4_transceive()`, `pn5180_14443_4_select_file()` (P2=0x0C with fallback to 0x00), `pn5180_14443_4_read_binary()`, and the hardware-independent APDU helpers `pn5180_apdu_parse_command()`, `pn5180_apdu_parse_response()`, `pn5180_apdu_build_response()`, `pn5180_apdu_get_status()`.
+- **Poll status**: `pn5180_14443_get_all_uids_ex()` and `pn5180_15693_get_all_uids_ex()` tell "no card" apart from a transport failure, a protocol error and an allocation failure.
+- **MIFARE Classic value blocks**: `pn5180_mifare_value_read()`, `pn5180_mifare_value_write()`, `pn5180_mifare_increment()`, `pn5180_mifare_decrement()`, `pn5180_mifare_restore()`, `pn5180_mifare_transfer()`.
+- **Card identification**: MIFARE Ultralight C is told apart from Ultralight (it answers AUTHENTICATE with a challenge); NTAG210 and NTAG212 are told apart from Ultralight EV1 by the product type of GET_VERSION.
+- **Host tests** in `host_test/`: the protocol code runs on the host against simulated cards (NTAG, Ultralight C, MIFARE Classic, ISO14443-4 with a Type 4 application, ISO15693) under AddressSanitizer. `make -C host_test test IDF_PATH=<esp-idf>`.
+
+ISO14443-4 fixes:
+
+- After a timeout or a damaged frame the reader sends R(NAK) (R(ACK) while the card is chaining) instead of repeating the I-block, and repeats the I-block only when the card's R(ACK) shows that it was not received.
+- Commands longer than the card's frame size are chained.
+- RATS announces 256-byte frames (FSDI 8) instead of 64.
+- `halt()` releases an ISO14443-4 card with S(DESELECT).
+- A waiting time extension applies to one block only and is capped at the longest frame waiting time (4949 ms).
+- After HLTA the driver waits 1.1 ms before the next command, as the NXP reader library does.
+
+Other changes:
+
+- `pn5180_delay_ms()` is precise below a FreeRTOS tick: whole ticks are slept, the remainder is a busy wait. It used to round every delay up to whole ticks.
+- Without an IRQ pin the driver polls once per millisecond after the first 5 ms, sleeping on a high-resolution timer in between (it slept a whole tick before).
+- `detect_card_type_and_capacity()` leaves an Ultralight family card halted on every path, so the caller's `select_by_uid()` always works afterwards.
+- The `app_logic` example reads NDEF with `pn5180_ndef_read_card_auto()` and selects the card again after a refused read.
+- README restructured: quick start, common tasks, troubleshooting, reference.
+
 ## v 0.3.0 - 2026-10-07
 
 ### Hardware receive timeout, common RF exchange, IRQ pin, shared SPI bus; all public names prefixed
-
-These changes were verified by building the examples only (ESP-IDF 5.5.4 and 6.0.1); they have not been tested on hardware yet.
 
 Breaking changes:
 
@@ -37,7 +73,6 @@ Behaviour changes to be aware of:
 ### NDEF API moved to the `pn5180_ndef_` namespace; bug fixes from a code review
 
 The review compared the driver with the PN532 component, the NXP reader library and the datasheets.
-These changes were verified by building the examples only; they have not been tested on hardware yet.
 
 Breaking change:
 

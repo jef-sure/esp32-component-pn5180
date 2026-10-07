@@ -224,7 +224,7 @@ bool pn5180_ndef_make_uri_record(pn5180_ndef_record_t *rec, const char *uri, boo
     return true;
 }
 
-bool pn5180_ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, pn5180_ndef_record_t *out_rec, bool *is_begin, bool *is_end)
+static bool ndef_decode_next_ex(const uint8_t *in, size_t in_len, size_t *offset, pn5180_ndef_record_t *out_rec, bool *is_begin, bool *is_end, bool *is_chunk)
 {
     if (!in || !offset || !out_rec) return false;
     // out_rec fields point into the input buffer; do not free or modify input until done.
@@ -237,6 +237,11 @@ bool pn5180_ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, p
     bool       sr  = (hdr & PN5180_NDEF_SR) != 0;
     bool       il  = (hdr & PN5180_NDEF_IL) != 0;
     pn5180_ndef_tnf_t tnf = (pn5180_ndef_tnf_t)(hdr & PN5180_NDEF_TNF_MASK);
+
+    if (tnf == PN5180_NDEF_TNF_RESERVED) {
+        // TNF 0x07 is reserved and must not appear in a message.
+        return false;
+    }
 
     if (pos >= in_len) return false;
     uint8_t type_len = in[pos++];
@@ -278,6 +283,15 @@ bool pn5180_ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, p
         pos += payload_len;
     }
 
+    if (tnf == PN5180_NDEF_TNF_UNKNOWN && type_len != 0) {
+        // NDEF 1.0: an unknown-type record carries no type.
+        return false;
+    }
+    if (tnf == PN5180_NDEF_TNF_EMPTY && (type_len != 0 || id_len != 0 || payload_len != 0)) {
+        // An empty record must carry no type, ID, or payload.
+        return false;
+    }
+
     out_rec->tnf         = tnf;
     out_rec->type_len    = type_len;
     out_rec->id_len      = id_len;
@@ -288,9 +302,15 @@ bool pn5180_ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, p
 
     if (is_begin) *is_begin = mb;
     if (is_end) *is_end = me;
+    if (is_chunk) *is_chunk = (hdr & PN5180_NDEF_CF) != 0;
 
     *offset = pos;
     return true;
+}
+
+bool pn5180_ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, pn5180_ndef_record_t *out_rec, bool *is_begin, bool *is_end)
+{
+    return ndef_decode_next_ex(in, in_len, offset, out_rec, is_begin, is_end, NULL);
 }
 
 size_t pn5180_ndef_decode_message(const uint8_t *in, size_t in_len, pn5180_ndef_record_t *records, size_t capacity)
@@ -310,17 +330,183 @@ size_t pn5180_ndef_decode_message(const uint8_t *in, size_t in_len, pn5180_ndef_
     return count;
 }
 
-static size_t pn5180_ndef_count_records(const uint8_t *data, size_t data_len)
+static bool ndef_size_add(size_t base, size_t add, size_t *out)
 {
-    size_t        count = 0, pos = 0;
-    pn5180_ndef_record_t rec;
-    while (pos < data_len) {
-        bool me = false;
-        if (!pn5180_ndef_decode_next(data, data_len, &pos, &rec, NULL, &me)) break;
-        count++;
-        if (me) break;
+    if (out == NULL || add > (SIZE_MAX - base)) {
+        return false;
     }
-    return count;
+    *out = base + add;
+    return true;
+}
+
+typedef struct
+{
+    size_t logical_record_count;
+    size_t chunk_payload_size;
+} ndef_decode_plan_t;
+
+// First pass over a message: validates the record sequence (MB/ME, chunk rules) and sizes the result.
+static bool ndef_plan_decode(const uint8_t *data, size_t data_len, ndef_decode_plan_t *plan)
+{
+    if (data == NULL || data_len == 0 || plan == NULL) {
+        return false;
+    }
+
+    memset(plan, 0, sizeof(*plan));
+    size_t   pos             = 0;
+    size_t   physical_count  = 0;
+    uint32_t chunk_total_len = 0;
+    bool     in_chunk        = false;
+    bool     message_ended   = false;
+
+    while (pos < data_len) {
+        pn5180_ndef_record_t physical;
+        bool                 mb = false;
+        bool                 me = false;
+        bool                 cf = false;
+        if (!ndef_decode_next_ex(data, data_len, &pos, &physical, &mb, &me, &cf)) {
+            return false;
+        }
+
+        if ((physical_count == 0 && !mb) || (physical_count != 0 && mb) || message_ended) {
+            return false;
+        }
+        physical_count++;
+
+        if (in_chunk) {
+            // Continuation chunks use TNF "unchanged" and carry neither type nor ID.
+            if (physical.tnf != PN5180_NDEF_TNF_UNCHANGED || physical.type_len != 0 || physical.id_len != 0 || (cf && me)) {
+                return false;
+            }
+            if (physical.payload_len > UINT32_MAX - chunk_total_len ||
+                !ndef_size_add(plan->chunk_payload_size, physical.payload_len, &plan->chunk_payload_size)) {
+                return false;
+            }
+            chunk_total_len += physical.payload_len;
+            if (!cf) {
+                in_chunk = false;
+                plan->logical_record_count++;
+            }
+        } else {
+            if (physical.tnf == PN5180_NDEF_TNF_UNCHANGED) {
+                return false;
+            }
+            if (cf) {
+                if (me) {
+                    return false;
+                }
+                in_chunk        = true;
+                chunk_total_len = physical.payload_len;
+                if (!ndef_size_add(plan->chunk_payload_size, physical.payload_len, &plan->chunk_payload_size)) {
+                    return false;
+                }
+            } else {
+                plan->logical_record_count++;
+            }
+        }
+
+        if (me) {
+            if (in_chunk) {
+                return false;
+            }
+            message_ended = true;
+        }
+    }
+
+    return message_ended && !in_chunk && plan->logical_record_count > 0;
+}
+
+// Second pass: fills the logical records; chunked payloads are concatenated into chunk_payload.
+static bool ndef_decode_logical_records(const uint8_t *data, size_t data_len, pn5180_ndef_record_t *records, size_t record_count, uint8_t *chunk_payload)
+{
+    size_t                pos          = 0;
+    size_t                logical      = 0;
+    size_t                payload_used = 0;
+    pn5180_ndef_record_t *chunk_record = NULL;
+
+    while (pos < data_len && logical < record_count) {
+        pn5180_ndef_record_t physical;
+        bool                 cf = false;
+        if (!ndef_decode_next_ex(data, data_len, &pos, &physical, NULL, NULL, &cf)) {
+            return false;
+        }
+
+        if (chunk_record != NULL) {
+            if (physical.payload_len > 0) {
+                memcpy(chunk_payload + payload_used, physical.payload, physical.payload_len);
+                payload_used += physical.payload_len;
+                chunk_record->payload_len += physical.payload_len;
+            }
+            if (!cf) {
+                logical++;
+                chunk_record = NULL;
+            }
+        } else if (cf) {
+            records[logical]             = physical;
+            records[logical].payload     = chunk_payload + payload_used;
+            records[logical].payload_len = 0;
+            chunk_record                 = &records[logical];
+            if (physical.payload_len > 0) {
+                memcpy(chunk_payload + payload_used, physical.payload, physical.payload_len);
+                payload_used += physical.payload_len;
+                chunk_record->payload_len = physical.payload_len;
+            }
+        } else {
+            records[logical++] = physical;
+        }
+    }
+
+    return logical == record_count && chunk_record == NULL;
+}
+
+pn5180_ndef_result_t pn5180_ndef_parse_message(const uint8_t *raw_data, size_t raw_data_len, pn5180_ndef_message_parsed_t **out_msg)
+{
+    if (out_msg == NULL) {
+        return PN5180_NDEF_ERR_INVALID_PARAM;
+    }
+    *out_msg = NULL;
+    if (raw_data == NULL || raw_data_len == 0) {
+        return PN5180_NDEF_ERR_PARSE_FAILED;
+    }
+
+    ndef_decode_plan_t plan;
+    if (!ndef_plan_decode(raw_data, raw_data_len, &plan)) {
+        return PN5180_NDEF_ERR_PARSE_FAILED;
+    }
+
+    if (plan.logical_record_count > SIZE_MAX / sizeof(pn5180_ndef_record_t)) {
+        return PN5180_NDEF_ERR_NO_MEMORY;
+    }
+    // Single allocation: header + records array + raw NDEF data + assembled chunk payloads, for one-shot free.
+    size_t records_size = sizeof(pn5180_ndef_record_t) * plan.logical_record_count;
+    size_t total_size;
+    if (!ndef_size_add(sizeof(pn5180_ndef_message_parsed_t), records_size, &total_size) || !ndef_size_add(total_size, raw_data_len, &total_size) ||
+        !ndef_size_add(total_size, plan.chunk_payload_size, &total_size)) {
+        return PN5180_NDEF_ERR_NO_MEMORY;
+    }
+
+    uint8_t *block_ptr = malloc(total_size);
+    if (block_ptr == NULL) {
+        return PN5180_NDEF_ERR_NO_MEMORY;
+    }
+
+    pn5180_ndef_message_parsed_t *result        = (pn5180_ndef_message_parsed_t *)block_ptr;
+    pn5180_ndef_record_t         *records       = (pn5180_ndef_record_t *)(block_ptr + sizeof(pn5180_ndef_message_parsed_t));
+    uint8_t                      *ndef_data     = block_ptr + sizeof(pn5180_ndef_message_parsed_t) + records_size;
+    uint8_t                      *chunk_payload = ndef_data + raw_data_len;
+
+    memcpy(ndef_data, raw_data, raw_data_len);
+    if (!ndef_decode_logical_records(ndef_data, raw_data_len, records, plan.logical_record_count, chunk_payload)) {
+        free(block_ptr);
+        return PN5180_NDEF_ERR_PARSE_FAILED;
+    }
+
+    result->raw_data     = ndef_data;
+    result->raw_data_len = raw_data_len;
+    result->records      = records;
+    result->record_count = plan.logical_record_count;
+    *out_msg             = result;
+    return PN5180_NDEF_OK;
 }
 
 #define PN5180_NDEF_DEFAULT_MAX_BLOCKS 256
@@ -416,41 +602,9 @@ pn5180_ndef_result_t pn5180_ndef_read_from_selected_card( //
         return read_ok ? PN5180_NDEF_ERR_NO_NDEF : PN5180_NDEF_ERR_READ_FAILED;
     }
 
-    size_t count = pn5180_ndef_count_records(buf + ndef_offset, ndef_len);
-    if (count == 0) {
-        free(buf);
-        return PN5180_NDEF_ERR_PARSE_FAILED;
-    }
-
-    // Single allocation: header + records array + raw NDEF data
-    // Single allocation: header + records array + raw NDEF data for one-shot free.
-    size_t records_size = sizeof(pn5180_ndef_record_t) * count;
-    size_t total_size   = sizeof(pn5180_ndef_message_parsed_t) + records_size + ndef_len;
-
-    uint8_t *block_ptr = malloc(total_size);
-    if (!block_ptr) {
-        free(buf);
-        return PN5180_NDEF_ERR_NO_MEMORY;
-    }
-
-    pn5180_ndef_message_parsed_t *result    = (pn5180_ndef_message_parsed_t *)block_ptr;
-    pn5180_ndef_record_t         *records   = (pn5180_ndef_record_t *)(block_ptr + sizeof(pn5180_ndef_message_parsed_t));
-    uint8_t               *ndef_data = block_ptr + sizeof(pn5180_ndef_message_parsed_t) + records_size;
-
-    memcpy(ndef_data, buf + ndef_offset, ndef_len);
+    pn5180_ndef_result_t parse_res = pn5180_ndef_parse_message(buf + ndef_offset, ndef_len, out_msg);
     free(buf);
-
-    if (pn5180_ndef_decode_message(ndef_data, ndef_len, records, count) != count) {
-        free(block_ptr);
-        return PN5180_NDEF_ERR_PARSE_FAILED;
-    }
-
-    result->raw_data     = ndef_data;
-    result->raw_data_len = ndef_len;
-    result->records      = records;
-    result->record_count = count;
-    *out_msg             = result;
-    return PN5180_NDEF_OK;
+    return parse_res;
 }
 
 void pn5180_ndef_free_parsed_message(pn5180_ndef_message_parsed_t *msg)
@@ -691,6 +845,8 @@ const char *pn5180_ndef_result_to_string(pn5180_ndef_result_t result)
         return "Buffer too small";
     case PN5180_NDEF_ERR_CARD_FULL:
         return "Card capacity exceeded";
+    case PN5180_NDEF_ERR_UNSUPPORTED:
+        return "Card type not supported";
     default:
         return "Unknown error";
     }

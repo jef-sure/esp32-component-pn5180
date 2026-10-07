@@ -75,6 +75,10 @@ static const char *get_card_type_name(pn5180_card_type_t subtype)
         return "NTAG215";
     case PN5180_MIFARE_NTAG216:
         return "NTAG216";
+    case PN5180_MIFARE_NTAG210:
+        return "NTAG210";
+    case PN5180_MIFARE_NTAG212:
+        return "NTAG212";
     case PN5180_MIFARE_PLUS_2K:
         return "MIFARE Plus 2K";
     case PN5180_MIFARE_PLUS_4K:
@@ -164,33 +168,6 @@ static bool authenticate_sector(pn5180_proto_t *proto, pn5180_uid_t *uid, int se
     return false;
 }
 
-typedef struct
-{
-    pn5180_uid_t *uid;
-} ndef_auth_ctx_t;
-
-static bool ndef_auth_callback(pn5180_proto_t *proto, int blockno, void *user_ctx)
-{
-    ndef_auth_ctx_t *ctx = (ndef_auth_ctx_t *)user_ctx;
-    if (!ctx || !ctx->uid) return true;
-    if (!requires_authentication(ctx->uid->subtype)) return true;
-
-    int sector       = get_sector_from_block(ctx->uid->subtype, blockno);
-    int sector_block = get_sector_first_block(ctx->uid->subtype, sector);
-    if (!authenticate_sector(proto, ctx->uid, sector_block)) {
-        ESP_LOGE(TAG, "NDEF auth: Failed to authenticate sector %d", sector);
-        return false;
-    }
-    return true;
-}
-
-static int ndef_sector_id_callback(int blockno, void *user_ctx)
-{
-    ndef_auth_ctx_t *ctx = (ndef_auth_ctx_t *)user_ctx;
-    if (!ctx || !ctx->uid) return blockno;
-    return get_sector_from_block(ctx->uid->subtype, blockno);
-}
-
 static void print_block_data(int block, const uint8_t *data, int size)
 {
     printf("    Block %3d: ", block);
@@ -247,6 +224,22 @@ static void read_card_blocks(pn5180_proto_t *proto, pn5180_uid_t *uid, int block
             print_block_data(block, block_data, block_size);
         } else {
             ESP_LOGW(TAG, "Block %3d: Read failed", block);
+            // A card that refused the command (NAK) is no longer selected: select it again before the retry.
+            if (proto->halt != NULL) {
+                proto->halt(proto);
+            }
+            if (!proto->select_by_uid(proto, uid)) {
+                ESP_LOGW(TAG, "Block %3d: Reselect failed - stopping", block);
+                break;
+            }
+            if (needs_auth) {
+                current_sector = -1;
+                --block; // authenticate the sector again and repeat this block
+                if (++continuous_failures >= 5) {
+                    break;
+                }
+                continue;
+            }
             if (proto->block_read(proto, block, block_data, block_size)) {
                 ESP_LOGI(TAG, "Block %3d: Read succeeded on retry", block);
                 print_block_data(block, block_data, block_size);
@@ -290,20 +283,20 @@ static void process_card(pn5180_proto_t *proto, pn5180_uid_t *uid)
     printf("  Type: %s\n", get_card_type_name(uid->subtype));
     printf("  Blocks: %d, Block size: %d bytes\n", blocks_count, block_size);
 
-    int start_block = (uid->subtype == PN5180_15693) ? 1 : 4;
-
-    ndef_auth_ctx_t auth_ctx = {
-        .uid = uid,
-    };
-
-    pn5180_ndef_message_parsed_t *msg;
-    pn5180_ndef_result_t          result = pn5180_ndef_read_from_selected_card(proto, start_block, block_size, 256 /* PN5180_NDEF_DEFAULT_MAX_BLOCKS*/, ndef_auth_callback,
-                                                                 ndef_sector_id_callback, &auth_ctx, &msg);
+    // The NDEF mapping (Type 2, MIFARE Classic, Type 4 or Type 5) is chosen from the detected card type.
+    pn5180_ndef_message_parsed_t *msg    = NULL;
+    pn5180_ndef_result_t          result = pn5180_ndef_read_card_auto(proto, uid, &msg);
 
     if (result != PN5180_NDEF_OK) {
-        ESP_LOGE(TAG, "Failed to read NDEF message");
-        if (uid->subtype != PN5180_MIFARE_DESFIRE) {
-            read_card_blocks(proto, uid, blocks_count, block_size);
+        ESP_LOGW(TAG, "No NDEF message read: %s", pn5180_ndef_result_to_string(result));
+        if (uid->subtype != PN5180_MIFARE_DESFIRE && uid->subtype != PN5180_MIFARE_UNKNOWN) {
+            // The NDEF attempt may have left the card unselected.
+            if (proto->halt != NULL) {
+                proto->halt(proto);
+            }
+            if (proto->select_by_uid(proto, uid)) {
+                read_card_blocks(proto, uid, blocks_count, block_size);
+            }
         }
         return;
     }

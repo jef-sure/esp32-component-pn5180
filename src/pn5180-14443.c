@@ -1,8 +1,11 @@
 #include "pn5180-14443.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "pn5180-internal.h"
 #include "pn5180-mifare.h"
+#include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "pn5180-14443";
@@ -19,15 +22,12 @@ typedef enum
     RX_RESULT_FATAL,
 } rx_result_t;
 
-static pn5180_uids_array_t *pn5180_14443_get_all_uids(pn5180_t *pn5180);
+static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, pn5180_poll_status_t *status);
 
 static bool pn5180_mifare_halt(pn5180_t *pn5180);
 
 static bool        pn5180_14443_select_by_uid(pn5180_t *pn5180, pn5180_uid_t *uid);
-static bool        pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, pn5180_card_type_t *subtype, int *blocks_count);
-static void        pn5180_14443_detect_desfire_capacity(pn5180_t *pn5180, int *blocks_count);
-static bool        pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t *rx_len);
-static bool        pn5180_iso14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len);
+static bool        pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, pn5180_uid_t *uid, pn5180_card_type_t *subtype, int *blocks_count);
 static bool        pn5180_14443_setup_rf(pn5180_t *pn5180);
 static void        pn5180_iso14443_4_reset_state(pn5180_t *pn5180);
 static rx_result_t pn5180_iso14443_4_exchange_frame(pn5180_t *pn5180, const char *operation, const uint8_t *tx, size_t tx_len, int64_t timeout_ms,
@@ -46,8 +46,6 @@ static void pn5180_iso14443_4_reset_state(pn5180_t *pn5180)
     pn5180->iso14443_block_number  = 0;
     pn5180->iso14443_frame_size    = 0;
     pn5180->iso14443_fwt_ms        = 0;
-    pn5180->iso14443_ndef_checked  = false;
-    pn5180->iso14443_ndef_detected = false;
 }
 
 // Sends one ISO14443-4 block and receives the answer. timeout_ms is the frame waiting time.
@@ -144,7 +142,8 @@ static bool _pn5180_14443_setup_rf(pn5180_proto_t *proto)
 
 static pn5180_uids_array_t *_pn5180_14443_get_all_uids(pn5180_proto_t *proto)
 {
-    return pn5180_14443_get_all_uids(proto->pn5180);
+    pn5180_poll_status_t status;
+    return pn5180_14443_poll(proto->pn5180, &status);
 }
 
 static bool _pn5180_14443_select_by_uid(pn5180_proto_t *proto, pn5180_uid_t *uid)
@@ -152,56 +151,15 @@ static bool _pn5180_14443_select_by_uid(pn5180_proto_t *proto, pn5180_uid_t *uid
     return pn5180_14443_select_by_uid(proto->pn5180, uid);
 }
 
-// Helper to read blocks via ISO 14443-4 APDU (Read Binary)
-static bool pn5180_iso14443_4_read_binary(pn5180_t *pn5180, int blockno, uint8_t *buffer, size_t buffer_len)
-{
-    if (buffer_len == 0 || buffer_len > 250) {
-        // Keep Le safe (some cards dislike 256/00 on short APDU, or buffer is too big)
-        return false;
-    }
-
-    uint8_t apdu[5];
-    apdu[0] = 0x00;                  // CLA
-    apdu[1] = 0xB0;                  // INS (Read Binary)
-    apdu[2] = (blockno >> 8) & 0xFF; // P1
-    apdu[3] = blockno & 0xFF;        // P2
-    apdu[4] = (uint8_t)buffer_len;   // Le
-
-    // We need a temp buffer because we receive Data + SW1SW2 (2 bytes)
-    // and the caller provided buffer might be exactly buffer_len.
-    uint8_t temp_rx[260];
-    size_t  temp_len = sizeof(temp_rx);
-
-    if (!pn5180_iso14443_4_transceive(pn5180, apdu, 5, temp_rx, &temp_len)) {
-        ESP_LOGE(TAG, "ReadBinary transceive failed");
-        return false;
-    }
-
-    // Check Response Status Word (SW1 SW2)
-    if (temp_len < 2) return false;
-
-    uint8_t sw1 = temp_rx[temp_len - 2];
-    uint8_t sw2 = temp_rx[temp_len - 1];
-
-    if (sw1 == 0x90 && sw2 == 0x00) {
-        size_t data_len = temp_len - 2;
-        // Verify we got what we asked for (or less if EOF)
-        if (data_len > buffer_len) data_len = buffer_len;
-        memcpy(buffer, temp_rx, data_len);
-        // If we read less than expected, should we zero pad?
-        // Standard block read usually implies full block.
-        // But for file read, less is valid (EOF).
-        return true;
-    }
-
-    ESP_LOGW(TAG, "ReadBinary failed: SW=%02X %02X", sw1, sw2);
-    return false;
-}
-
 static bool _pn5180_14443_mifare_block_read(pn5180_proto_t *proto, int blockno, uint8_t *buffer, size_t buffer_len)
 {
     if (proto->pn5180->iso14443_current_card_type == PN5180_MIFARE_DESFIRE) {
-        return pn5180_iso14443_4_read_binary(proto->pn5180, blockno, buffer, buffer_len);
+        // ISO14443-4 card: READ BINARY on the file the application selected, blockno is the file offset.
+        if (buffer_len == 0 || buffer_len > 255 || blockno < 0 || blockno > 0x7FFF) {
+            return false;
+        }
+        size_t got = buffer_len;
+        return pn5180_14443_4_read_binary(proto->pn5180, (uint16_t)blockno, (uint8_t)buffer_len, buffer, &got);
     }
     return pn5180_mifare_block_read(proto->pn5180, blockno, buffer, buffer_len);
 }
@@ -229,7 +187,8 @@ static bool _pn5180_14443_authenticate( //
     // key_type: 0x60 for Key A, 0x61 for Key B
 
     if (uid->subtype == PN5180_MIFARE_ULTRALIGHT || uid->subtype == PN5180_MIFARE_ULTRALIGHT_C || uid->subtype == PN5180_MIFARE_ULTRALIGHT_EV1 ||
-        uid->subtype == PN5180_MIFARE_NTAG213 || uid->subtype == PN5180_MIFARE_NTAG215 || uid->subtype == PN5180_MIFARE_NTAG216) {
+        uid->subtype == PN5180_MIFARE_NTAG210 || uid->subtype == PN5180_MIFARE_NTAG212 || uid->subtype == PN5180_MIFARE_NTAG213 ||
+        uid->subtype == PN5180_MIFARE_NTAG215 || uid->subtype == PN5180_MIFARE_NTAG216) {
         // Ultralight variants don't require MIFARE authentication
         return true;
     }
@@ -329,8 +288,11 @@ static bool pn5180_14443_setup_rf(pn5180_t *pn5180)
 }
 
 // Sends a 7-bit short frame (REQA or WUPA) and reads the 2-byte ATQA.
-static bool pn5180_14443_send_short_frame(pn5180_t *pn5180, uint8_t cmd, const char *name, uint8_t *atqa)
+static bool pn5180_14443_send_short_frame(pn5180_t *pn5180, uint8_t cmd, const char *name, uint8_t *atqa, bool *fatal)
 {
+    if (fatal != NULL) {
+        *fatal = false;
+    }
     // Clear MFC_CRYPTO_ON bit to ensure clean state for new card discovery
     pn5180_write_register_and_mask(pn5180, PN5180_SYSTEM_CONFIG, PN5180_SYSTEM_CONFIG_CLEAR_CRYPTO_MASK);
     pn5180_disable_crc(pn5180);
@@ -340,6 +302,9 @@ static bool pn5180_14443_send_short_frame(pn5180_t *pn5180, uint8_t cmd, const c
     pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, &cmd, 1, 7, atqa, 2, &rx_len, PN5180_TIMEOUT_14443A_ACTIVATION_US, NULL);
     if (result == PN5180_RF_FATAL) {
         ESP_LOGE(TAG, "Failed to send %s command", name);
+        if (fatal != NULL) {
+            *fatal = true;
+        }
         return false;
     }
     // Several cards answering at once make the ATQA collide; that still means cards are present.
@@ -354,14 +319,14 @@ static bool pn5180_14443_send_short_frame(pn5180_t *pn5180, uint8_t cmd, const c
     return true;
 }
 
-static bool pn5180_14443_send_reqa(pn5180_t *pn5180, uint8_t *atqa)
+static bool pn5180_14443_send_reqa(pn5180_t *pn5180, uint8_t *atqa, bool *fatal)
 {
-    return pn5180_14443_send_short_frame(pn5180, 0x26, "REQA", atqa);
+    return pn5180_14443_send_short_frame(pn5180, 0x26, "REQA", atqa, fatal);
 }
 
 static bool pn5180_14443_send_wupa(pn5180_t *pn5180, uint8_t *atqa)
 {
-    return pn5180_14443_send_short_frame(pn5180, 0x52, "WUPA", atqa);
+    return pn5180_14443_send_short_frame(pn5180, 0x52, "WUPA", atqa, NULL);
 }
 
 static bool prepare_14443A_activation(pn5180_t *pn5180)
@@ -623,69 +588,103 @@ static bool pn5180_14443_resolve_full_uid_cascade(pn5180_t *pn5180, uint8_t *ful
     return false;
 }
 
-static pn5180_uids_array_t *pn5180_14443_get_all_uids(pn5180_t *pn5180)
+static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, pn5180_poll_status_t *status)
 {
     pn5180_uids_array_t *uids       = NULL;
     uint8_t              card_count = 0;
-    bool                 need_break = false;
-    prepare_14443A_activation(pn5180);
-    while (card_count < 14 && !need_break) {
-        uint8_t atqa[2];
-        if (!pn5180_14443_send_reqa(pn5180, atqa)) {
-            ESP_LOGI(TAG, "No more cards found.");
+
+    *status = PN5180_POLL_NO_TARGET;
+    if (!prepare_14443A_activation(pn5180)) {
+        *status = PN5180_POLL_TRANSPORT_ERROR;
+        return NULL;
+    }
+    while (card_count < 14) {
+        uint8_t atqa[2] = {0, 0};
+        bool    fatal   = false;
+        if (!pn5180_14443_send_reqa(pn5180, atqa, &fatal)) {
+            if (fatal && uids == NULL) {
+                *status = PN5180_POLL_TRANSPORT_ERROR;
+            }
+            PN5180_LOGD(TAG, "No more cards found.");
             break;
         }
 
         uint8_t full_uid[12];
         int8_t  full_uid_len = 0;
         uint8_t sak;
-        if (pn5180_14443_resolve_full_uid_cascade(pn5180, full_uid, &full_uid_len, &sak)) {
-            ESP_LOGI(TAG, "Found Card %d: UID Len %d", ++card_count, full_uid_len);
-            uint32_t agc_reg     = 0;
-            uint16_t current_agc = 0;
-            if (pn5180_read_register(pn5180, PN5180_RF_STATUS, &agc_reg)) {
-                current_agc = (uint16_t)(agc_reg & PN5180_RF_STATUS_AGC_MASK);
-            }
+        if (!pn5180_14443_resolve_full_uid_cascade(pn5180, full_uid, &full_uid_len, &sak)) {
+            // A card answered REQA but could not be singled out.
             if (uids == NULL) {
-                uids = calloc(1, sizeof(pn5180_uids_array_t));
-                if (uids == NULL) {
-                    ESP_LOGE(TAG, "Memory allocation failed for UIDs");
-                    need_break = true;
-                } else {
-                    uids->uids_count         = 1;
-                    uids->uids[0].uid_length = full_uid_len;
-                    uids->uids[0].sak        = sak;
-                    uids->uids[0].agc        = current_agc;
-                    uids->uids[0].subtype    = PN5180_MIFARE_UNKNOWN;
-                    memcpy(uids->uids[0].uid, full_uid, full_uid_len);
-                }
-            } else {
-                pn5180_uids_array_t *new_uids = realloc(uids, sizeof(pn5180_uids_array_t) + (uids->uids_count * sizeof(pn5180_uid_t)));
-                if (new_uids == NULL) {
-                    ESP_LOGE(TAG, "Memory allocation failed for UIDs");
-                    need_break = true;
-                } else {
-                    uids                                    = new_uids;
-                    uids->uids[uids->uids_count].uid_length = full_uid_len;
-                    uids->uids[uids->uids_count].sak        = sak;
-                    uids->uids[uids->uids_count].agc        = current_agc;
-                    uids->uids[uids->uids_count].subtype    = PN5180_MIFARE_UNKNOWN;
-                    memcpy(uids->uids[uids->uids_count].uid, full_uid, full_uid_len);
-                    uids->uids_count++;
-                }
+                *status = PN5180_POLL_PROTOCOL_ERROR;
             }
-            pn5180_mifare_halt(pn5180);
-        } else {
             break;
         }
+        ESP_LOGI(TAG, "Found Card %d: UID Len %d", ++card_count, full_uid_len);
+        uint32_t agc_reg     = 0;
+        uint16_t current_agc = 0;
+        if (pn5180_read_register(pn5180, PN5180_RF_STATUS, &agc_reg)) {
+            current_agc = (uint16_t)(agc_reg & PN5180_RF_STATUS_AGC_MASK);
+        }
+
+        // pn5180_uids_array_t holds one entry itself; further entries follow it.
+        int                  count    = (uids == NULL) ? 0 : uids->uids_count;
+        pn5180_uids_array_t *new_uids = realloc(uids, sizeof(pn5180_uids_array_t) + ((size_t)count * sizeof(pn5180_uid_t)));
+        if (new_uids == NULL) {
+            ESP_LOGE(TAG, "Memory allocation failed for UIDs");
+            if (uids == NULL) {
+                *status = PN5180_POLL_NO_MEMORY;
+            }
+            pn5180_mifare_halt(pn5180);
+            break;
+        }
+        uids                = new_uids;
+        pn5180_uid_t *entry = &uids->uids[count];
+        memset(entry, 0, sizeof(*entry));
+        entry->uid_length = full_uid_len;
+        entry->sak        = sak;
+        entry->agc        = current_agc;
+        entry->subtype    = PN5180_MIFARE_UNKNOWN;
+        entry->atqa[0]    = atqa[0];
+        entry->atqa[1]    = atqa[1];
+        memcpy(entry->uid, full_uid, full_uid_len);
+        uids->uids_count = count + 1;
+
+        // Halt the card so that the next REQA finds the remaining ones.
+        pn5180_mifare_halt(pn5180);
+    }
+    if (uids != NULL) {
+        *status = PN5180_POLL_FOUND;
     }
     return uids;
 }
 
+pn5180_uids_array_t *pn5180_14443_get_all_uids_ex(pn5180_proto_t *proto, pn5180_poll_status_t *status)
+{
+    pn5180_poll_status_t local_status = PN5180_POLL_INVALID_ARGUMENT;
+    pn5180_uids_array_t *uids         = NULL;
+    if (proto != NULL && proto->pn5180 != NULL) {
+        uids = pn5180_14443_poll(proto->pn5180, &local_status);
+    }
+    if (status != NULL) {
+        *status = local_status;
+    }
+    return uids;
+}
+
+// Brings the card back to the selected state after a command left it in IDLE or HALT.
+// Ultralight family cards reset to IDLE after every NAK, and after an abandoned authentication.
+static bool pn5180_14443_reselect(pn5180_t *pn5180, pn5180_uid_t *uid)
+{
+    pn5180_mifare_halt(pn5180);
+    return pn5180_14443_select_by_uid(pn5180, uid);
+}
+
 /*
-    Returns true if card required reselection
+    Tells the Ultralight family members apart. Returns true if the card has to be selected again
+    afterwards, which is always the case: GET_VERSION is followed by a halt, and the probes that
+    fail leave the card in IDLE.
 */
-static bool pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, pn5180_card_type_t *subtype, int *blocks_count)
+static bool pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, pn5180_uid_t *uid, pn5180_card_type_t *subtype, int *blocks_count)
 {
     uint8_t response[10];
     uint8_t get_version_cmd = 0x60;
@@ -700,39 +699,58 @@ static bool pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, pn5180_card
     PN5180_LOGD(TAG, "Sending GET_VERSION: 0x%02X", get_version_cmd);
     size_t             rx_len = 0;
     pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, &get_version_cmd, 1, 0, response, sizeof(response), &rx_len, PN5180_TIMEOUT_MIFARE_READ_US, NULL);
-    pn5180_disable_crc(pn5180);
-    // Cards without GET_VERSION answer with a NAK (reported as an RX error) or not at all.
     if (result != PN5180_RF_OK || rx_len < 8) {
-        PN5180_LOGD(TAG, "GET_VERSION failed (result=%d, rx_len=%u) - assuming standard Ultralight", (int)result, (unsigned)rx_len);
+        // No GET_VERSION: an original Ultralight or an Ultralight C. They share ATQA and SAK; only the
+        // Ultralight C answers AUTHENTICATE (1Ah) with AFh and an 8-byte challenge. The failed GET_VERSION
+        // has reset the card to IDLE, so it is selected again first.
+        PN5180_LOGD(TAG, "GET_VERSION failed (result=%d, rx_len=%u)", (int)result, (unsigned)rx_len);
+        pn5180_disable_crc(pn5180);
+        if (!pn5180_14443_reselect(pn5180, uid)) {
+            PN5180_LOGD(TAG, "Reselect after GET_VERSION failed - assuming standard Ultralight");
+            return true;
+        }
+        const uint8_t auth_cmd[2] = {0x1A, 0x00};
+        pn5180_enable_crc(pn5180);
+        result = pn5180_rf_transceive(pn5180, auth_cmd, sizeof(auth_cmd), 0, response, sizeof(response), &rx_len, PN5180_TIMEOUT_MIFARE_READ_US, NULL);
+        pn5180_disable_crc(pn5180);
+        if (result == PN5180_RF_OK && rx_len == 9 && response[0] == 0xAF) {
+            PN5180_LOGD(TAG, "Detected MIFARE Ultralight C");
+            *subtype = PN5180_MIFARE_ULTRALIGHT_C;
+            // 48 pages, of which READ addresses 00h..2Bh; the key pages 2Ch..2Fh cannot be read.
+            *blocks_count = 44;
+        } else {
+            PN5180_LOGD(TAG, "No Ultralight C challenge (result=%d) - assuming standard Ultralight", (int)result);
+        }
+        // The authentication is not completed, so the card drops out of the selected state. Halting it
+        // here leaves every path of this function in the same state: the caller selects the card again.
+        pn5180_mifare_halt(pn5180);
         return true;
     }
+    pn5180_disable_crc(pn5180);
 
-    // Extract and map storage size byte (response[6])
+    // GET_VERSION response: header, vendor, product type, subtype, major, minor, storage size, protocol
+    uint8_t product_type = response[2];
     uint8_t storage_size = response[6];
+    bool    is_ntag      = (product_type == 0x04);
 
     switch (storage_size) {
-    case 0x0B: // Ultralight EV1 48 bytes (20 pages)
-        PN5180_LOGD(TAG, "Detected MIFARE Ultralight EV1 (48 bytes, 20 pages)");
-        *subtype      = PN5180_MIFARE_ULTRALIGHT_EV1;
+    case 0x0B: // 48 bytes user memory, 20 pages: Ultralight EV1 MF0UL11 or NTAG210
+        *subtype      = is_ntag ? PN5180_MIFARE_NTAG210 : PN5180_MIFARE_ULTRALIGHT_EV1;
         *blocks_count = 20;
         break;
-    case 0x0E: // Ultralight EV1 128 bytes (41 pages)
-        PN5180_LOGD(TAG, "Detected MIFARE Ultralight EV1 (128 bytes, 41 pages)");
-        *subtype      = PN5180_MIFARE_ULTRALIGHT_EV1;
+    case 0x0E: // 128 bytes user memory, 41 pages: Ultralight EV1 MF0UL21 or NTAG212
+        *subtype      = is_ntag ? PN5180_MIFARE_NTAG212 : PN5180_MIFARE_ULTRALIGHT_EV1;
         *blocks_count = 41;
         break;
-    case 0x0F: // NTAG variant with 180 bytes (45 pages)
-        PN5180_LOGD(TAG, "Detected NTAG variant (180 bytes total, 45 pages)");
+    case 0x0F: // NTAG213, 45 pages
         *subtype      = PN5180_MIFARE_NTAG213;
         *blocks_count = 45;
         break;
-    case 0x11: // NTAG215 540 bytes total (135 pages)
-        PN5180_LOGD(TAG, "Detected NTAG215 (540 bytes total, 135 pages)");
+    case 0x11: // NTAG215, 135 pages
         *subtype      = PN5180_MIFARE_NTAG215;
         *blocks_count = 135;
         break;
-    case 0x13: // NTAG216 924 bytes total (231 pages)
-        PN5180_LOGD(TAG, "Detected NTAG216 (924 bytes total, 231 pages)");
+    case 0x13: // NTAG216, 231 pages
         *subtype      = PN5180_MIFARE_NTAG216;
         *blocks_count = 231;
         break;
@@ -742,19 +760,20 @@ static bool pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, pn5180_card
         *blocks_count = 16;
         break;
     }
+    PN5180_LOGD(TAG, "GET_VERSION: product type 0x%02X, storage 0x%02X, %d pages", product_type, storage_size, *blocks_count);
     pn5180_mifare_halt(pn5180);
     return true;
 }
 
 static bool pn5180_14443_send_rats(pn5180_t *pn5180)
 {
-    // FSDI=5 (64 bytes), CID=0
-    uint8_t rats_cmd[2] = {0xE0, 0x50};
+    // FSDI=8 (the reader accepts frames of up to 256 bytes), CID=0
+    uint8_t rats_cmd[2] = {0xE0, 0x80};
 
     PN5180_LOGD(TAG, "Sending RATS");
     pn5180_enable_crc(pn5180); // ATS has CRC
 
-    uint8_t            ats[64];
+    uint8_t            ats[256];
     size_t             rx_len = 0;
     pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, rats_cmd, 2, 0, ats, sizeof(ats), &rx_len, PN5180_TIMEOUT_14443A_RATS_US, NULL);
     if (result != PN5180_RF_OK) {
@@ -772,271 +791,309 @@ static bool pn5180_14443_send_rats(pn5180_t *pn5180)
     return true;
 }
 
-// Send RATS and optionally Select NDEF Application
-// Returns true if RATS success
-static bool pn5180_activate_layer4_ndef(pn5180_t *pn5180)
+// Activates ISO14443-4 on the selected card: RATS, with retries.
+static bool pn5180_14443_4_activate(pn5180_t *pn5180)
 {
-    // Use cached NDEF result if already checked in this session
-    if (pn5180->iso14443_layer4_active && pn5180->iso14443_ndef_checked) {
-        return pn5180->iso14443_ndef_detected;
+    if (pn5180->iso14443_layer4_active) {
+        return true;
     }
-
-    // 1. Send RATS (only if not already active)
-    if (!pn5180->iso14443_layer4_active) {
-        uint8_t rats_retries = 3;
-        bool    rats_ok      = false;
-        while (rats_retries--) {
-            if (pn5180_14443_send_rats(pn5180)) {
-                rats_ok = true;
-                break;
-            }
-            pn5180_delay_ms(5);
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (pn5180_14443_send_rats(pn5180)) {
+            pn5180->iso14443_layer4_active = true;
+            return true;
         }
-
-        if (!rats_ok) {
-            ESP_LOGE(TAG, "RATS failed after retries");
-            return false;
-        }
-        pn5180->iso14443_layer4_active = true;
-        // RATS implies new session, ensure NDEF checked is false
-        pn5180->iso14443_ndef_checked = false;
+        pn5180_delay_ms(5);
     }
-
-    // 2. Select NDEF Tag Application (AID: D2 76 00 00 85 01 01)
-    const uint8_t ndef_aid[] = {0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
-    if (!pn5180_iso14443_4_select_file(pn5180, ndef_aid, sizeof(ndef_aid))) {
-        PN5180_LOGD(TAG, "Failed to select NDEF Application");
-        // Not fatal for "activation" (might use other App), but fatal for NDEF read.
-        pn5180->iso14443_ndef_checked  = true;
-        pn5180->iso14443_ndef_detected = false;
-        return false;
-    }
-
-    // 3. Select NDEF File (E1 04)
-    const uint8_t ndef_file_id[] = {0xE1, 0x04};
-    if (!pn5180_iso14443_4_select_file(pn5180, ndef_file_id, 2)) {
-        PN5180_LOGD(TAG, "Failed to select NDEF File");
-        pn5180->iso14443_ndef_checked  = true;
-        pn5180->iso14443_ndef_detected = false;
-        return false;
-    }
-
-    pn5180->iso14443_ndef_checked  = true;
-    pn5180->iso14443_ndef_detected = true;
-    return true;
+    ESP_LOGE(TAG, "RATS failed after retries");
+    return false;
 }
 
-static bool pn5180_iso14443_4_transceive(pn5180_t *pn5180, const uint8_t *tx, size_t tx_len, uint8_t *rx, size_t *rx_len)
+#define ISO_DEP_PCB_I_BLOCK    0x02 // I-block; bit 0 is the block number, bit 4 the chaining flag
+#define ISO_DEP_PCB_CHAINING   0x10
+#define ISO_DEP_PCB_R_ACK      0xA2 // R(ACK); bit 0 is the block number
+#define ISO_DEP_PCB_R_NAK      0xB2 // R(NAK); bit 0 is the block number
+#define ISO_DEP_PCB_S_WTX      0xF2
+#define ISO_DEP_PCB_S_DESELECT 0xC2
+#define ISO_DEP_MAX_RETRIES    3
+// Longest frame waiting time ISO14443-4 allows (FWI 14); a waiting time extension cannot go beyond it.
+#define ISO_DEP_FWT_MAX_MS 4949
+// The PN5180 transmit buffer holds 260 bytes, the receive buffer below 260: keep blocks within 256 bytes.
+#define ISO_DEP_MAX_INF 253
+
+// State of one command/response exchange
+typedef struct
 {
-    if (pn5180 == NULL || tx == NULL || rx == NULL || rx_len == NULL || *rx_len == 0) {
+    const uint8_t *apdu;
+    size_t         apdu_len;
+    size_t         max_inf;
+    size_t         tx_offset;                    // start of the APDU part carried by i_block
+    size_t         tx_chunk;                     // length of that part
+    bool           tx_chaining;                  // i_block is not the last block of the command
+    uint8_t        i_block[1 + ISO_DEP_MAX_INF]; // the I-block being sent, kept for retransmission
+    size_t         i_block_len;
+} iso_dep_tx_t;
+
+// Builds the I-block that carries the APDU part starting at tx_offset.
+static void pn5180_iso_dep_build_i_block(pn5180_t *pn5180, iso_dep_tx_t *tx)
+{
+    tx->tx_chunk    = tx->apdu_len - tx->tx_offset;
+    tx->tx_chaining = tx->tx_chunk > tx->max_inf;
+    if (tx->tx_chaining) {
+        tx->tx_chunk = tx->max_inf;
+    }
+    tx->i_block[0] = (uint8_t)(ISO_DEP_PCB_I_BLOCK | (pn5180->iso14443_block_number & 0x01) | (tx->tx_chaining ? ISO_DEP_PCB_CHAINING : 0));
+    memcpy(&tx->i_block[1], &tx->apdu[tx->tx_offset], tx->tx_chunk);
+    tx->i_block_len = 1 + tx->tx_chunk;
+}
+
+bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apdu_len, uint8_t *rx, size_t *rx_len)
+{
+    if (pn5180 == NULL || apdu == NULL || apdu_len == 0 || rx == NULL || rx_len == NULL || *rx_len == 0) {
+        return false;
+    }
+    if (!pn5180->iso14443_layer4_active) {
+        ESP_LOGE(TAG, "ISO14443-4 is not active: select an ISO14443-4 card first");
         return false;
     }
 
     size_t rx_capacity = *rx_len;
     *rx_len            = 0;
 
-    // Wrap APDU in I-Block (PCB | INF)
-    // PCB I-Block: 0000001b (0x02) or 00000011b (0x03)
-    // Bit 1 toggles (Block Number)
-    uint8_t pcb = 0x02 | (pn5180->iso14443_block_number & 0x01);
-
-    if (pn5180->iso14443_frame_size != 0 && (tx_len + 1) > pn5180->iso14443_frame_size) {
-        ESP_LOGE(TAG, "Layer 4 APDU too large for current FSC: tx=%zu frame=%u", tx_len + 1, pn5180->iso14443_frame_size);
+    iso_dep_tx_t *tx = calloc(1, sizeof(iso_dep_tx_t));
+    if (tx == NULL) {
         return false;
     }
+    tx->apdu     = apdu;
+    tx->apdu_len = apdu_len;
+    // Largest INF field the card accepts: FSC minus PCB and CRC (iso14443_frame_size is FSC without CRC).
+    tx->max_inf = (pn5180->iso14443_frame_size > 1) ? (size_t)(pn5180->iso14443_frame_size - 1) : 13;
+    if (tx->max_inf > ISO_DEP_MAX_INF) {
+        tx->max_inf = ISO_DEP_MAX_INF;
+    }
 
-    // Allocate temp buffer for Frame (PCB + INF)
-    uint16_t frame_len = tx_len + 1;
-    uint8_t *frame     = malloc(frame_len);
-    if (!frame) return false;
-
-    frame[0] = pcb;
-    memcpy(&frame[1], tx, tx_len);
-
-    // For ISO-DEP / Layer 4, the PN5180 automatically handles the CRC if enabled.
-    // However, some datasheets suggest RX_CRC is not used in "Transceive" state
-    // depending on config. Let's ensure it is enabled.
     pn5180_enable_crc(pn5180);
 
-    // PN5180 transmits exactly what we give it (plus CRC)
+    uint8_t ctrl_block[2]; // R- or S-block being sent
     uint8_t rx_buf[260];
-    int64_t initial_timeout_ms = pn5180->iso14443_fwt_ms > 0 ? pn5180->iso14443_fwt_ms : pn5180->timeout_ms;
-    int64_t base_timeout_ms    = initial_timeout_ms;
-    int     retransmits        = 0;
-    size_t  total_payload      = 0;
 
-    // Block to send in the next exchange: the I-block first, later R(ACK) or S(WTX) answers.
-    uint8_t        ctrl_block[2];
-    const uint8_t *next_tx     = frame;
-    size_t         next_tx_len = frame_len;
+    int64_t fwt_ms        = pn5180->iso14443_fwt_ms > 0 ? pn5180->iso14443_fwt_ms : pn5180->timeout_ms;
+    int64_t timeout_ms    = fwt_ms;
+    bool    rx_chaining   = false; // the card is sending a chained response
+    size_t  total_payload = 0;
+    int     retries       = 0;
+    bool    ok            = false;
 
-    while (retransmits < 3) {
+    pn5180_iso_dep_build_i_block(pn5180, tx);
+    const uint8_t *next_tx     = tx->i_block;
+    size_t         next_tx_len = tx->i_block_len;
+
+    while (true) {
         uint16_t    received = 0;
-        rx_result_t rx_rc =
-            pn5180_iso14443_4_exchange_frame(pn5180, "T4T Transceive", next_tx, next_tx_len, base_timeout_ms, rx_buf, sizeof(rx_buf), &received);
+        rx_result_t rx_rc    = pn5180_iso14443_4_exchange_frame(pn5180, "ISO-DEP", next_tx, next_tx_len, timeout_ms, rx_buf, sizeof(rx_buf), &received);
+        timeout_ms           = fwt_ms; // a waiting time extension covers one block only
 
         if (rx_rc == RX_RESULT_FATAL) {
-            free(frame);
-            return false;
+            break;
         }
 
         if (rx_rc == RX_RESULT_TIMEOUT || rx_rc == RX_RESULT_PROTOCOL_ERROR) {
-            retransmits++;
-            if (retransmits >= 3) {
-                ESP_LOGE(TAG, "T4T Transceive failed after %d retries", retransmits);
-                free(frame);
-                return false;
+            if (++retries > ISO_DEP_MAX_RETRIES) {
+                ESP_LOGE(TAG, "ISO-DEP exchange failed after %d retries", ISO_DEP_MAX_RETRIES);
+                break;
             }
-            ESP_LOGW(TAG, "Receive error (rc=%d), retransmitting (attempt %d)", rx_rc, retransmits);
-            if (total_payload > 0) {
-                ctrl_block[0] = (uint8_t)(0xA2 | (pn5180->iso14443_block_number & 0x01)); // R(ACK)
-                next_tx       = ctrl_block;
-                next_tx_len   = 1;
-            } else {
-                next_tx     = frame;
-                next_tx_len = frame_len;
-            }
+            // ISO14443-4 rules 4 and 5: ask with R(NAK) for the last block again; while the card is
+            // chaining, R(ACK) does that.
+            PN5180_LOGD(TAG, "ISO-DEP receive error (rc=%d), attempt %d", (int)rx_rc, retries);
+            ctrl_block[0] = (uint8_t)((rx_chaining ? ISO_DEP_PCB_R_ACK : ISO_DEP_PCB_R_NAK) | (pn5180->iso14443_block_number & 0x01));
+            next_tx       = ctrl_block;
+            next_tx_len   = 1;
             continue;
         }
 
         uint8_t rx_pcb = rx_buf[0];
-        if ((rx_pcb & 0xC0) == 0x00) {
+
+        if ((rx_pcb & 0xC0) == 0x00) { // I-block
+            if (tx->tx_chaining) {
+                ESP_LOGE(TAG, "ISO-DEP: I-block received while the command is still being chained");
+                break;
+            }
             if ((rx_pcb & 0x01) != (pn5180->iso14443_block_number & 0x01)) {
                 ESP_LOGE(TAG, "Unexpected I-Block number: got=%u expected=%u", rx_pcb & 0x01, pn5180->iso14443_block_number & 0x01);
-                free(frame);
-                return false;
+                break;
             }
 
-            size_t payload_len = received - 1;
+            size_t payload_len = (size_t)received - 1;
             if ((total_payload + payload_len) > rx_capacity) {
                 ESP_LOGE(TAG, "Layer 4 response too large: %zu > %zu", total_payload + payload_len, rx_capacity);
-                free(frame);
-                return false;
+                break;
             }
             memcpy(&rx[total_payload], &rx_buf[1], payload_len);
             total_payload += payload_len;
             pn5180->iso14443_block_number ^= 0x01;
+            retries = 0;
 
-            if ((rx_pcb & 0x10) != 0) {
+            if ((rx_pcb & ISO_DEP_PCB_CHAINING) != 0) {
                 // Chained response: acknowledge to get the next part
-                ctrl_block[0] = (uint8_t)(0xA2 | (pn5180->iso14443_block_number & 0x01)); // R(ACK)
+                rx_chaining   = true;
+                ctrl_block[0] = (uint8_t)(ISO_DEP_PCB_R_ACK | (pn5180->iso14443_block_number & 0x01));
                 next_tx       = ctrl_block;
                 next_tx_len   = 1;
-                retransmits   = 0;
                 continue;
             }
 
             *rx_len = total_payload;
-            free(frame);
-            return true;
+            ok      = true;
+            break;
         }
 
-        if ((rx_pcb & 0xC0) == 0x80) {
-            retransmits++;
-            if (retransmits >= 3) {
-                free(frame);
-                return false;
+        if ((rx_pcb & 0xC0) == 0x80) { // R-block
+            if ((rx_pcb & 0x10) != 0 || rx_chaining) {
+                // A card never sends R(NAK), and answers our R(ACK) with an I-block.
+                ESP_LOGE(TAG, "ISO-DEP: unexpected R-block 0x%02X", rx_pcb);
+                break;
             }
-            if (total_payload > 0) {
-                ESP_LOGW(TAG, "Received R-Block (0x%02X) during chaining, retransmitting R(ACK)", rx_pcb);
-                ctrl_block[0] = (uint8_t)(0xA2 | (pn5180->iso14443_block_number & 0x01)); // R(ACK)
-                next_tx       = ctrl_block;
-                next_tx_len   = 1;
-            } else {
-                ESP_LOGW(TAG, "Received R-Block (0x%02X), retransmitting I-Block", rx_pcb);
-                next_tx     = frame;
-                next_tx_len = frame_len;
+            if ((rx_pcb & 0x01) == (pn5180->iso14443_block_number & 0x01)) {
+                // The card acknowledges the I-block just sent: continue the command chain.
+                if (!tx->tx_chaining) {
+                    ESP_LOGE(TAG, "ISO-DEP: R(ACK) for an unchained block");
+                    break;
+                }
+                pn5180->iso14443_block_number ^= 0x01;
+                tx->tx_offset += tx->tx_chunk;
+                retries = 0;
+                pn5180_iso_dep_build_i_block(pn5180, tx);
+                next_tx     = tx->i_block;
+                next_tx_len = tx->i_block_len;
+                continue;
             }
+            // R(ACK) with the other block number: the card did not get the last I-block (rule 6).
+            if (++retries > ISO_DEP_MAX_RETRIES) {
+                ESP_LOGE(TAG, "ISO-DEP exchange failed after %d retries", ISO_DEP_MAX_RETRIES);
+                break;
+            }
+            PN5180_LOGD(TAG, "ISO-DEP: retransmitting I-block, attempt %d", retries);
+            next_tx     = tx->i_block;
+            next_tx_len = tx->i_block_len;
             continue;
         }
 
-        if ((rx_pcb & 0xC0) == 0xC0) {
-            if ((rx_pcb & 0x30) == 0x30) {
-                uint8_t wtxm = (received >= 2) ? (uint8_t)(rx_buf[1] & 0x3F) : 0;
-                if (wtxm == 0) {
-                    ESP_LOGE(TAG, "Invalid WTX frame received");
-                    free(frame);
-                    return false;
-                }
-                // S(WTX) response
-                ctrl_block[0]   = 0xF2;
-                ctrl_block[1]   = wtxm;
-                next_tx         = ctrl_block;
-                next_tx_len     = 2;
-                base_timeout_ms = initial_timeout_ms * wtxm;
-                if (base_timeout_ms < 1) {
-                    base_timeout_ms = 1;
-                }
-                continue;
+        // S-block
+        if ((rx_pcb & 0xF7) == ISO_DEP_PCB_S_WTX) {
+            uint8_t wtxm = (received >= 2) ? (uint8_t)(rx_buf[1] & 0x3F) : 0;
+            if (wtxm == 0 || wtxm > 59) {
+                ESP_LOGE(TAG, "Invalid WTX frame received");
+                break;
             }
-            ESP_LOGE(TAG, "Unsupported S-Block 0x%02X", rx_pcb);
-            free(frame);
-            return false;
+            ctrl_block[0] = ISO_DEP_PCB_S_WTX;
+            ctrl_block[1] = wtxm;
+            next_tx       = ctrl_block;
+            next_tx_len   = 2;
+            timeout_ms    = fwt_ms * wtxm;
+            if (timeout_ms > ISO_DEP_FWT_MAX_MS) {
+                timeout_ms = ISO_DEP_FWT_MAX_MS;
+            }
+            continue;
         }
-
-        ESP_LOGE(TAG, "Unknown ISO14443-4 PCB 0x%02X", rx_pcb);
-        free(frame);
-        return false;
+        ESP_LOGE(TAG, "Unsupported ISO14443-4 block 0x%02X", rx_pcb);
+        break;
     }
 
-    free(frame);
-    return false;
+    free(tx);
+    return ok;
 }
 
-static bool pn5180_iso14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len)
+static bool pn5180_14443_4_select(pn5180_t *pn5180, uint8_t p1, uint8_t p2, const uint8_t *file_id, size_t file_id_len, bool *card_refused)
 {
-    // ISO 7816-4 Select File: 00 A4 00 00 Lc FileID
-    // CLA=00, INS=A4, P1=00 (Select by ID), P2=0C (First or only occurrence, return no data)
-    // Wait, NDEF usually uses P2=00 (First or only), P1=04 (Select by DF Name/AID) or P1=00 (Select by File ID)
-
-    // For AID (Application): P1=04, P2=00
-    // For File ID: P1=00, P2=00 or P2=0C
-
-    uint8_t apdu[20];
-    apdu[0] = 0x00;
-    apdu[1] = 0xA4;
-
-    if (file_id_len > 2) {
-        apdu[2] = 0x04; // Select by DF Name (AID)
-    } else {
-        apdu[2] = 0x00; // Select by File ID
-    }
-
-    apdu[3] = 0x00; // P2 (00 = return FCI optional/default) mention: 0C for "no response data" but usually we want to check SW
-    apdu[4] = (uint8_t)file_id_len;
+    uint8_t apdu[5 + 16];
+    apdu[0] = 0x00;                 // CLA
+    apdu[1] = 0xA4;                 // INS = SELECT
+    apdu[2] = p1;                   // P1
+    apdu[3] = p2;                   // P2
+    apdu[4] = (uint8_t)file_id_len; // Lc
     memcpy(&apdu[5], file_id, file_id_len);
 
-    uint8_t rx[32];
+    *card_refused = false;
+
+    uint8_t rx[260];
     size_t  rx_len = sizeof(rx);
-
-    // Need to append Le=00 sometimes? Not for Select usually unless we want FCI.
-    // Let's assume just wrapper.
-
-    if (!pn5180_iso14443_4_transceive(pn5180, apdu, 5 + file_id_len, rx, &rx_len)) {
-        ESP_LOGE(TAG, "Select APDU failed to transmit/receive");
+    if (!pn5180_14443_4_transceive(pn5180, apdu, 5u + file_id_len, rx, &rx_len)) {
         return false;
     }
 
-    // Check SW1 SW2 (last 2 bytes)
-    if (rx_len < 2) return false;
-    uint8_t sw1 = rx[rx_len - 2];
-    uint8_t sw2 = rx[rx_len - 1];
-
-    if (sw1 == 0x90 && sw2 == 0x00) return true;
-
-    PN5180_LOGD(TAG, "Select failed with SW: %02X %02X", sw1, sw2);
+    pn5180_apdu_response_t response;
+    if (pn5180_apdu_parse_response(rx, rx_len, &response) != ESP_OK) {
+        return false;
+    }
+    if (pn5180_apdu_get_status(&response) == PN5180_APDU_SW_SUCCESS) {
+        return true;
+    }
+    PN5180_LOGD(TAG, "SELECT P1=%02X P2=%02X failed SW=%02X%02X", p1, p2, response.sw1, response.sw2);
+    *card_refused = true;
     return false;
 }
 
-static void pn5180_14443_detect_desfire_capacity(pn5180_t *pn5180, int *blocks_count)
+bool pn5180_14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len)
 {
-    // Activate Layer 4 and try to select NDEF app
-    if (pn5180_activate_layer4_ndef(pn5180)) {
-        // Assume default NDEF capacity if activation worked
-        *blocks_count = 4096;
-    } else {
-        *blocks_count = 0;
+    if (pn5180 == NULL || file_id == NULL || file_id_len == 0 || file_id_len > 16) {
+        return false;
     }
+
+    bool card_refused = false;
+    if (file_id_len > 2) {
+        // By AID: first or only occurrence, FCI optional.
+        return pn5180_14443_4_select(pn5180, 0x04, 0x00, file_id, file_id_len, &card_refused);
+    }
+
+    // By file identifier. NFC Forum Type 4 Tag mapping 2.0 mandates P2=0x0C (no response data);
+    // mapping 1.0 cards expect P2=0x00, so that is tried once when the card itself refuses the first form.
+    if (pn5180_14443_4_select(pn5180, 0x00, 0x0C, file_id, file_id_len, &card_refused)) {
+        return true;
+    }
+    return card_refused && pn5180_14443_4_select(pn5180, 0x00, 0x00, file_id, file_id_len, &card_refused);
+}
+
+bool pn5180_14443_4_read_binary(pn5180_t *pn5180, uint16_t offset, uint8_t le, uint8_t *buffer, size_t *got)
+{
+    if (pn5180 == NULL || buffer == NULL || got == NULL) {
+        return false;
+    }
+    // P1/P2 carry a 15-bit offset (bit 8 of P1 must stay 0, ISO 7816-4). Reject instead of wrapping.
+    if (offset > 0x7FFFu) {
+        ESP_LOGE(TAG, "READ BINARY offset 0x%04X exceeds the 0x7FFF limit", offset);
+        return false;
+    }
+
+    uint8_t apdu[5];
+    apdu[0] = 0x00;                            // CLA
+    apdu[1] = 0xB0;                            // INS = READ BINARY
+    apdu[2] = (uint8_t)((offset >> 8) & 0x7F); // P1: offset high byte
+    apdu[3] = (uint8_t)(offset & 0xFF);        // P2: offset low byte
+    apdu[4] = le;                              // Le
+
+    uint8_t rx[260];
+    size_t  rx_len = sizeof(rx);
+    if (!pn5180_14443_4_transceive(pn5180, apdu, sizeof(apdu), rx, &rx_len)) {
+        return false;
+    }
+
+    pn5180_apdu_response_t response;
+    if (pn5180_apdu_parse_response(rx, rx_len, &response) != ESP_OK) {
+        return false;
+    }
+    if (pn5180_apdu_get_status(&response) != PN5180_APDU_SW_SUCCESS) {
+        PN5180_LOGD(TAG, "READ BINARY @0x%04X len=%u SW=%02X%02X", offset, le, response.sw1, response.sw2);
+        return false;
+    }
+
+    if (response.data_len > *got) {
+        // Report the required size instead of silently truncating.
+        ESP_LOGE(TAG, "READ BINARY @0x%04X: %u bytes arrived, buffer holds %u", offset, (unsigned)response.data_len, (unsigned)*got);
+        *got = response.data_len;
+        return false;
+    }
+    memcpy(buffer, response.data, response.data_len);
+    *got = response.data_len;
+    return true;
 }
 
 static bool _pn5180_14443_detect_card_type_and_capacity( //
@@ -1055,7 +1112,7 @@ static bool _pn5180_14443_detect_card_type_and_capacity( //
         *blocks_count = 16;
         *block_size   = 4;
         // GET_VERSION can change card state; caller may need to reselect afterwards.
-        need_reselection = pn5180_14443_detect_ultralight_variant(pn5180, &uid->subtype, blocks_count);
+        need_reselection = pn5180_14443_detect_ultralight_variant(pn5180, uid, &uid->subtype, blocks_count);
         break;
     case 0x08:
         PN5180_LOGD(TAG, "Detected MIFARE Classic 1K");
@@ -1088,7 +1145,6 @@ static bool _pn5180_14443_detect_card_type_and_capacity( //
         uid->subtype  = PN5180_MIFARE_DESFIRE;
         *block_size   = 1;
         *blocks_count = 0;
-        pn5180_14443_detect_desfire_capacity(pn5180, blocks_count);
         break;
     case 0x28:
         PN5180_LOGD(TAG, "Detected MIFARE Classic 1K emulation on an ISO 14443-4 card");
@@ -1109,7 +1165,6 @@ static bool _pn5180_14443_detect_card_type_and_capacity( //
             uid->subtype  = PN5180_MIFARE_DESFIRE;
             *block_size   = 1;
             *blocks_count = 0;
-            pn5180_14443_detect_desfire_capacity(pn5180, blocks_count);
         } else {
             PN5180_LOGD(TAG, "Unknown or unsupported MIFARE type (SAK: 0x%02X)", uid->sak);
             uid->subtype  = PN5180_MIFARE_UNKNOWN;
@@ -1191,22 +1246,22 @@ static bool pn5180_14443_select_by_uid( //
             if (uid->sak != sak) {
                 uid->sak = sak;
             }
-            // Check if card supports ISO 14443-4 (Layer 4)
-            if (sak & 0x20) {
+            uid->atqa[0] = atqa[0];
+            uid->atqa[1] = atqa[1];
+            // SAK bit 6: the card supports ISO14443-4. A card that also emulates MIFARE Classic
+            // (SAK 0x28 / 0x38) accepts MIFARE commands only while it stays on ISO14443-3, so it is
+            // activated as ISO14443-4 only when the caller asks for it by setting the subtype to
+            // PN5180_MIFARE_DESFIRE before selecting.
+            bool classic_emulation = (sak & 0x08) != 0 && uid->subtype != PN5180_MIFARE_DESFIRE;
+            if ((sak & 0x20) != 0 && !classic_emulation) {
                 PN5180_LOGD(TAG, "Card supports ISO 14443-4, activating Layer 4...");
-                pn5180->iso14443_current_card_type = PN5180_MIFARE_DESFIRE; // Ensure type is set based on SAK
-
-                // Perform RATS and setup NDEF context
-                if (!pn5180_activate_layer4_ndef(pn5180)) {
-                    PN5180_LOGD(TAG, "NDEF activation failed (card might be unformatted)");
+                if (!pn5180_14443_4_activate(pn5180)) {
+                    return false;
                 }
-            } else {
-                // Not a Layer 4 card (e.g. Ultralight, Classic)
-                // s_active_card_type should be set by detect() or default logic
-                // But if we just selected by UID, we might need to infer it.
-                // Classic 1K = 0x08, 4K = 0x18.
-                // We rely on 'detect' having run previously to set subtype precise,
-                // but we can set a fallback here if needed.
+                pn5180->iso14443_current_card_type = PN5180_MIFARE_DESFIRE;
+            } else if (pn5180->iso14443_current_card_type == PN5180_MIFARE_DESFIRE) {
+                // block_read must not go through ISO14443-4 for this card
+                pn5180->iso14443_current_card_type = uid->subtype;
             }
 
             return true;
@@ -1218,6 +1273,22 @@ static bool pn5180_14443_select_by_uid( //
 
 static bool pn5180_mifare_halt(pn5180_t *pn5180)
 {
+    if (pn5180->iso14443_layer4_active) {
+        // ISO14443-4 cards are released with S(DESELECT), which they answer with S(DESELECT).
+        uint8_t deselect = ISO_DEP_PCB_S_DESELECT;
+        uint8_t answer[4];
+        size_t  answer_len = 0;
+        pn5180_enable_crc(pn5180);
+        pn5180_rf_result_t deselect_result =
+            pn5180_rf_transceive(pn5180, &deselect, 1, 0, answer, sizeof(answer), &answer_len, PN5180_TIMEOUT_14443A_RATS_US, NULL);
+        if (deselect_result == PN5180_RF_OK && answer_len >= 1 && (answer[0] & 0xF7) == ISO_DEP_PCB_S_DESELECT) {
+            pn5180_disable_crc(pn5180);
+            pn5180_set_transceiver_idle(pn5180);
+            pn5180_iso14443_4_reset_state(pn5180);
+            return true;
+        }
+        PN5180_LOGD(TAG, "S(DESELECT) not acknowledged (result=%d), sending HLTA", (int)deselect_result);
+    }
     pn5180_enable_tx_crc(pn5180);
     pn5180_disable_rx_crc(pn5180);
     uint8_t cmd_buf[2];
@@ -1231,6 +1302,8 @@ static bool pn5180_mifare_halt(pn5180_t *pn5180)
     if (!ret) {
         ESP_LOGE(TAG, "HLTA transmission failed (result=%d)", (int)result);
     }
+    // The card needs about 1 ms to act on HLTA before the next command (the NXP reader library waits 1100 us).
+    esp_rom_delay_us(1100);
     pn5180_disable_crc(pn5180);
     pn5180_set_transceiver_idle(pn5180);
     pn5180_write_register_and_mask(pn5180, PN5180_SYSTEM_CONFIG, PN5180_SYSTEM_CONFIG_CLEAR_CRYPTO_MASK);

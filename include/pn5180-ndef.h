@@ -34,6 +34,7 @@ typedef enum
     PN5180_NDEF_ERR_PARSE_FAILED     = -6, /**< NDEF message parsing failed */
     PN5180_NDEF_ERR_BUFFER_TOO_SMALL = -7, /**< Output buffer too small */
     PN5180_NDEF_ERR_CARD_FULL        = -8, /**< Card capacity exceeded */
+    PN5180_NDEF_ERR_UNSUPPORTED      = -9, /**< Card type has no NDEF mapping in this driver */
 } pn5180_ndef_result_t;
 
 /** @name NDEF Record flag bits (header byte)
@@ -304,6 +305,42 @@ pn5180_ndef_result_t pn5180_ndef_write_to_selected_card(struct _pn5180_proto_t *
  * @param msg Pointer to parsed message to free (can be NULL)
  */
 void pn5180_ndef_free_parsed_message(pn5180_ndef_message_parsed_t *msg);
+
+/**
+ * @brief Parse an encoded NDEF message into logical records
+ *
+ * Records carrying the chunk flag (CF) are validated and reassembled: the first chunk supplies
+ * TNF, type and ID, the following chunks must use TNF "unchanged", and their payloads are
+ * concatenated into one logical record. The returned message owns a copy of the encoded bytes
+ * and the assembled payloads.
+ *
+ * @param raw_data Encoded NDEF message (without TLV or NLEN prefix)
+ * @param raw_data_len Number of encoded bytes
+ * @param out_msg Receives the parsed message; free with pn5180_ndef_free_parsed_message()
+ * @return PN5180_NDEF_OK or an error code
+ */
+pn5180_ndef_result_t pn5180_ndef_parse_message(const uint8_t *raw_data, size_t raw_data_len, pn5180_ndef_message_parsed_t **out_msg);
+
+/**
+ * @brief Read the NDEF message of a selected card, whatever its tag type
+ *
+ * Picks the NDEF mapping from uid->subtype, so detect_card_type_and_capacity() must have run,
+ * and the card must be selected (select_by_uid()):
+ * - Ultralight / NTAG (Type 2): capability container in page 3, TLVs from page 4
+ * - MIFARE Classic: sectors listed in the MIFARE Application Directory, with the public NDEF keys
+ * - ISO14443-4 cards (Type 4): NDEF application, capability container file, NDEF file
+ * - ISO15693 (Type 5): capability container in block 0, TLVs after it
+ *
+ * A failed read is retried once after selecting the card again, because several card families
+ * leave the selected state after an error.
+ *
+ * @param proto Protocol interface the card was found with
+ * @param uid Card to read; its subtype, block_size and blocks_count are used
+ * @param out_msg Receives the parsed message; free with pn5180_ndef_free_parsed_message()
+ * @return PN5180_NDEF_OK, PN5180_NDEF_ERR_NO_NDEF if the card carries no NDEF message,
+ *         PN5180_NDEF_ERR_UNSUPPORTED for a card type without NDEF mapping, or another error code
+ */
+pn5180_ndef_result_t pn5180_ndef_read_card_auto(struct _pn5180_proto_t *proto, pn5180_uid_t *uid, pn5180_ndef_message_parsed_t **out_msg);
 
 /**
  * @brief Extract text content from a Well-known Text record

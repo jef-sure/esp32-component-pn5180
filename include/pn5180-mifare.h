@@ -30,6 +30,37 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
  */
 int  pn5180_mifare_block_write(pn5180_t *pn5180, int blockno, const uint8_t *buffer, size_t buffer_len);
 
+/**
+ * @brief Read a MIFARE Classic value block and check its format
+ *
+ * The sector must be authenticated. Fails if the block is not a correctly formatted value
+ * block (value, inverted value, value, address, inverted address, address, inverted address).
+ */
+bool pn5180_mifare_value_read(pn5180_t *pn5180, uint8_t blockno, int32_t *value);
+
+/**
+ * @brief Format a block as a MIFARE Classic value block
+ * @param value Initial value
+ * @param addr Address byte stored in the block (usually the block number, used for backup management)
+ */
+bool pn5180_mifare_value_write(pn5180_t *pn5180, uint8_t blockno, int32_t value, uint8_t addr);
+
+/**
+ * @brief Add @p delta to a value block
+ *
+ * The result is held in the card's transfer buffer; call pn5180_mifare_transfer() to store it.
+ */
+bool pn5180_mifare_increment(pn5180_t *pn5180, uint8_t blockno, uint32_t delta);
+
+/** @brief Subtract @p delta from a value block; store the result with pn5180_mifare_transfer() */
+bool pn5180_mifare_decrement(pn5180_t *pn5180, uint8_t blockno, uint32_t delta);
+
+/** @brief Load a value block into the card's transfer buffer */
+bool pn5180_mifare_restore(pn5180_t *pn5180, uint8_t blockno);
+
+/** @brief Write the card's transfer buffer to a value block */
+bool pn5180_mifare_transfer(pn5180_t *pn5180, uint8_t blockno);
+
 #ifdef __cplusplus
 }
 #endif

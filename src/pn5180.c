@@ -81,14 +81,6 @@ static bool pn5180_read_firmware_version(pn5180_t *pn5180, uint16_t *fw_version)
     return true;
 }
 
-void pn5180_delay_ms(int ms)
-{
-    int64_t start = esp_timer_get_time();
-    while ((esp_timer_get_time() - start) < (ms * 1000)) {
-        vTaskDelay(1);
-    }
-}
-
 // Microsecond delay: sleeps whole ticks and busy-waits the remainder.
 static void pn5180_delay_us(uint32_t us)
 {
@@ -100,6 +92,13 @@ static void pn5180_delay_us(uint32_t us)
     int64_t remaining = end - esp_timer_get_time();
     if (remaining > 0) {
         esp_rom_delay_us((uint32_t)remaining);
+    }
+}
+
+void pn5180_delay_ms(int ms)
+{
+    if (ms > 0) {
+        pn5180_delay_us((uint32_t)ms * 1000u);
     }
 }
 
@@ -215,12 +214,44 @@ static bool inline wait_busy_level(pn5180_t *pn5180, int level, const char *time
     return true;
 }
 
+static void pn5180_poll_timer_cb(void *arg)
+{
+    xSemaphoreGive((SemaphoreHandle_t)arg);
+}
+
+// Sleeps for about us microseconds with the CPU released. vTaskDelay() cannot do this: it sleeps
+// whole ticks, typically 10 ms.
+static void pn5180_poll_sleep(pn5180_t *pn5180, uint32_t us)
+{
+    // A tick that is no longer than the wanted sleep makes vTaskDelay() precise enough.
+    if (pn5180->poll_timer == NULL || (uint32_t)portTICK_PERIOD_MS * 1000u <= us) {
+        vTaskDelay(1);
+        return;
+    }
+    esp_timer_handle_t timer = (esp_timer_handle_t)pn5180->poll_timer;
+    xSemaphoreTake((SemaphoreHandle_t)pn5180->poll_sem, 0);
+    if (esp_timer_start_once(timer, us) != ESP_OK) {
+        vTaskDelay(1);
+        return;
+    }
+    // The tick timeout is only a backstop in case the timer does not fire.
+    xSemaphoreTake((SemaphoreHandle_t)pn5180->poll_sem, pdMS_TO_TICKS(us / 1000 + 20) + 1);
+    esp_timer_stop(timer);
+}
+
 // Frees only what pn5180_init() allocated; the SPI structure stays with the caller.
 static void pn5180_free(pn5180_t *pn5180)
 {
     if (pn5180->irq_sem != NULL) {
         gpio_isr_handler_remove(pn5180->irq);
         vSemaphoreDelete((SemaphoreHandle_t)pn5180->irq_sem);
+    }
+    if (pn5180->poll_timer != NULL) {
+        esp_timer_stop((esp_timer_handle_t)pn5180->poll_timer);
+        esp_timer_delete((esp_timer_handle_t)pn5180->poll_timer);
+    }
+    if (pn5180->poll_sem != NULL) {
+        vSemaphoreDelete((SemaphoreHandle_t)pn5180->poll_sem);
     }
     free(pn5180->send_buf);
     free(pn5180->recv_buf);
@@ -258,6 +289,22 @@ pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_n
     ret->tx_config        = 0;
     ret->hw_rx_timeout    = true;
     ret->rf_guard_time_us = 5100;
+    // Timer for sleeping between IRQ_STATUS polls with sub-tick precision. Without it the driver
+    // still works, with tick-length sleeps.
+    ret->poll_sem = xSemaphoreCreateBinary();
+    if (ret->poll_sem != NULL) {
+        const esp_timer_create_args_t poll_timer_args = {
+            .callback = pn5180_poll_timer_cb, //
+            .arg      = ret->poll_sem,        //
+            .name     = "pn5180_poll"         //
+        };
+        esp_timer_handle_t poll_timer = NULL;
+        if (esp_timer_create(&poll_timer_args, &poll_timer) == ESP_OK) {
+            ret->poll_timer = poll_timer;
+        } else {
+            ESP_LOGW(TAG, "Failed to create poll timer, polling with tick resolution");
+        }
+    }
     // Set the idle levels before the pins become outputs so that NSS and RST do not glitch low.
     gpio_set_level(nss, 1);
     gpio_set_level(rst, 1);
@@ -700,8 +747,10 @@ bool pn5180_lpcd_enter(pn5180_t *pn5180, uint16_t wakeup_counter_ms)
     }
     PN5180_LOGD(TAG, "LPCD reference AGC_REF_CONFIG=0x%08" PRIx32, agc_ref);
 
-    // LPCD_IRQ and GENERAL_ERROR_IRQ are non-maskable, so IRQ_ENABLE needs no setup for the IRQ pin.
+    // LPCD_IRQ and GENERAL_ERROR_IRQ are non-maskable; writing IRQ_ENABLE still takes the flags of the last
+    // RF exchange off the IRQ pin, and is what the NXP reader library does before entering LPCD.
     pn5180_clear_all_irqs(pn5180);
+    pn5180_write_register(pn5180, PN5180_IRQ_ENABLE, PN5180_LPCD_IRQ_STAT | PN5180_GENERAL_ERROR_IRQ_STAT);
     if (pn5180->irq_sem != NULL) {
         xSemaphoreTake((SemaphoreHandle_t)pn5180->irq_sem, 0); // drop a stale notification
     }
@@ -1181,8 +1230,10 @@ bool pn5180_irq_attach(pn5180_t *pn5180, gpio_num_t irq)
     return true;
 }
 
-// How long the wait keeps polling IRQ_STATUS back to back before it starts yielding between polls.
+// How long the wait keeps polling IRQ_STATUS back to back before it starts sleeping between polls.
 #define PN5180_IRQ_SPIN_US 5000
+// Sleep between polls after that; the CPU is released meanwhile.
+#define PN5180_IRQ_POLL_US 1000
 // With the IRQ pin the wait still wakes up this often to poll IRQ_STATUS, in case an edge was missed.
 #define PN5180_IRQ_RECHECK_MS 20
 
@@ -1214,7 +1265,7 @@ static bool pn5180_wait_irq_until(pn5180_t *pn5180, uint32_t irq_mask, int64_t d
         } else if (now < spin_until) {
             esp_rom_delay_us(10);
         } else {
-            vTaskDelay(1);
+            pn5180_poll_sleep(pn5180, PN5180_IRQ_POLL_US);
         }
     }
 }

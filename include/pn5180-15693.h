@@ -21,6 +21,14 @@ typedef enum
  */
 pn5180_proto_t *pn5180_15693_init(pn5180_t *pn5180, pn5180_15693_rf_config_t rf_config);
 
+/**
+ * @brief Poll for ISO15693 tags and report why nothing was returned
+ * @param proto Protocol interface from pn5180_15693_init()
+ * @param status Out: outcome of the poll (may be NULL)
+ * @return Heap-allocated UID array for PN5180_POLL_FOUND (caller must free), otherwise NULL
+ */
+pn5180_uids_array_t *pn5180_15693_get_all_uids_ex(pn5180_proto_t *proto, pn5180_poll_status_t *status);
+
 #ifdef __cplusplus
 }
 #endif

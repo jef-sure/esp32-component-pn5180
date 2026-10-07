@@ -135,6 +135,8 @@ typedef struct _pn5180_t
     gpio_num_t    irq;              /**< IRQ pin, GPIO_NUM_NC unless pn5180_irq_attach() was called */
     void         *irq_sem;          /**< Binary semaphore given from the IRQ pin interrupt */
     bool          irq_active_high;  /**< IRQ pin polarity, read from EEPROM IRQ_PIN_CONFIG */
+    void         *poll_timer;       /**< High-resolution timer that paces IRQ_STATUS polling without an IRQ pin */
+    void         *poll_sem;         /**< Binary semaphore given when poll_timer expires */
     uint8_t       tx_config;        /**< RF configuration last loaded with pn5180_load_rf_config() */
     bool          rf_config_loaded; /**< tx_config is valid */
     bool          is_rf_on;
@@ -148,8 +150,6 @@ typedef struct _pn5180_t
     uint16_t iso14443_frame_size;       // Max ISO14443-4 frame size excluding CRC bytes
     int64_t  iso14443_fwt_ms;           // Frame waiting time derived from ATS
     bool    iso14443_layer4_active;
-    bool    iso14443_ndef_checked;  // Cache for NDEF Application presence check
-    bool    iso14443_ndef_detected; // Result of NDEF Application presence check
 
     // ISO15693 State
     bool iso15693_use_high_rate;
@@ -176,8 +176,21 @@ typedef enum _pn5180_nfc_subtype_t
     PN5180_MIFARE_PLUS_2K,        /**< MIFARE Plus 2K (security level dependent) */
     PN5180_MIFARE_PLUS_4K,        /**< MIFARE Plus 4K (security level dependent) */
     PN5180_MIFARE_DESFIRE,        /**< MIFARE DESFire (ISO 14443-4, file-based) */
-    PN5180_15693                  /**< ISO 15693 vicinity card */
+    PN5180_15693,                 /**< ISO 15693 vicinity card */
+    PN5180_MIFARE_NTAG210,        /**< NTAG210 (48 bytes user memory) */
+    PN5180_MIFARE_NTAG212         /**< NTAG212 (128 bytes user memory) */
 } __attribute__((__packed__)) pn5180_card_type_t;
+
+/** @brief Outcome of a card poll, see pn5180_14443_get_all_uids_ex() and pn5180_15693_get_all_uids_ex() */
+typedef enum
+{
+    PN5180_POLL_FOUND = 0,        /**< At least one card was found; the UID array is returned */
+    PN5180_POLL_NO_TARGET,        /**< No card answered */
+    PN5180_POLL_TRANSPORT_ERROR,  /**< The PN5180 could not be driven (SPI failure, RF field did not come up) */
+    PN5180_POLL_PROTOCOL_ERROR,   /**< A card answered but anticollision or selection failed */
+    PN5180_POLL_NO_MEMORY,        /**< Memory allocation for the UID array failed */
+    PN5180_POLL_INVALID_ARGUMENT  /**< NULL protocol or device pointer */
+} pn5180_poll_status_t;
 
 /**
  * @brief UID metadata and block geometry for a detected card
@@ -193,6 +206,7 @@ typedef struct
     int        blocks_count; /**< Total number of blocks on card */
     pn5180_card_type_t subtype;      /**< Detected card type/subtype */
     uint8_t    uid[10];      /**< Card UID bytes (length indicated by uid_length) */
+    uint8_t    atqa[2];      /**< ATQA as received, first byte first (ISO14443A only; 44 00 for Ultralight) */
 } pn5180_uid_t;
 
 /**
@@ -673,6 +687,9 @@ pn5180_transceive_state_t pn5180_get_transceive_state(pn5180_t *pn5180);
 
 /**
  * @brief Delay execution for specified milliseconds
+ *
+ * Precise to well below a FreeRTOS tick: whole ticks are slept, the remainder is a busy wait.
+ *
  * @param ms Milliseconds to delay
  */
 void pn5180_delay_ms(int ms);
