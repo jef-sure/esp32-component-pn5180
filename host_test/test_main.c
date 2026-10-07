@@ -379,6 +379,33 @@ static void test_classic_ndef_is_read_through_the_mad(void)
     pn5180_ndef_free_parsed_message(parsed);
 }
 
+static void test_classic_mad_crc_is_checked(void)
+{
+    // The simulator's CRC reproduces the example of the NXP MAD documentation (CRC 89h), ...
+    static const uint8_t doc_example[31] = {0x01, 0x01, 0x08, 0x01, 0x08, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x03,
+                                            0x10, 0x03, 0x10, 0x02, 0x10, 0x02, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x30};
+    TEST_ASSERT_EQUAL_HEX8(0x89, sim_mad_crc(doc_example, sizeof(doc_example)));
+
+    // ... the driver accepts a MAD carrying that CRC (test_classic_ndef_is_read_through_the_mad), and
+    // refuses one whose CRC byte does not match its content.
+    sim_a_init_classic_1k(&s_card_a);
+    uint8_t ndef[64];
+    size_t  ndef_len = make_uri_message("https://example.com/crc", ndef, sizeof(ndef));
+    sim_a_classic_store_ndef(&s_card_a, ndef, ndef_len);
+    pn5180_uid_t uid = activate_card_a();
+
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    pn5180_ndef_free_parsed_message(parsed);
+    parsed = NULL;
+
+    s_card_a.memory[16] ^= 0x01; // CRC byte of MAD1
+    s_proto_a->halt(s_proto_a);
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_NO_NDEF, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_NULL(parsed);
+}
+
 static void test_classic_without_mad_has_no_ndef(void)
 {
     sim_a_init_classic_1k(&s_card_a); // transport configuration: default keys, no MAD
@@ -507,19 +534,27 @@ static void test_iso_dep_recovers_from_lost_frames_and_wtx(void)
     got                   = sizeof(data);
     TEST_ASSERT_FALSE(pn5180_14443_4_read_binary(s_pn5180, 0, 15, data, &got));
     s_card_a.wtx_requests = 0;
-    // The abandoned exchange left reader and card out of step: release the card and start a new session.
-    TEST_ASSERT_TRUE(s_proto_a->halt(s_proto_a));
+    // The driver closed the session itself: the card was deselected and is halted.
+    TEST_ASSERT_FALSE(s_pn5180->iso14443_layer4_active);
+    TEST_ASSERT_EQUAL(1, s_card_a.deselect_count);
+    TEST_ASSERT_EQUAL(SIM_A_HALT, s_card_a.state);
+    got = sizeof(data);
+    TEST_ASSERT_FALSE(pn5180_14443_4_read_binary(s_pn5180, 0, 15, data, &got)); // no session
     TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
     TEST_ASSERT_TRUE(pn5180_14443_4_select_file(s_pn5180, aid, sizeof(aid)));
     TEST_ASSERT_TRUE(pn5180_14443_4_select_file(s_pn5180, cc, sizeof(cc)));
 
-    // Both directions lost several times in a row: the exchange gives up, and the next one works.
-    s_card_a.drop_commands = 10;
+    // The card stops hearing the reader altogether: the exchange gives up and so does the deselect.
+    s_card_a.drop_commands = 100;
     got                    = sizeof(data);
     TEST_ASSERT_FALSE(pn5180_14443_4_read_binary(s_pn5180, 0, 15, data, &got));
+    TEST_ASSERT_FALSE(s_pn5180->iso14443_layer4_active);
+    TEST_ASSERT_EQUAL(SIM_A_PROTOCOL, s_card_a.state);
+    // Such a card comes back only after the field was switched off: it restarts in the idle state.
     s_card_a.drop_commands = 0;
-    got                    = sizeof(data);
-    TEST_ASSERT_TRUE(pn5180_14443_4_read_binary(s_pn5180, 0, 15, data, &got));
+    s_card_a.state         = SIM_A_IDLE;
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    TEST_ASSERT_TRUE(pn5180_14443_4_select_file(s_pn5180, aid, sizeof(aid)));
 }
 
 static void test_type4_ndef_read(void)
@@ -693,6 +728,7 @@ int main(void)
     RUN_TEST(test_type2_read_stays_inside_the_data_area);
     RUN_TEST(test_ultralight_c_is_told_apart_from_ultralight);
     RUN_TEST(test_classic_ndef_is_read_through_the_mad);
+    RUN_TEST(test_classic_mad_crc_is_checked);
     RUN_TEST(test_classic_without_mad_has_no_ndef);
     RUN_TEST(test_classic_block_write_and_value_operations);
     RUN_TEST(test_iso_dep_card_is_activated_on_select);

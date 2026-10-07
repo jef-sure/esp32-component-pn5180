@@ -17,7 +17,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/esp32-component-pn5180^0.4.2"
+idf.py add-dependency "jef-sure/esp32-component-pn5180^0.4.3"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.x or 6.0 is required.
@@ -263,7 +263,7 @@ if (pn5180_14443_4_transceive(pn5180, apdu, sizeof(apdu), rx, &rx_len)) {
 }
 ```
 
-`halt()` releases an ISO14443-4 card with S(DESELECT).
+`halt()` releases an ISO14443-4 card with S(DESELECT). An exchange that fails (no answer after the retries, protocol error, response larger than the buffer) ends the session the same way: select the card again before the next APDU.
 
 ### Read an ISO15693 tag
 
@@ -316,7 +316,7 @@ A PN5180 command is two SPI transfers, each framed by NSS. The driver holds the 
 - **`RF_ON blocked by external RF field (RFCA)`** — another reader's field is present. `pn5180_set_rfca(pn5180, false)` switches the field on regardless.
 - **`select_by_uid()` fails on a card that was just read** — the card is still selected and ignores the wake-up. Call `halt()` first, then `select_by_uid()`.
 - **Reads fail after one refused command** — Ultralight and NTAG cards leave the selected state after any NAK (for example a read beyond the last page), MIFARE Classic after a refused authentication. Select the card again.
-- **`PN5180_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, uses non-default keys, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
+- **`PN5180_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, the MAD has a wrong CRC, the card uses non-default keys, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
 - **ISO15693 `halt()` returns false** — the tag does not implement Reset to Ready, which is an optional command. The tag stays selected until the field is switched off.
 - **Everything times out after an update to 0.3.0 or later** — the receive timeout runs on a PN5180 timer; `pn5180_set_hw_rx_timeout(pn5180, false)` switches to a host-side timeout to tell a timer problem from an RF problem.
 

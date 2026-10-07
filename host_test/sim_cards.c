@@ -549,6 +549,22 @@ void sim_a_init_classic_1k(sim_a_card_t *card)
     }
 }
 
+uint8_t sim_mad_crc(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0xC7; // preset
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            bool carry = (crc & 0x80) != 0;
+            crc        = (uint8_t)(crc << 1);
+            if (carry) {
+                crc ^= 0x1D; // x^8 + x^4 + x^3 + x^2 + 1
+            }
+        }
+    }
+    return crc;
+}
+
 void sim_a_classic_store_ndef(sim_a_card_t *card, const uint8_t *ndef, size_t ndef_len)
 {
     static const uint8_t key_mad[6]  = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
@@ -574,6 +590,7 @@ void sim_a_classic_store_ndef(sim_a_card_t *card, const uint8_t *ndef, size_t nd
         mad[2 + (sector - 1) * 2]     = 0x03;
         mad[2 + (sector - 1) * 2 + 1] = 0xE1;
     }
+    mad[0] = sim_mad_crc(&mad[1], sizeof(mad) - 1);
     memcpy(&card->memory[1 * 16], mad, 16);
     memcpy(&card->memory[2 * 16], mad + 16, 16);
     memcpy(card->sector_key_a[0], key_mad, 6);

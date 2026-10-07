@@ -1,5 +1,13 @@
 # Changelog
 
+## v 0.4.3 - 2026-10-07
+
+### ISO14443-4 session is closed after a failed exchange
+
+- When `pn5180_14443_4_transceive()` gives up (no answer after the retries, too many waiting time extensions, protocol error, response larger than the buffer), reader and card are out of step. The driver now sends S(DESELECT) and marks ISO14443-4 as inactive, so the next call fails clearly until the card is selected again. It used to leave the session marked active.
+- `pn5180_wait_for_irq()` logs an SPI failure as such instead of as a timeout.
+- MIFARE Classic NDEF: the CRC of the MIFARE Application Directory (MAD1 and MAD2) is checked; a directory with a wrong CRC is treated as absent (`PN5180_NDEF_ERR_NO_NDEF`).
+
 ## v 0.4.2 - 2026-10-07
 
 ### Field-off time of 5.1 ms

@@ -40,7 +40,10 @@ pn5180_uids_array_t *pn5180_14443_get_all_uids_ex(pn5180_proto_t *proto, pn5180_
  * @param apdu_len Command APDU length in bytes
  * @param rx Buffer for the response APDU (data followed by SW1 SW2)
  * @param rx_len In: size of @p rx. Out: response length
- * @return true if a response was received, false on failure or if ISO14443-4 is not active
+ * @return true if a response was received, false on failure or if ISO14443-4 is not active.
+ *         A failed exchange ends the ISO14443-4 session: the driver sends S(DESELECT) and the card
+ *         has to be selected again with select_by_uid(). If the card does not react to that either,
+ *         switch the RF field off and on.
  */
 bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apdu_len, uint8_t *rx, size_t *rx_len);
 

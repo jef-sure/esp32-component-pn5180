@@ -1280,9 +1280,12 @@ static pn5180_wait_result_t pn5180_wait_irq_until(pn5180_t *pn5180, uint32_t irq
 
 bool pn5180_wait_for_irq(pn5180_t *pn5180, uint32_t irq_mask, const char *operation, uint32_t *irq_status)
 {
-    int64_t deadline = esp_timer_get_time() + (1000LL * pn5180->timeout_ms);
-    bool    ret      = pn5180_wait_irq_until(pn5180, irq_mask, deadline, irq_status) == PN5180_WAIT_IRQ;
-    if (!ret) {
+    int64_t              deadline    = esp_timer_get_time() + (1000LL * pn5180->timeout_ms);
+    pn5180_wait_result_t wait_result = pn5180_wait_irq_until(pn5180, irq_mask, deadline, irq_status);
+    bool                 ret         = (wait_result == PN5180_WAIT_IRQ);
+    if (wait_result == PN5180_WAIT_SPI_ERROR) {
+        ESP_LOGE(TAG, "SPI failure while waiting for %s", operation);
+    } else if (!ret) {
         ESP_LOGE(TAG, "Timeout waiting for %s", operation);
     } else if (*irq_status & PN5180_GENERAL_ERROR_IRQ_STAT) {
         ESP_LOGW(TAG, "General error detected during %s", operation);

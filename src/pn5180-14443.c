@@ -851,6 +851,17 @@ static void pn5180_iso_dep_build_i_block(pn5180_t *pn5180, iso_dep_tx_t *tx)
     tx->i_block_len = 1 + tx->tx_chunk;
 }
 
+// Releases an ISO14443-4 card with S(DESELECT), which the card answers with S(DESELECT) before it halts.
+static bool pn5180_14443_4_deselect(pn5180_t *pn5180)
+{
+    uint8_t deselect = ISO_DEP_PCB_S_DESELECT;
+    uint8_t answer[4];
+    size_t  answer_len = 0;
+    pn5180_enable_crc(pn5180);
+    pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, &deselect, 1, 0, answer, sizeof(answer), &answer_len, PN5180_TIMEOUT_14443A_RATS_US, NULL);
+    return result == PN5180_RF_OK && answer_len >= 1 && (answer[0] & 0xF7) == ISO_DEP_PCB_S_DESELECT;
+}
+
 bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apdu_len, uint8_t *rx, size_t *rx_len)
 {
     if (pn5180 == NULL || apdu == NULL || apdu_len == 0 || rx == NULL || rx_len == NULL || *rx_len == 0) {
@@ -888,6 +899,7 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
     int     retries       = 0;
     int     wtx_count     = 0;
     bool    ok            = false;
+    bool    fatal         = false;
 
     pn5180_iso_dep_build_i_block(pn5180, tx);
     const uint8_t *next_tx     = tx->i_block;
@@ -899,6 +911,7 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
         timeout_ms           = fwt_ms; // a waiting time extension covers one block only
 
         if (rx_rc == RX_RESULT_FATAL) {
+            fatal = true;
             break;
         }
 
@@ -1028,6 +1041,18 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
     }
 
     free(tx);
+    if (!ok) {
+        // An exchange that was given up leaves reader and card out of step: block numbers no longer match,
+        // or the card still waits for an answer. The session cannot be continued, so it is closed here.
+        // The card is told with S(DESELECT) where possible (it then halts); if that does not get through,
+        // only switching the field off brings the card back.
+        if (!fatal) {
+            pn5180_14443_4_deselect(pn5180);
+        }
+        pn5180_disable_crc(pn5180);
+        pn5180_set_transceiver_idle(pn5180);
+        pn5180_iso14443_4_reset_state(pn5180);
+    }
     return ok;
 }
 
@@ -1303,20 +1328,13 @@ static bool pn5180_14443_select_by_uid( //
 static bool pn5180_mifare_halt(pn5180_t *pn5180)
 {
     if (pn5180->iso14443_layer4_active) {
-        // ISO14443-4 cards are released with S(DESELECT), which they answer with S(DESELECT).
-        uint8_t deselect = ISO_DEP_PCB_S_DESELECT;
-        uint8_t answer[4];
-        size_t  answer_len = 0;
-        pn5180_enable_crc(pn5180);
-        pn5180_rf_result_t deselect_result =
-            pn5180_rf_transceive(pn5180, &deselect, 1, 0, answer, sizeof(answer), &answer_len, PN5180_TIMEOUT_14443A_RATS_US, NULL);
-        if (deselect_result == PN5180_RF_OK && answer_len >= 1 && (answer[0] & 0xF7) == ISO_DEP_PCB_S_DESELECT) {
+        if (pn5180_14443_4_deselect(pn5180)) {
             pn5180_disable_crc(pn5180);
             pn5180_set_transceiver_idle(pn5180);
             pn5180_iso14443_4_reset_state(pn5180);
             return true;
         }
-        PN5180_LOGD(TAG, "S(DESELECT) not acknowledged (result=%d), sending HLTA", (int)deselect_result);
+        PN5180_LOGD(TAG, "S(DESELECT) not acknowledged, sending HLTA");
     }
     pn5180_enable_tx_crc(pn5180);
     pn5180_disable_rx_crc(pn5180);

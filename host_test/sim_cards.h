@@ -90,6 +90,8 @@ void sim_a_init_ultralight(sim_a_card_t *card, bool ultralight_c);
 void sim_a_init_classic_1k(sim_a_card_t *card);
 void sim_a_init_iso_dep(sim_a_card_t *card, uint8_t sak, uint8_t ats_fsci);
 
+/** CRC of a MIFARE Application Directory, over the bytes after the CRC byte itself. */
+uint8_t sim_mad_crc(const uint8_t *data, size_t len);
 /** Formats a Classic card as NDEF tag: MAD in sector 0, NDEF keys, message in sectors 1.. */
 void sim_a_classic_store_ndef(sim_a_card_t *card, const uint8_t *ndef, size_t ndef_len);
 /** Stores an NDEF message in the Type 4 NDEF file. */

@@ -197,6 +197,25 @@ static bool classic_auth(pn5180_proto_t *proto, pn5180_uid_t *uid, int blockno, 
     return proto->authenticate(proto, secondary_key, PN5180_MIFARE_CLASSIC_KEYA, uid, blockno);
 }
 
+// CRC of a MIFARE Application Directory: CRC-8 with polynomial x^8 + x^4 + x^3 + x^2 + 1 (1Dh) and
+// preset C7h, over the info byte and the application identifiers. Byte 0 of the MAD holds the CRC.
+static uint8_t classic_mad_crc(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0xC7;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x1D) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+static bool classic_mad_crc_ok(const uint8_t *mad, size_t mad_len)
+{
+    return classic_mad_crc(&mad[1], mad_len - 1) == mad[0];
+}
+
 static bool classic_mad_entry_is_ndef(const uint8_t *mad, size_t mad_len, int entry, int entry_count)
 {
     if (entry < 0 || entry >= entry_count || mad_len < 2u + (size_t)entry_count * 2u) {
@@ -361,6 +380,11 @@ static pn5180_ndef_result_t classic_read_ndef(pn5180_proto_t *proto, pn5180_uid_
         return PN5180_NDEF_ERR_NO_NDEF;
     }
 
+    if (!classic_mad_crc_ok(mad1, sizeof(mad1))) {
+        PN5180_LOGD(TAG, "Classic: MAD1 CRC mismatch");
+        return PN5180_NDEF_ERR_NO_NDEF;
+    }
+
     // MIFARE Mini has sectors 1..4, 1K and 4K sectors 1..15 in MAD1.
     int mad1_entries = (uid->subtype == PN5180_MIFARE_CLASSIC_MINI) ? 4 : CLASSIC_MAD1_ENTRY_COUNT;
     if (!classic_collect_ndef_sectors(mad1, sizeof(mad1), 1, mad1_entries, sectors, CLASSIC_MAX_NDEF_SECTORS, &sector_count)) {
@@ -377,6 +401,10 @@ static pn5180_ndef_result_t classic_read_ndef(pn5180_proto_t *proto, pn5180_uid_
             if (!proto->block_read(proto, CLASSIC_MAD2_FIRST_DATA_BLOCK + i, mad2 + (size_t)i * 16u, 16)) {
                 return PN5180_NDEF_ERR_NO_NDEF;
             }
+        }
+        if (!classic_mad_crc_ok(mad2, sizeof(mad2))) {
+            PN5180_LOGD(TAG, "Classic: MAD2 CRC mismatch");
+            return PN5180_NDEF_ERR_NO_NDEF;
         }
         if (!classic_collect_ndef_sectors(mad2, sizeof(mad2), 17, CLASSIC_MAD2_ENTRY_COUNT, sectors, CLASSIC_MAX_NDEF_SECTORS, &sector_count)) {
             return PN5180_NDEF_ERR_NO_NDEF;
