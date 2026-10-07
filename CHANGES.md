@@ -1,5 +1,78 @@
 # Changelog
 
+## v 0.5.0 - 2026-10-07
+
+### NDEF writing reworked and NDEF checks aligned with the NXP reader library; fixes from two comparisons with the PN532 component and from an external review
+
+Behaviour changes to be aware of:
+
+- NDEF reading is stricter. A tag that declares an unknown mapping version or non-standard access conditions is now `PN5180_NDEF_ERR_UNSUPPORTED` where the driver used to read it anyway; details under "NDEF" below.
+- `pn5180_ndef_write_card_auto()` writes into the NDEF TLV the tag has. A tag without one (not NDEF formatted) is refused, where the old function wrote wherever it was told to.
+- ISO15693 inventory makes one pass if the first RF configuration finds tags, and leaves that configuration (ASK 10 %) loaded.
+- The `block_write` callback is refused for ISO14443-4 cards, and `block_read` fails on a short answer from ISO14443-4 and ISO15693 cards.
+
+Breaking change:
+
+- **`pn5180_ndef_write_card_auto(proto, &uid, &message)`** replaces `pn5180_ndef_write_to_selected_card(proto, &message, start_block, block_size, max_blocks)`. Like `pn5180_ndef_read_card_auto()` it takes the selected card and finds the data area in the capability container of the tag, for Ultralight / NTAG (Type 2) and ISO15693 (Type 5). The old function wrote consecutive blocks of any size the caller named: on a MIFARE Classic card a message of more than 46 bytes written from block 4 ran into the sector trailer and overwrote the keys and access bits. MIFARE Classic and ISO14443-4 cards are now `PN5180_NDEF_ERR_UNSUPPORTED`.
+
+NDEF:
+
+- Writing follows the procedure of the NXP reader library (`phalTop`):
+  - The capability container is checked: a tag without one is `PN5180_NDEF_ERR_NO_NDEF`, a read-only tag `PN5180_NDEF_ERR_ACCESS_DENIED`, an unknown mapping version or proprietary access conditions `PN5180_NDEF_ERR_UNSUPPORTED`.
+  - The message is written into the NDEF TLV the tag already has, and the TLVs in front of it are kept. The old function wrote from the block the caller named, which on an NTAG as it leaves the factory overwrote the Lock Control TLV. A tag without NDEF TLV is `PN5180_NDEF_ERR_NO_NDEF`.
+  - The TLV length is set to 0 first and to the real length last, so a write that stops halfway leaves an empty message. The length used to be written first, in front of old data.
+  - A message that does not fit between the NDEF TLV and the end of the data area is `PN5180_NDEF_ERR_CARD_FULL`; the Terminator TLV is written only if there is room for it. The size of the data area was not checked before.
+  - A Type 2 tag whose control TLVs put lock or reserved bytes inside the data area is `PN5180_NDEF_ERR_UNSUPPORTED`.
+- Reading follows the checks of the NXP reader library as well:
+  - Type 2 and Type 5: a capability container with an unknown major version or with proprietary or reserved access conditions is `PN5180_NDEF_ERR_UNSUPPORTED`; a Type 2 data area below 48 bytes is `PN5180_NDEF_ERR_NO_NDEF`. Neither was checked before.
+  - Type 2: more than three NULL TLVs in a row end the search (`PN5180_NDEF_ERR_NO_NDEF`), so a blank data area is no longer read to its end. Lock or reserved bytes that a control TLV places inside the message are `PN5180_NDEF_ERR_UNSUPPORTED`; they were returned as message bytes.
+  - Type 5: the byte `00` is a TLV with a length field like any other; it was skipped as a one-byte NULL TLV, which exists on Type 2 only.
+  - Type 2 and Type 5: an NDEF TLV longer than the rest of the data area is `PN5180_NDEF_ERR_PARSE_FAILED`, found without reading the tag to its end; it was `PN5180_NDEF_ERR_NO_NDEF`.
+  - MIFARE Classic: only the identifier `03 E1` in the application directory marks an NDEF sector; `E1 03` was accepted too. The general purpose byte of the first NDEF sector is checked: a major mapping version above 1 is `PN5180_NDEF_ERR_UNSUPPORTED`, read access other than "granted" is `PN5180_NDEF_ERR_ACCESS_DENIED`.
+  - Type 4: a capability container with CCLEN below 15, MLe below 15, an NDEF file size outside 5 to 7FFFh or a reserved NDEF file identifier is `PN5180_NDEF_ERR_PARSE_FAILED`.
+- A message longer than the TLV length field allows (FFFEh bytes) is `PN5180_NDEF_ERR_CARD_FULL`; the length was truncated before.
+- `pn5180_ndef_encode_message()` returns 0 for a record that declares a type, ID or payload length without the matching pointer. It used to skip those bytes and return a shorter, damaged message.
+- `pn5180_ndef_decode_smartposter()` applies the rules of the message parser to the nested message: a payload without Message End, with a second Message Begin, or with data after the last record returns 0 instead of the records decoded so far. Chunked nested records return 0 as well.
+- Type 4: a capability container with the Extended NDEF File Control TLV (`06`, files above 32 KB) is `PN5180_NDEF_ERR_UNSUPPORTED`; it was `PN5180_NDEF_ERR_PARSE_FAILED`. The mapping version is checked before the TLV.
+- Type 4: a SELECT that got no answer and closed the ISO14443-4 session is `PN5180_NDEF_ERR_READ_FAILED`, so `pn5180_ndef_read_card_auto()` repeats the read from a new activation. It was `PN5180_NDEF_ERR_NO_NDEF`, as for a card that refuses the SELECT.
+- `pn5180_ndef_read_from_selected_card()` stops at the Terminator TLV instead of reading on to the block limit.
+- `pn5180_ndef_tlv_find_ndef()` rejects NULL arguments.
+
+MIFARE:
+
+- `pn5180_mifare_block_read()` accepts only the 16-byte READ answer. A 4-byte answer was tolerated and left the other 12 bytes of the buffer unset.
+- `pn5180_mifare_block_read()` and `pn5180_mifare_block_write()` reject NULL pointers and block numbers outside 0..255; 256 used to be sent as block 0.
+
+Fixes from an external review of 0.4.3:
+
+- **ISO14443A scan: the limit of 14 cards did not work with a log level below INFO.** The card counter was incremented inside a log statement, which is not compiled in at lower levels. A card that did not take the HLTA was then found again and again until the memory ran out. The counter is a statement of its own now, and a UID that shows up a second time ends the scan.
+- **ISO14443-4: a card that answers with chained blocks without data no longer keeps `pn5180_14443_4_transceive()` running forever**; such a block ends the exchange.
+- ISO14443-4: S-blocks with a CID are treated as invalid blocks, as I- and R-blocks with CID already were; the CID byte of an S(WTX) was read as the waiting time multiplier.
+- ISO14443-4: the start-up frame guard time of the ATS (SFGI) is waited after RATS. The waiting time after an extension request is never shorter than the card's own frame waiting time.
+- ISO14443-4 cards through the protocol callbacks: `block_read()` fails if the card returns fewer bytes than asked for, instead of leaving the rest of the buffer unset; `block_write()` is refused while ISO14443-4 is active, where it used to send a raw MIFARE frame into the session.
+- `pn5180_recover()` and `pn5180_set_rf_off()` mark ISO14443-4 as inactive: the card loses the session with the field.
+- SAK `0x11` is MIFARE Plus 4K (`PN5180_MIFARE_PLUS_4K`, 256 blocks); it was reported as Plus 2K. The unreachable SAK `0x24` entry is gone.
+- **ISO15693: blocks above 255 are read and written with Extended Read / Write Single Block (`30h` / `31h`).** The codes used before, `23h` / `24h`, are Read / Write Multiple Blocks, so a wrong block came back.
+- ISO15693 inventory: tags found with the first RF configuration (ASK 10 %) end the search. It used to run a second pass with ASK 100 % in every case, left that configuration loaded and mixed the signal strength values of both passes.
+- ISO15693: a reader failure during the inventory is reported as `PN5180_POLL_TRANSPORT_ERROR`, not as "no tag"; the entries of the second and further tags are zeroed before use (`block_size`, `blocks_count` and `atqa` held stale memory); `block_read()` fails if the tag's blocks are shorter than the buffer asks for; the collision search no longer loses a branch at the deepest level.
+- `pn5180_send_data()` rejects a negative length; `pn5180_read_register()` assembles the value without signed overflow; `pn5180.c` includes the headers it uses directly.
+
+Brought over from PN532 component 0.7.3, which was debugged on hardware:
+
+- `pn5180_ndef_encode_message()` returns 0 for records the parser of this driver refuses: an Empty record with a type, ID or payload, an Unknown record with a type, and the TNF values Unchanged and Reserved.
+- `pn5180_spi_attach()` returns NULL for a host that is not initialized or whose transactions are shorter than a PN5180 transfer (`max_transfer_sz` below `PN5180_MAX_BUF_SIZE`, or a bus without DMA); the first longer read failed there before.
+- SPI clocks above 7 MHz are lowered to that limit with a warning (`PN5180_SPI_MAX_CLOCK_HZ`).
+- `pn5180_send_command()` rejects NULL buffers.
+- The component names `esp_driver_spi` and `esp_driver_gpio` as requirements only from ESP-IDF 5.3 on, where they exist; with 5.0 to 5.2 the configuration step failed. Compiled here with 5.5.4 and 6.0.1 only.
+- `host_test/Makefile` accepts `UNITY_DIR` in place of `IDF_PATH`, and a GitHub workflow runs the host tests on push and pull request.
+- README: new section on targets with a random UID (first byte `08`, a phone for example).
+
+Other changes:
+
+- The package in the component registry contains the build files of the examples and `CHANGES.md`.
+- Documentation: the README introduction no longer promises NDEF writing for MIFARE Classic and Type 4; new README section on task stack use; return value contracts of `pn5180_ndef_encode_message()`, `pn5180_ndef_extract_uri()`, `pn5180_ndef_decode_smartposter()` and `pn5180_mifare_value_read()` spelled out; `PN5180_NDEF_ERR_BUFFER_TOO_SMALL` marked as reserved; block number ranges and buffer sizes of the `block_read` / `block_write` callbacks described; new troubleshooting entries for refused NDEF writes and unsupported tags; the comment on `PN5180_MIFARE_ULTRALIGHT_EV1` gave bytes as pages.
+- Host tests cover the changes of this release (42 tests), with a simulated card that ignores HLTA and one that sends empty chained blocks.
+
 ## v 0.4.3 - 2026-10-07
 
 ### ISO14443-4 session is closed after a failed exchange

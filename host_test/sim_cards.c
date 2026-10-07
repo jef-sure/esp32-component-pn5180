@@ -337,6 +337,17 @@ static pn5180_rf_result_t sim_a_iso_dep(sim_a_card_t *card, const uint8_t *tx, s
     uint8_t out[300];
     size_t  out_len = 0;
 
+    if (card->sends_empty_chain && (pcb & 0xC0) != 0xC0) {
+        // I-block with the chaining bit and no data, block number as the reader expects it
+        if ((pcb & 0xC0) == 0x00) {
+            card->block_number = pcb & 0x01;
+        } else {
+            card->block_number ^= 1;
+        }
+        const uint8_t empty = (uint8_t)(0x12 | card->block_number);
+        return answer(rx, rx_size, rx_len, &empty, 1);
+    }
+
     if ((pcb & 0xC0) == 0x00) { // I-block
         card->block_number ^= 1;
         if (card->command_len + tx_len - 1 > sizeof(card->command)) {
@@ -464,7 +475,7 @@ pn5180_rf_result_t sim_a_card(void *ctx, const uint8_t *tx, size_t tx_len, uint8
 
     case SIM_A_ACTIVE:
         if (tx_len == 2 && tx[0] == 0x50 && tx[1] == 0x00) { // HLTA
-            sim_a_leave_selected_state(card, true);
+            sim_a_leave_selected_state(card, !card->ignores_hlta);
             return PN5180_RF_TIMEOUT;
         }
         if (card->kind == SIM_A_TYPE2) {
@@ -599,6 +610,7 @@ void sim_a_classic_store_ndef(sim_a_card_t *card, const uint8_t *ndef, size_t nd
     size_t offset = 0;
     for (int sector = 1; sector <= sectors_used; sector++) {
         memcpy(card->sector_key_a[sector], key_ndef, 6);
+        card->memory[(sector * 4 + 3) * 16 + 9] = 0x40; // general purpose byte: mapping version 1.0, read and write access
         for (int block = 0; block < 3; block++) {
             memcpy(&card->memory[(sector * 4 + block) * 16], &stream[offset], 16);
             offset += 16;

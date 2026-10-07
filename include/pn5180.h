@@ -171,7 +171,7 @@ typedef enum _pn5180_nfc_subtype_t
     PN5180_MIFARE_CLASSIC_4K,     /**< MIFARE Classic 4K (40 sectors, 256 blocks) */
     PN5180_MIFARE_ULTRALIGHT,     /**< MIFARE Ultralight (64 bytes, no auth) */
     PN5180_MIFARE_ULTRALIGHT_C,   /**< MIFARE Ultralight C (192 bytes, 3DES auth) */
-    PN5180_MIFARE_ULTRALIGHT_EV1, /**< MIFARE Ultralight EV1 (48/128 pages) */
+    PN5180_MIFARE_ULTRALIGHT_EV1, /**< MIFARE Ultralight EV1 (20 or 41 pages: 48 or 128 bytes of user memory) */
     PN5180_MIFARE_NTAG213,        /**< NTAG213 (144 bytes user memory) */
     PN5180_MIFARE_NTAG215,        /**< NTAG215 (504 bytes user memory) */
     PN5180_MIFARE_NTAG216,        /**< NTAG216 (888 bytes user memory) */
@@ -287,9 +287,13 @@ typedef bool pn5180_func_detect_card_type_t( //
 /**
  * @brief Callback: Read a block from the selected card
  * @param pn5180_proto Protocol interface
- * @param blockno Block number to read
+ * @param blockno Block number to read. ISO14443A memory cards: block or first page, 0..255;
+ *                ISO14443-4 cards: offset in the selected file; ISO15693: block number, above 255
+ *                with Extended Read Single Block
  * @param buffer Destination buffer for block data
- * @param buffer_len Size of destination buffer
+ * @param buffer_len Size of destination buffer. MIFARE Classic, Ultralight and NTAG cards answer
+ *                   16 bytes, of which the first buffer_len are copied; ISO14443-4 and ISO15693
+ *                   cards have to deliver at least buffer_len bytes
  * @return true on success, false on failure
  */
 typedef bool pn5180_func_block_read_t(struct _pn5180_proto_t *pn5180_proto, int blockno, uint8_t *buffer, size_t buffer_len);
@@ -297,10 +301,11 @@ typedef bool pn5180_func_block_read_t(struct _pn5180_proto_t *pn5180_proto, int 
 /**
  * @brief Callback: Write a block to the selected card
  * @param pn5180_proto Protocol interface
- * @param blockno Block number to write
+ * @param blockno Block number to write (see the read callback for the ranges)
  * @param buffer Source buffer containing block data
- * @param buffer_len Size of source buffer
- * @return 0 on success, negative error code on failure
+ * @param buffer_len Size of source buffer: 16 for a MIFARE Classic block, 4 for an Ultralight /
+ *                   NTAG page, the block size for ISO15693
+ * @return 0 on success, negative error code on failure. Not available for ISO14443-4 cards
  */
 typedef int pn5180_func_block_write_t(struct _pn5180_proto_t *pn5180_proto, int blockno, const uint8_t *buffer, size_t buffer_len);
 
@@ -353,13 +358,16 @@ typedef enum
     PN5180_TS_RESERVED     = 7  /**< Reserved state; also returned when the state cannot be read */
 } pn5180_transceive_state_t;
 
+/** @brief Highest SPI clock the PN5180 host interface takes (7 Mbit/s) */
+#define PN5180_SPI_MAX_CLOCK_HZ (7000000)
+
 /**
  * @brief Initialize SPI interface for PN5180
  * @param host_id SPI host device ID
  * @param sck SPI clock GPIO pin
  * @param miso SPI MISO GPIO pin
  * @param mosi SPI MOSI GPIO pin
- * @param clock_speed_hz SPI clock speed in Hz
+ * @param clock_speed_hz SPI clock speed in Hz; a value above PN5180_SPI_MAX_CLOCK_HZ is lowered to it
  * @return Pointer to initialized SPI structure, or NULL on failure
  */
 pn5180_spi_t *pn5180_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_t miso, gpio_num_t mosi, int clock_speed_hz);
@@ -370,9 +378,13 @@ pn5180_spi_t *pn5180_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_nu
  * Only adds the PN5180 as a device on the bus. The bus is shared with other devices and is
  * never freed by pn5180_deinit(), whatever its free_spi_bus argument says.
  *
+ * The bus has to carry a whole PN5180 transfer in one transaction: max_transfer_sz of at least
+ * PN5180_MAX_BUF_SIZE and a DMA channel (a bus without DMA is limited to 64 bytes).
+ *
  * @param host_id SPI host device ID of the initialized bus
- * @param clock_speed_hz SPI clock speed in Hz
- * @return Pointer to initialized SPI structure, or NULL on failure
+ * @param clock_speed_hz SPI clock speed in Hz; a value above PN5180_SPI_MAX_CLOCK_HZ is lowered to it
+ * @return Pointer to initialized SPI structure; NULL if the host is not initialized, carries
+ *         less than PN5180_MAX_BUF_SIZE bytes per transaction, or the device cannot be added
  */
 pn5180_spi_t *pn5180_spi_attach(spi_host_device_t host_id, int clock_speed_hz);
 
@@ -485,7 +497,7 @@ void pn5180_set_rfca(pn5180_t *pn5180, bool enable);
  * @brief Reset the PN5180 and restore the RF configuration and field state it had before
  *
  * For recovering a reader that stopped responding. Card state is lost: cards have to be
- * selected again.
+ * selected again, and an ISO14443-4 session is marked as closed.
  *
  * @return true on success, false on failure
  */
@@ -558,7 +570,7 @@ bool pn5180_write_eeprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int le
  * @brief Send data via RF to card
  * @param pn5180 Pointer to PN5180 device structure
  * @param data Data buffer to send
- * @param len Number of bytes to send (max 260)
+ * @param len Number of bytes to send (0..260)
  * @param valid_bits Number of valid bits in last byte (0-7, 0 means all 8 bits valid)
  * @return true on success, false on failure
  */
@@ -635,6 +647,9 @@ bool pn5180_set_rf_on(pn5180_t *pn5180);
 
 /**
  * @brief Turn off RF field
+ *
+ * Cards lose their state without field; an ISO14443-4 session is marked as closed.
+ *
  * @param pn5180 Pointer to PN5180 device structure
  * @return true on success, false on failure
  */

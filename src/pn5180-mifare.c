@@ -8,6 +8,14 @@ static const char *TAG = "pn5180-mifare";
 
 bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, size_t buffer_len)
 {
+    if (pn5180 == NULL || buffer == NULL || buffer_len == 0) {
+        return false;
+    }
+    if (blockno < 0 || blockno > 0xFF) {
+        ESP_LOGE(TAG, "MIFARE block number %d out of range", blockno);
+        return false;
+    }
+
     uint8_t cmd_buf[2];
     cmd_buf[0] = 0x30; // MIFARE Read command
     cmd_buf[1] = (uint8_t)blockno;
@@ -22,10 +30,9 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
         return false;
     }
 
-    // TODO: If Ultralight field issues resurface, re-check whether some readers return
-    // 16 bytes here with only the first 4 bytes valid and the trailing bytes undefined.
-    if (rx_len != 16 && rx_len != 4) {
-        ESP_LOGE(TAG, "MIFARE block %d read returned incorrect length: %u (expected 16 for Classic or 4 for Ultralight)", blockno, (unsigned)rx_len);
+    // READ always answers 16 bytes: one Classic block or four Ultralight / NTAG pages.
+    if (rx_len != 16) {
+        ESP_LOGE(TAG, "MIFARE block %d read returned incorrect length: %u (expected 16)", blockno, (unsigned)rx_len);
         return false;
     }
     PN5180_LOGD(TAG, "MIFARE block %d read returned %u bytes", blockno, (unsigned)rx_len);
@@ -74,6 +81,13 @@ static int pn5180_mifare_page_write(pn5180_t *pn5180, int pageno, const uint8_t 
 
 int pn5180_mifare_block_write(pn5180_t *pn5180, int blockno, const uint8_t *buffer, size_t buffer_len)
 {
+    if (pn5180 == NULL || buffer == NULL) {
+        return -1;
+    }
+    if (blockno < 0 || blockno > 0xFF) {
+        ESP_LOGE(TAG, "MIFARE block number %d out of range", blockno);
+        return -1;
+    }
     if (buffer_len == 4) {
         return pn5180_mifare_page_write(pn5180, blockno, buffer);
     }

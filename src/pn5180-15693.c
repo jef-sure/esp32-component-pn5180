@@ -21,8 +21,7 @@ static bool pn5180_iso15693_check_response(const char *operation, const uint8_t 
         return false;
     }
     if ((buffer[0] & 0x01) != 0) {
-        uint8_t error_code = (num_bytes > 1) ? buffer[1] : 0x00;
-        ESP_LOGW(TAG, "%s: ISO15693 error flags=0x%02X code=0x%02X", operation, buffer[0], error_code);
+        ESP_LOGW(TAG, "%s: ISO15693 error flags=0x%02X code=0x%02X", operation, buffer[0], (num_bytes > 1) ? buffer[1] : 0x00);
         return false;
     }
     return true;
@@ -39,8 +38,8 @@ static bool pn5180_iso15693_check_response(const char *operation, const uint8_t 
 #define ISO15693_CMD_RESET_TO_READY   0x26
 #define ISO15693_CMD_READ_SINGLE      0x20
 #define ISO15693_CMD_WRITE_SINGLE     0x21
-#define ISO15693_CMD_READ_SINGLE_EXT  0x23
-#define ISO15693_CMD_WRITE_SINGLE_EXT 0x24
+#define ISO15693_CMD_READ_SINGLE_EXT  0x30 // Extended Read Single Block: two-byte block number
+#define ISO15693_CMD_WRITE_SINGLE_EXT 0x31 // Extended Write Single Block
 #define ISO15693_CMD_GET_SYSTEM_INFO  0x2B
 #define ISO15693_FLAG_INVENTORY       0x04
 #define ISO15693_FLAG_DATA_RATE_HIGH  0x02
@@ -96,6 +95,7 @@ static bool _pn5180_15693_setup_rf(pn5180_proto_t *proto)
 
 static void pn5180_iso15693_fill_uid(pn5180_uid_t *entry, const uint8_t *uid, uint8_t uid_len, uint16_t agc)
 {
+    memset(entry, 0, sizeof(*entry));
     entry->uid_length = uid_len;
     entry->sak        = 0;
     entry->agc        = agc;
@@ -207,7 +207,7 @@ static size_t pn5180_iso15693_build_inventory_cmd(pn5180_t *pn5180, uint8_t *sen
  * @brief Try single-slot inventory to read one tag at a time.
  * Uses a Stack-based Depth-First Search (DFS) to resolve collisions.
  */
-static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_array_t **uids)
+static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_array_t **uids, bool *fatal)
 {
     const int max_total_scans = 64; // Safety limit
     int       scan_count      = 0;
@@ -221,7 +221,7 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
         int      retries;
     } mask_t;
 
-    mask_t stack[16]; // Depth up to 16 should be plenty
+    mask_t stack[20]; // masks of up to 16 bits: at most 17 entries wait at a time
     int    stack_ptr = 0;
 
     // Push initial global search
@@ -245,7 +245,12 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
         size_t             rx_len    = 0;
         uint32_t           rx_status = 0;
         pn5180_rf_result_t result    = pn5180_rf_transceive(pn5180, inv_cmd, inv_len, 0, rx_buf, sizeof(rx_buf), &rx_len, PN5180_TIMEOUT_15693_US, &rx_status);
-        if (result == PN5180_RF_TIMEOUT || result == PN5180_RF_FATAL) {
+        if (result == PN5180_RF_FATAL) {
+            // The reader itself failed: this is not "no tag".
+            *fatal = true;
+            break;
+        }
+        if (result == PN5180_RF_TIMEOUT) {
             // Timeout - no tags match this mask
             continue;
         }
@@ -295,7 +300,7 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
 
             // If retries exhausted OR it looks like a clean collision, SPLIT
             if (current.len < 16) {
-                if (stack_ptr + 2 <= ARRAY_SIZE(stack)) {
+                if ((size_t)stack_ptr + 2 <= ARRAY_SIZE(stack)) {
                     // Push '1' branch
                     stack[stack_ptr].len     = current.len + 1;
                     stack[stack_ptr].val     = current.val | (1ULL << current.len);
@@ -504,8 +509,12 @@ static bool pn5180_iso15693_block_read(pn5180_t *pn5180, int blockno, uint8_t *b
     }
 
     size_t data_len = num_bytes - 1;
-    size_t copy_len = (data_len < buffer_len) ? data_len : buffer_len;
-    memcpy(buffer, &temp[1], copy_len);
+    if (data_len < buffer_len) {
+        // The tag's blocks are shorter than the caller assumes: the rest of the buffer would stay unset.
+        ESP_LOGE(TAG, "block_read: block %d has %u bytes, %u expected", blockno, (unsigned)data_len, (unsigned)buffer_len);
+        return false;
+    }
+    memcpy(buffer, &temp[1], buffer_len);
     return true;
 }
 
@@ -610,8 +619,9 @@ static bool _pn5180_15693_detect_card_type_and_capacity( //
     return false;
 }
 
-static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
+static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180, bool *fatal)
 {
+    *fatal = false;
     if (pn5180 == NULL) {
         PN5180_LOGD(TAG, "get_all_uids: pn5180 is NULL");
         return NULL;
@@ -633,7 +643,7 @@ static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
 
         // Try high data rate first
         pn5180->iso15693_use_high_rate = true;
-        pn5180_15693_inventory_single_slot(pn5180, &uids);
+        pn5180_15693_inventory_single_slot(pn5180, &uids, fatal);
 
         if (uids == NULL || uids->uids_count == 0) {
             if (uids != NULL) {
@@ -643,19 +653,13 @@ static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
             // Retry with low data rate
             pn5180->iso15693_use_high_rate = false;
             PN5180_LOGD(TAG, "get_all_uids: retry with low data rate");
-            pn5180_15693_inventory_single_slot(pn5180, &uids);
+            pn5180_15693_inventory_single_slot(pn5180, &uids, fatal);
         }
 
-        if (uids != NULL && uids->uids_count > 0 && pn5180->iso15693_use_high_rate == false) {
-            // Only stop if we found tags AND we have already tried the low rate (fallback).
-            // Actually, if we found tags, we can probably stop?
-            // BUT if we want MULTI-CARD, maybe we should try all rates?
-            // Let's being conservative: if we found tags, we are good.
-            // But the issue is if Tag 1 is high rate and Tag 2 is low rate.
-            // So we should NOT break here if we want to support mixed tags.
-            // For now, let's allow trying the fallback if we suspect more tags.
-            // But we don't know if we suspect more tags.
-            // Reverting to "simple" logic: if found, break.
+        // ASK 100 % is only the fallback: tags found with the first configuration end the search.
+        // A second pass would also leave the other RF configuration loaded and mix the signal
+        // strength values of two passes.
+        if ((uids != NULL && uids->uids_count > 0) || *fatal) {
             break;
         }
     }
@@ -684,7 +688,8 @@ static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
 
 static pn5180_uids_array_t *_pn5180_15693_get_all_uids(pn5180_proto_t *proto)
 {
-    return pn5180_15693_get_all_uids(proto->pn5180);
+    bool fatal;
+    return pn5180_15693_get_all_uids(proto->pn5180, &fatal);
 }
 
 pn5180_uids_array_t *pn5180_15693_get_all_uids_ex(pn5180_proto_t *proto, pn5180_poll_status_t *status)
@@ -692,12 +697,13 @@ pn5180_uids_array_t *pn5180_15693_get_all_uids_ex(pn5180_proto_t *proto, pn5180_
     pn5180_poll_status_t local_status = PN5180_POLL_INVALID_ARGUMENT;
     pn5180_uids_array_t *uids         = NULL;
     if (proto != NULL && proto->pn5180 != NULL) {
-        uids = pn5180_15693_get_all_uids(proto->pn5180);
+        bool fatal = false;
+        uids       = pn5180_15693_get_all_uids(proto->pn5180, &fatal);
         if (uids != NULL) {
             local_status = PN5180_POLL_FOUND;
         } else {
             // The inventory tries two RF configurations; if the field is still off, none could be set up.
-            local_status = proto->pn5180->is_rf_on ? PN5180_POLL_NO_TARGET : PN5180_POLL_TRANSPORT_ERROR;
+            local_status = (proto->pn5180->is_rf_on && !fatal) ? PN5180_POLL_NO_TARGET : PN5180_POLL_TRANSPORT_ERROR;
         }
     }
     if (status != NULL) {

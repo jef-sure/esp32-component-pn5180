@@ -32,7 +32,7 @@ static bool        pn5180_14443_setup_rf(pn5180_t *pn5180);
 static void        pn5180_iso14443_4_reset_state(pn5180_t *pn5180);
 static rx_result_t pn5180_iso14443_4_exchange_frame(pn5180_t *pn5180, const char *operation, const uint8_t *tx, size_t tx_len, int64_t timeout_ms,
                                                     uint8_t *rx_buf, size_t rx_buf_size, uint16_t *received);
-static bool        pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, uint16_t ats_len);
+static bool        pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, uint16_t ats_len, uint8_t *sfgi_out);
 static bool        _pn5180_14443_detect_card_type_and_capacity( //
     pn5180_t     *pn5180,                                //
     pn5180_uid_t *uid,                                   //
@@ -77,10 +77,11 @@ static rx_result_t pn5180_iso14443_4_exchange_frame(pn5180_t *pn5180, const char
     return RX_RESULT_OK;
 }
 
-static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, uint16_t ats_len)
+static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, uint16_t ats_len, uint8_t *sfgi_out)
 {
     uint8_t  fsci = 2;
     uint8_t  fwi  = 4;
+    uint8_t  sfgi = 0;
     uint16_t idx  = 1;
 
     if (ats == NULL || ats_len < 1) {
@@ -110,7 +111,8 @@ static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, ui
                 ESP_LOGE(TAG, "ATS missing TB1");
                 return false;
             }
-            fwi = (uint8_t)((ats[idx] >> 4) & 0x0F);
+            fwi  = (uint8_t)((ats[idx] >> 4) & 0x0F);
+            sfgi = (uint8_t)(ats[idx] & 0x0F);
             idx++;
         }
         if (t0 & 0x40) {
@@ -131,7 +133,9 @@ static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, ui
         pn5180->iso14443_fwt_ms = 1;
     }
 
-    PN5180_LOGD(TAG, "ATS applied: FSCI=%u frame=%u FWI=%u FWT=%" PRId64 "ms", fsci, pn5180->iso14443_frame_size, fwi, pn5180->iso14443_fwt_ms);
+    // SFGI 15 is reserved and read as 0, as are all values without a guard time need.
+    *sfgi_out = (sfgi > 14) ? 0 : sfgi;
+    PN5180_LOGD(TAG, "ATS applied: FSCI=%u frame=%u FWI=%u FWT=%" PRId64 "ms SFGI=%u", fsci, pn5180->iso14443_frame_size, fwi, pn5180->iso14443_fwt_ms, sfgi);
     return true;
 }
 
@@ -159,13 +163,19 @@ static bool _pn5180_14443_mifare_block_read(pn5180_proto_t *proto, int blockno, 
             return false;
         }
         size_t got = buffer_len;
-        return pn5180_14443_4_read_binary(proto->pn5180, (uint16_t)blockno, (uint8_t)buffer_len, buffer, &got);
+        // A shorter answer (end of file) would leave the rest of the buffer unset.
+        return pn5180_14443_4_read_binary(proto->pn5180, (uint16_t)blockno, (uint8_t)buffer_len, buffer, &got) && got == buffer_len;
     }
     return pn5180_mifare_block_read(proto->pn5180, blockno, buffer, buffer_len);
 }
 
 static int _pn5180_14443_mifare_block_write(pn5180_proto_t *proto, int blockno, const uint8_t *buffer, size_t buffer_len)
 {
+    if (proto->pn5180->iso14443_layer4_active) {
+        // A raw MIFARE frame would break the ISO14443-4 session; such cards are written with APDUs.
+        ESP_LOGE(TAG, "block_write is not available while ISO14443-4 is active");
+        return -1;
+    }
     return pn5180_mifare_block_write(proto->pn5180, blockno, buffer, buffer_len);
 }
 
@@ -621,7 +631,21 @@ static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, pn5180_poll_stat
             }
             break;
         }
-        ESP_LOGI(TAG, "Found Card %d: UID Len %d", ++card_count, full_uid_len);
+        // A card that shows up again did not take the HLTA: the scan would find it forever.
+        bool duplicate = false;
+        for (int i = 0; uids != NULL && i < uids->uids_count; i++) {
+            if (uids->uids[i].uid_length == full_uid_len && memcmp(uids->uids[i].uid, full_uid, (size_t)full_uid_len) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            ESP_LOGW(TAG, "Card answered again after HLTA, ending the scan");
+            pn5180_mifare_halt(pn5180);
+            break;
+        }
+        card_count++;
+        ESP_LOGI(TAG, "Found Card %d: UID Len %d", card_count, full_uid_len);
         uint32_t agc_reg     = 0;
         uint16_t current_agc = 0;
         if (pn5180_read_register(pn5180, PN5180_RF_STATUS, &agc_reg)) {
@@ -786,8 +810,14 @@ static bool pn5180_14443_send_rats(pn5180_t *pn5180)
         return false;
     }
     PN5180_LOGD(TAG, "Received ATS (%u bytes)", (unsigned)rx_len);
-    if (!pn5180_iso14443_4_apply_ats(pn5180, ats, (uint16_t)rx_len)) {
+    uint8_t sfgi = 0;
+    if (!pn5180_iso14443_4_apply_ats(pn5180, ats, (uint16_t)rx_len, &sfgi)) {
         return false;
+    }
+    if (sfgi > 0) {
+        // Start-up frame guard time: the card needs (256 * 16 / fc) * 2^SFGI, about 302 us * 2^SFGI,
+        // after its ATS before it can take the first block.
+        pn5180_delay_us((uint32_t)302 << sfgi);
     }
     pn5180->iso14443_block_number = 0;
     return true;
@@ -859,7 +889,7 @@ static bool pn5180_14443_4_deselect(pn5180_t *pn5180)
     size_t  answer_len = 0;
     pn5180_enable_crc(pn5180);
     pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, &deselect, 1, 0, answer, sizeof(answer), &answer_len, PN5180_TIMEOUT_14443A_RATS_US, NULL);
-    return result == PN5180_RF_OK && answer_len >= 1 && (answer[0] & 0xF7) == ISO_DEP_PCB_S_DESELECT;
+    return result == PN5180_RF_OK && answer_len >= 1 && answer[0] == ISO_DEP_PCB_S_DESELECT;
 }
 
 bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apdu_len, uint8_t *rx, size_t *rx_len)
@@ -935,7 +965,9 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
         // I- and R-blocks must be right: anything else is an invalid block, handled like a damaged one.
         bool is_i_block    = (rx_pcb & 0xC0) == 0x00;
         bool is_r_block    = (rx_pcb & 0xC0) == 0x80;
-        bool invalid_block = (is_i_block && (rx_pcb & 0x2E) != 0x02) || (is_r_block && (rx_pcb & 0x2E) != 0x22) || (rx_pcb & 0xC0) == 0x40;
+        bool is_s_block    = (rx_pcb & 0xC0) == 0xC0;
+        bool invalid_block = (is_i_block && (rx_pcb & 0x2E) != 0x02) || (is_r_block && (rx_pcb & 0x2E) != 0x22) || (is_s_block && (rx_pcb & 0x08) != 0) ||
+                             (rx_pcb & 0xC0) == 0x40;
         if (invalid_block) {
             if (++retries > ISO_DEP_MAX_RETRIES) {
                 ESP_LOGE(TAG, "ISO-DEP exchange failed: invalid block 0x%02X", rx_pcb);
@@ -946,7 +978,7 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
             next_tx_len   = 1;
             continue;
         }
-        if ((rx_pcb & 0xF7) != ISO_DEP_PCB_S_WTX) {
+        if (rx_pcb != ISO_DEP_PCB_S_WTX) {
             wtx_count = 0;
         }
 
@@ -963,6 +995,12 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
             size_t payload_len = (size_t)received - 1;
             if ((total_payload + payload_len) > rx_capacity) {
                 ESP_LOGE(TAG, "Layer 4 response too large: %zu > %zu", total_payload + payload_len, rx_capacity);
+                break;
+            }
+            if (payload_len == 0 && (rx_pcb & ISO_DEP_PCB_CHAINING) != 0) {
+                // A chained block without data makes no progress; a card that keeps sending them
+                // would keep this loop running, since only the buffer size bounds a chain.
+                ESP_LOGE(TAG, "ISO-DEP: chained I-block without data");
                 break;
             }
             memcpy(&rx[total_payload], &rx_buf[1], payload_len);
@@ -1016,7 +1054,7 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
         }
 
         // S-block
-        if ((rx_pcb & 0xF7) == ISO_DEP_PCB_S_WTX) {
+        if (rx_pcb == ISO_DEP_PCB_S_WTX) {
             uint8_t wtxm = (received >= 2) ? (uint8_t)(rx_buf[1] & 0x3F) : 0;
             if (wtxm == 0 || wtxm > 59) {
                 ESP_LOGE(TAG, "Invalid WTX frame received");
@@ -1032,7 +1070,8 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
             next_tx_len   = 2;
             timeout_ms    = fwt_ms * wtxm;
             if (timeout_ms > ISO_DEP_FWT_MAX_MS) {
-                timeout_ms = ISO_DEP_FWT_MAX_MS;
+                // Never below the plain frame waiting time, which rounding puts a little above the cap for FWI 14
+                timeout_ms = (fwt_ms > ISO_DEP_FWT_MAX_MS) ? fwt_ms : ISO_DEP_FWT_MAX_MS;
             }
             continue;
         }
@@ -1180,11 +1219,16 @@ static bool _pn5180_14443_detect_card_type_and_capacity( //
         *blocks_count = 20; // 5 sectors * 4 blocks
         *block_size   = 16;
         break;
-    case 0x10: // MIFARE Plus S (2K)
-    case 0x11: // MIFARE Plus X (2K)
+    case 0x10: // MIFARE Plus 2K in security level 2 (AN10833)
         PN5180_LOGD(TAG, "Detected MIFARE Plus 2K");
         uid->subtype  = PN5180_MIFARE_PLUS_2K;
         *blocks_count = 128; // 32 sectors * 4 blocks
+        *block_size   = 16;
+        break;
+    case 0x11: // MIFARE Plus 4K in security level 2 (AN10833)
+        PN5180_LOGD(TAG, "Detected MIFARE Plus 4K");
+        uid->subtype  = PN5180_MIFARE_PLUS_4K;
+        *blocks_count = 256; // 32 sectors * 4 blocks + 8 sectors * 16 blocks
         *block_size   = 16;
         break;
     case 0x18:
@@ -1194,7 +1238,6 @@ static bool _pn5180_14443_detect_card_type_and_capacity( //
         *block_size   = 16;
         break;
     case 0x20: // ISO 14443-4 (DESFire family)
-    case 0x24: // DESFire EV1/EV2/EV3
         PN5180_LOGD(TAG, "Detected MIFARE DESFire (ISO 14443-4)");
         uid->subtype  = PN5180_MIFARE_DESFIRE;
         *block_size   = 1;
@@ -1245,7 +1288,7 @@ static bool pn5180_14443_select_by_uid( //
     uint8_t uid_offset    = 0;
     uint8_t sak           = 0;
     uint8_t level_data[5]; // 4 data bytes + 1 BCC
-    uint8_t atqa[2];
+    uint8_t atqa[2] = {0, 0};
 
     // Reset Layer 4 state for new selection
     pn5180_iso14443_4_reset_state(pn5180);

@@ -40,6 +40,7 @@ typedef struct
     uint8_t       sak;
     uint8_t       atqa[2];
     int           cascade_done; /**< cascade levels selected so far */
+    bool          ignores_hlta; /**< misbehaving card: goes back to IDLE instead of HALT */
 
     /* Type 2 */
     uint8_t memory[1024];    /**< pages of 4 bytes */
@@ -74,6 +75,7 @@ typedef struct
     int     wtx_requests;   /**< the card asks N more times for a waiting time extension before it answers */
     int     deselect_count;
     int     rats_count;
+    bool    sends_empty_chain; /**< hostile card: answers everything with chained I-blocks without data */
     /* Type 4 application */
     uint8_t cc_file[15];
     uint8_t ndef_file[600];

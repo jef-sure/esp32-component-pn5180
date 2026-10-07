@@ -25,6 +25,10 @@ static size_t tlv_parse_length(const uint8_t *data, size_t data_len, size_t offs
 
 bool pn5180_ndef_tlv_find_ndef(const uint8_t *data, size_t data_len, size_t *search_pos, size_t *ndef_offset, size_t *ndef_length)
 {
+    if (data == NULL || search_pos == NULL || ndef_offset == NULL || ndef_length == NULL) {
+        return false;
+    }
+
     size_t i = *search_pos;
     while (i < data_len) {
         uint8_t type = data[i];

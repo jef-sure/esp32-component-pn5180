@@ -1,12 +1,15 @@
 #include "pn5180.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "pn5180-internal.h"
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 // PN5180 1-Byte Direct Commands
@@ -105,6 +108,10 @@ void pn5180_delay_ms(int ms)
 // Adds the PN5180 as a device on an initialized bus. NSS is driven by the driver, not by the SPI master.
 static bool pn5180_spi_add_device(pn5180_spi_t *spi, spi_host_device_t host_id, int clock_speed_hz)
 {
+    if (clock_speed_hz > PN5180_SPI_MAX_CLOCK_HZ) {
+        ESP_LOGW(TAG, "clock_speed_hz=%d is above the PN5180 maximum, using %d Hz", clock_speed_hz, PN5180_SPI_MAX_CLOCK_HZ);
+        clock_speed_hz = PN5180_SPI_MAX_CLOCK_HZ;
+    }
     spi_device_interface_config_t dev_config = {
         .clock_speed_hz = clock_speed_hz, //
         .mode           = 0,              //
@@ -123,6 +130,17 @@ static bool pn5180_spi_add_device(pn5180_spi_t *spi, spi_host_device_t host_id, 
 
 pn5180_spi_t *pn5180_spi_attach(spi_host_device_t host_id, int clock_speed_hz)
 {
+    size_t max_transaction_len = 0;
+    if ((unsigned)host_id >= SPI_HOST_MAX || spi_bus_get_max_transaction_len(host_id, &max_transaction_len) != ESP_OK) {
+        ESP_LOGE(TAG, "pn5180_spi_attach: SPI host %d is not initialized", (int)host_id);
+        return NULL;
+    }
+    // A command and its answer are each one transaction of up to PN5180_MAX_BUF_SIZE bytes.
+    if (max_transaction_len < PN5180_MAX_BUF_SIZE) {
+        ESP_LOGE(TAG, "pn5180_spi_attach: SPI host %d carries %u bytes per transaction, the PN5180 needs %d", (int)host_id, (unsigned)max_transaction_len,
+                 PN5180_MAX_BUF_SIZE);
+        return NULL;
+    }
     pn5180_spi_t *spi = (pn5180_spi_t *)calloc(1, sizeof(pn5180_spi_t));
     if (spi == NULL) {
         return NULL;
@@ -497,7 +515,7 @@ bool pn5180_read_register(pn5180_t *pn5180, uint8_t reg, uint32_t *pvalue)
         ESP_LOGE(TAG, "pn5180_read_register: pvalue is NULL");
         return false;
     }
-    *pvalue = (value[3] << 24) | (value[2] << 16) | (value[1] << 8) | value[0];
+    *pvalue = ((uint32_t)value[3] << 24) | ((uint32_t)value[2] << 16) | ((uint32_t)value[1] << 8) | value[0];
     return ret;
 }
 
@@ -573,6 +591,10 @@ pn5180_transceive_state_t pn5180_get_transceive_state(pn5180_t *pn5180)
 
 bool pn5180_send_data(pn5180_t *pn5180, const uint8_t *data, int len, uint8_t valid_bits)
 {
+    if (len < 0 || (len > 0 && data == NULL)) {
+        ESP_LOGE(TAG, "send_data: invalid data or length");
+        return false;
+    }
     if (len > 260) {
         ESP_LOGE(TAG, "send_data: Data length exceeds maximum allowed size of 260 bytes");
         return false;
@@ -1037,6 +1059,10 @@ bool pn5180_set_rf_on(pn5180_t *pn5180)
 
 bool pn5180_set_rf_off(pn5180_t *pn5180)
 {
+    // Without field a card loses its ISO14443-4 session.
+    pn5180->iso14443_layer4_active = false;
+    pn5180->iso14443_block_number  = 0;
+
     uint32_t rf_status = 0;
     if (pn5180_read_register(pn5180, PN5180_RF_STATUS, &rf_status)) {
         if ((rf_status & PN5180_RF_STATUS_TX_RF_STATUS_MASK) == 0) {
@@ -1072,6 +1098,10 @@ bool pn5180_set_rf_off(pn5180_t *pn5180)
 
 bool pn5180_send_command(pn5180_t *pn5180, uint8_t *send_buffer, size_t send_buffer_len, uint8_t *recv_buffer, size_t recv_buffer_len)
 {
+    if (pn5180 == NULL || send_buffer == NULL || send_buffer_len == 0 || (recv_buffer == NULL && recv_buffer_len > 0)) {
+        ESP_LOGE(TAG, "pn5180_send_command: invalid arguments");
+        return false;
+    }
     bool ret = transceive_command(pn5180, send_buffer, send_buffer_len, recv_buffer, recv_buffer_len);
     if (!ret) {
         ESP_LOGE(TAG, "Failed to send command");
@@ -1133,6 +1163,10 @@ bool pn5180_recover(pn5180_t *pn5180)
     bool    rf_was_on  = pn5180->is_rf_on;
     bool    was_loaded = pn5180->rf_config_loaded;
     uint8_t tx_config  = pn5180->tx_config;
+
+    // The reset takes the field away, so a card loses its ISO14443-4 session.
+    pn5180->iso14443_layer4_active = false;
+    pn5180->iso14443_block_number  = 0;
 
     if (!pn5180_reset(pn5180)) {
         ESP_LOGE(TAG, "recover: reset failed");

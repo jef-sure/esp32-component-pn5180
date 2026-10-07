@@ -19,6 +19,7 @@
 
 static const char *TAG __attribute__((unused)) = "pn5180-ndef";
 
+#define TLV_NDEF       0x03
 #define TLV_TERMINATOR 0xFE
 
 /* ---- Byte stream collected from the card, searched for the NDEF TLV ---- */
@@ -106,63 +107,450 @@ static bool ndef_reselect(pn5180_proto_t *proto, pn5180_uid_t *uid)
     return proto->select_by_uid != NULL && proto->select_by_uid(proto, uid);
 }
 
+/* ---- Type 2 and Type 5: TLVs in a data area that the capability container describes ---- */
+
+/*
+ * Checks and procedures follow the NXP reader library (phalTop, T2T and T5T: CheckNdef, ReadNdef,
+ * WriteNdef):
+ *   - the capability container must show a supported version and known access conditions;
+ *   - the NDEF TLV is found by walking the TLVs of the data area;
+ *   - writing puts the message into the NDEF TLV the tag already has, so TLVs in front of it
+ *     (lock control, memory control, proprietary) and the bytes sharing its first block are kept;
+ *     the TLV length is set to 0 first, then the message is written, then the real length; a
+ *     Terminator TLV follows the message if the data area has room for it.
+ */
+
+#define NDEF_AREA_MAX_RESERVED 4
+
+typedef struct
+{
+    size_t stream_base; /**< tag address of the first stream byte, on a block boundary */
+    size_t area_start;  /**< tag address of the first TLV byte */
+    size_t area_end;    /**< tag address after the data area */
+    size_t block_size;
+    bool   type2; /**< READ answers 16 bytes; control TLVs reserve bytes of the tag */
+    struct
+    {
+        size_t addr;
+        size_t size;
+    } reserved[NDEF_AREA_MAX_RESERVED]; /**< lock and reserved bytes named by control TLVs */
+    size_t reserved_count;
+} ndef_area_t;
+
+// Appends the next block (Type 2: the next four pages) of the data area to the stream.
+// PN5180_NDEF_ERR_NO_NDEF means that the data area ended.
+static pn5180_ndef_result_t area_read_more(pn5180_proto_t *proto, const ndef_area_t *ctx, ndef_stream_t *stream)
+{
+    size_t addr = ctx->stream_base + stream->len;
+    if (addr >= ctx->area_end) {
+        return PN5180_NDEF_ERR_NO_NDEF;
+    }
+    uint8_t data[32];
+    size_t  got = ctx->type2 ? 16u : ctx->block_size;
+    if (!proto->block_read(proto, (int)(addr / ctx->block_size), data, got)) {
+        return PN5180_NDEF_ERR_READ_FAILED;
+    }
+    if (got > ctx->area_end - addr) {
+        got = ctx->area_end - addr;
+    }
+    return stream_append(stream, data, got) ? PN5180_NDEF_OK : PN5180_NDEF_ERR_NO_MEMORY;
+}
+
+static pn5180_ndef_result_t area_need(pn5180_proto_t *proto, const ndef_area_t *ctx, ndef_stream_t *stream, size_t len)
+{
+    while (stream->len < len) {
+        pn5180_ndef_result_t result = area_read_more(proto, ctx, stream);
+        if (result != PN5180_NDEF_OK) {
+            return result;
+        }
+    }
+    return PN5180_NDEF_OK;
+}
+
+// Walks the TLVs of the data area up to the NDEF TLV and returns the tag address of its T byte,
+// as phalTop_Sw_Int_T2T_DetectTlvBlocks() / ..._T5T_DetectTlvBlocks() of the NXP reader library do.
+// A data area without NDEF TLV is PN5180_NDEF_ERR_NO_NDEF: the tag is not set up for NDEF.
+static pn5180_ndef_result_t area_find_ndef_tlv(pn5180_proto_t *proto, ndef_area_t *ctx, ndef_stream_t *stream, size_t *header_addr)
+{
+    size_t pos        = ctx->area_start - ctx->stream_base;
+    int    null_count = 0;
+    for (;;) {
+        pn5180_ndef_result_t result = area_need(proto, ctx, stream, pos + 1);
+        if (result != PN5180_NDEF_OK) {
+            return result;
+        }
+        uint8_t type = stream->data[pos];
+        // NULL TLV: a single byte, known to Type 2 only (on Type 5, 00h is a reserved TLV with a
+        // length like any other). A Type 2 tag must not carry more than three of them in a row.
+        if (ctx->type2 && type == 0x00) {
+            if (++null_count > 3) {
+                return PN5180_NDEF_ERR_NO_NDEF;
+            }
+            pos++;
+            continue;
+        }
+        null_count = 0;
+        if (type == TLV_TERMINATOR) {
+            return PN5180_NDEF_ERR_NO_NDEF;
+        }
+        if (type == TLV_NDEF) {
+            *header_addr = ctx->stream_base + pos;
+            return PN5180_NDEF_OK;
+        }
+
+        // Any other TLV is skipped by its length.
+        if ((result = area_need(proto, ctx, stream, pos + 2)) != PN5180_NDEF_OK) {
+            return result;
+        }
+        size_t length      = stream->data[pos + 1];
+        size_t length_size = 1;
+        if (length == 0xFF) {
+            if ((result = area_need(proto, ctx, stream, pos + 4)) != PN5180_NDEF_OK) {
+                return result;
+            }
+            length      = ((size_t)stream->data[pos + 2] << 8) | stream->data[pos + 3];
+            length_size = 3;
+        }
+        // Lock Control (01h) and Memory Control (02h) TLV of a Type 2 tag: position byte (page
+        // address, byte offset), size (bits for lock bytes, bytes for reserved ones), page control
+        // (low nibble: bytes per page as a power of two).
+        if (ctx->type2 && (type == 0x01 || type == 0x02) && length == 3) {
+            if ((result = area_need(proto, ctx, stream, pos + 1 + length_size + 3)) != PN5180_NDEF_OK) {
+                return result;
+            }
+            if (ctx->reserved_count >= NDEF_AREA_MAX_RESERVED) {
+                return PN5180_NDEF_ERR_UNSUPPORTED;
+            }
+            const uint8_t *value                    = &stream->data[pos + 1 + length_size];
+            size_t         bytes_per_page           = (size_t)1 << (value[2] & 0x0F);
+            ctx->reserved[ctx->reserved_count].addr = (size_t)(value[0] >> 4) * bytes_per_page + (value[0] & 0x0F);
+            ctx->reserved[ctx->reserved_count].size = (type == 0x01) ? ((size_t)value[1] + 7u) / 8u : value[1];
+            ctx->reserved_count++;
+        }
+        pos += 1 + length_size + length;
+    }
+}
+
+// True if a Lock Control or Memory Control TLV puts lock or reserved bytes into [from, to).
+static bool area_has_reserved_bytes(const ndef_area_t *ctx, size_t from, size_t to)
+{
+    for (size_t i = 0; i < ctx->reserved_count; i++) {
+        if (ctx->reserved[i].size > 0 && ctx->reserved[i].addr < to && ctx->reserved[i].addr + ctx->reserved[i].size > from) {
+            PN5180_LOGD(TAG, "NDEF: lock or reserved bytes at %u inside the data area", (unsigned)ctx->reserved[i].addr);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Reads the message out of the NDEF TLV of the data area. Takes over the stream.
+static pn5180_ndef_result_t ndef_read_from_area(pn5180_proto_t *proto, ndef_area_t *ctx, ndef_stream_t *seeded, pn5180_ndef_message_parsed_t **out_msg)
+{
+    ndef_stream_t        stream      = *seeded;
+    size_t               header_addr = 0;
+    pn5180_ndef_result_t result      = area_find_ndef_tlv(proto, ctx, &stream, &header_addr);
+    if (result != PN5180_NDEF_OK) {
+        goto done;
+    }
+
+    size_t pos = header_addr - ctx->stream_base;
+    if ((result = area_need(proto, ctx, &stream, pos + 2)) != PN5180_NDEF_OK) {
+        goto done;
+    }
+    size_t length      = stream.data[pos + 1];
+    size_t length_size = 1;
+    if (length == 0xFF) {
+        if ((result = area_need(proto, ctx, &stream, pos + 4)) != PN5180_NDEF_OK) {
+            goto done;
+        }
+        length      = ((size_t)stream.data[pos + 2] << 8) | stream.data[pos + 3];
+        length_size = 3;
+    }
+    if (length == 0) {
+        // Formatted tag without a message
+        result = PN5180_NDEF_ERR_NO_NDEF;
+        goto done;
+    }
+    size_t value_addr = header_addr + 1 + length_size;
+    if (value_addr > ctx->area_end || length > ctx->area_end - value_addr) {
+        // The message does not fit the data area the capability container describes.
+        result = PN5180_NDEF_ERR_PARSE_FAILED;
+        goto done;
+    }
+    // The NXP library leaves lock and reserved bytes out of the message; this driver does not
+    // read around them.
+    if (area_has_reserved_bytes(ctx, value_addr, value_addr + length)) {
+        result = PN5180_NDEF_ERR_UNSUPPORTED;
+        goto done;
+    }
+    if ((result = area_need(proto, ctx, &stream, pos + 1 + length_size + length)) != PN5180_NDEF_OK) {
+        goto done;
+    }
+    result = pn5180_ndef_parse_message(stream.data + pos + 1 + length_size, length, out_msg);
+
+done:
+    free(stream.data);
+    return result;
+}
+
+// Writes the message into the NDEF TLV of the data area. Takes over the stream.
+static pn5180_ndef_result_t ndef_write_into_area(pn5180_proto_t *proto, ndef_area_t *ctx, ndef_stream_t *seeded, const pn5180_ndef_message_t *msg)
+{
+    ndef_stream_t stream = *seeded;
+    size_t        ndef_len = pn5180_ndef_encode_message(msg, NULL, 0);
+    if (ndef_len == 0) {
+        free(stream.data);
+        return PN5180_NDEF_ERR_INVALID_PARAM;
+    }
+    if (ndef_len > 0xFFFE) {
+        // The three-byte TLV length format ends at FFFEh.
+        free(stream.data);
+        return PN5180_NDEF_ERR_CARD_FULL;
+    }
+
+    size_t               header_addr = 0;
+    uint8_t             *image       = NULL;
+    pn5180_ndef_result_t result      = area_find_ndef_tlv(proto, ctx, &stream, &header_addr);
+    if (result != PN5180_NDEF_OK) {
+        goto done;
+    }
+
+    // T, L (one byte, or FFh and two bytes from 255 on) and the message have to fit between the
+    // NDEF TLV and the end of the data area.
+    size_t block_size  = ctx->block_size;
+    size_t length_size = (ndef_len < 0xFF) ? 1 : 3;
+    size_t tlv_len     = 1 + length_size + ndef_len;
+    size_t room        = ctx->area_end - header_addr;
+    if (tlv_len > room) {
+        result = PN5180_NDEF_ERR_CARD_FULL;
+        goto done;
+    }
+    // Lock or reserved bytes inside the part of the data area that would be written: the message
+    // would have to go around them, which this driver does not do.
+    if (area_has_reserved_bytes(ctx, header_addr, ctx->area_end)) {
+        result = PN5180_NDEF_ERR_UNSUPPORTED;
+        goto done;
+    }
+    bool terminator = tlv_len < room;
+
+    // Image of the blocks to write, starting with the block of the NDEF TLV.
+    size_t image_addr = header_addr - header_addr % block_size;
+    size_t prefix     = header_addr - image_addr;
+    size_t used       = prefix + tlv_len + (terminator ? 1u : 0u);
+    size_t blocks     = (used + block_size - 1) / block_size;
+    image             = calloc(blocks + 1, block_size); // one spare block for the zero-length step
+    if (image == NULL) {
+        result = PN5180_NDEF_ERR_NO_MEMORY;
+        goto done;
+    }
+    size_t last_addr = image_addr + (blocks - 1) * block_size;
+    if (last_addr + block_size > ctx->area_end) {
+        // The last block reaches beyond the data area: those bytes keep their content.
+        if (!proto->block_read(proto, (int)(last_addr / block_size), image + (blocks - 1) * block_size, block_size)) {
+            result = PN5180_NDEF_ERR_READ_FAILED;
+            goto done;
+        }
+        memset(image + (blocks - 1) * block_size, 0, ctx->area_end - last_addr);
+    }
+    memcpy(image, stream.data + (image_addr - ctx->stream_base), prefix);
+    size_t pos   = prefix;
+    image[pos++] = TLV_NDEF;
+    if (length_size == 1) {
+        image[pos++] = (uint8_t)ndef_len;
+    } else {
+        image[pos++] = 0xFF;
+        image[pos++] = (uint8_t)(ndef_len >> 8);
+        image[pos++] = (uint8_t)(ndef_len & 0xFF);
+    }
+    if (pn5180_ndef_encode_message(msg, image + pos, ndef_len) != ndef_len) {
+        result = PN5180_NDEF_ERR_INVALID_PARAM;
+        goto done;
+    }
+    pos += ndef_len;
+    if (terminator) {
+        image[pos++] = TLV_TERMINATOR;
+    }
+
+    // The block with the first length byte decides whether the tag shows a message.
+    size_t key_block  = (prefix + 1) / block_size;
+    int    first_block = (int)(image_addr / block_size);
+    if (blocks > 1) {
+        // Length 0 while the other blocks are written: a reader never sees the new length together
+        // with old data, also after an interrupted write.
+        uint8_t *zeroed = image + blocks * block_size;
+        memcpy(zeroed, image + key_block * block_size, block_size);
+        zeroed[(prefix + 1) % block_size] = 0x00;
+        if (proto->block_write(proto, first_block + (int)key_block, zeroed, block_size) < 0) {
+            result = PN5180_NDEF_ERR_WRITE_FAILED;
+        }
+    }
+    for (size_t i = 0; i < blocks && result == PN5180_NDEF_OK; i++) {
+        if (i != key_block && proto->block_write(proto, first_block + (int)i, image + i * block_size, block_size) < 0) {
+            result = PN5180_NDEF_ERR_WRITE_FAILED;
+        }
+    }
+    if (result == PN5180_NDEF_OK && proto->block_write(proto, first_block + (int)key_block, image + key_block * block_size, block_size) < 0) {
+        result = PN5180_NDEF_ERR_WRITE_FAILED;
+    }
+
+done:
+    free(image);
+    free(stream.data);
+    return result;
+}
+
 /* ---- Type 2: Ultralight, NTAG ---- */
 
-static pn5180_ndef_result_t type2_read_ndef(pn5180_proto_t *proto, pn5180_uid_t *uid, pn5180_ndef_message_parsed_t **out_msg)
+// Reads the capability container and describes the data area. The stream receives the bytes of
+// the data area that came along with the capability container.
+static pn5180_ndef_result_t type2_open_area(pn5180_proto_t *proto, const pn5180_uid_t *uid, bool for_write, ndef_area_t *ctx, ndef_stream_t *stream)
 {
-    // READ returns four pages: page 3 is the capability container, pages 4..6 the start of the data area.
+    // READ returns four pages: page 3 is the capability container (magic, version, data area size
+    // in units of 8 bytes, access), pages 4..6 the start of the data area.
     uint8_t first[16];
     if (!proto->block_read(proto, 3, first, sizeof(first))) {
         return PN5180_NDEF_ERR_READ_FAILED;
     }
-    if (first[0] != 0xE1) {
-        PN5180_LOGD(TAG, "T2: no capability container (page 3 starts with %02X)", first[0]);
+    // No magic number, or a data area below the 48 bytes of the smallest Type 2 tag
+    if (first[0] != 0xE1 || first[2] < 6) {
+        PN5180_LOGD(TAG, "T2: tag is not NDEF formatted (capability container %02X %02X %02X %02X)", first[0], first[1], first[2], first[3]);
         return PN5180_NDEF_ERR_NO_NDEF;
     }
-    // CC byte 2 is the size of the data area in units of 8 bytes. It excludes pages 0..3 and the
-    // lock and configuration pages at the end, so it bounds how far NDEF reads may go.
-    size_t data_bytes = (size_t)first[2] * 8u;
-    if (data_bytes == 0) {
-        return PN5180_NDEF_ERR_NO_NDEF;
+    if ((first[1] & 0xF0) != 0x10) {
+        PN5180_LOGD(TAG, "T2: unsupported mapping version %02X", first[1]);
+        return PN5180_NDEF_ERR_UNSUPPORTED;
     }
-    int end_page    = 4 + (int)(data_bytes / 4u); // first page after the data area
+    // Access byte: 00h read and write, 0Fh read only; other values are proprietary.
+    if (first[3] != 0x00 && first[3] != 0x0F) {
+        PN5180_LOGD(TAG, "T2: unsupported access conditions %02X", first[3]);
+        return PN5180_NDEF_ERR_UNSUPPORTED;
+    }
+    if (for_write && first[3] == 0x0F) {
+        return PN5180_NDEF_ERR_ACCESS_DENIED;
+    }
+
+    // The size excludes pages 0..3 and the lock and configuration pages at the end, so it bounds
+    // how far reads and writes may go.
+    *ctx = (ndef_area_t){.stream_base = 16, .area_start = 16, .area_end = 16u + (size_t)first[2] * 8u, .block_size = 4, .type2 = true};
+    if (uid->blocks_count >= 4 + 12 && ctx->area_end > (size_t)uid->blocks_count * 4u) {
+        // A capability container must not promise more than the tag has.
+        ctx->area_end = (size_t)uid->blocks_count * 4u;
+    }
+    return stream_append(stream, &first[4], 12) ? PN5180_NDEF_OK : PN5180_NDEF_ERR_NO_MEMORY;
+}
+
+static pn5180_ndef_result_t type2_read_ndef(pn5180_proto_t *proto, pn5180_uid_t *uid, pn5180_ndef_message_parsed_t **out_msg)
+{
+    ndef_area_t          ctx;
+    ndef_stream_t        stream = {0};
+    pn5180_ndef_result_t result = type2_open_area(proto, uid, false, &ctx, &stream);
+    if (result != PN5180_NDEF_OK) {
+        free(stream.data);
+        return result;
+    }
     uid->block_size = 4;
+    return ndef_read_from_area(proto, &ctx, &stream, out_msg);
+}
 
-    ndef_stream_t stream      = {0};
-    size_t        tlv_pos     = 0;
-    size_t        ndef_offset = 0;
-    size_t        ndef_len    = 0;
-    bool          found       = false;
-    bool          read_ok     = true;
-    bool          no_memory   = false;
-
-    size_t valid = (data_bytes < 12u) ? data_bytes : 12u;
-    if (!stream_append(&stream, &first[4], valid)) {
-        return PN5180_NDEF_ERR_NO_MEMORY;
+static pn5180_ndef_result_t type2_write_ndef(pn5180_proto_t *proto, const pn5180_uid_t *uid, const pn5180_ndef_message_t *msg)
+{
+    ndef_area_t          ctx;
+    ndef_stream_t        stream = {0};
+    pn5180_ndef_result_t result = type2_open_area(proto, uid, true, &ctx, &stream);
+    if (result != PN5180_NDEF_OK) {
+        free(stream.data);
+        return result;
     }
-    tlv_scan_t scan = stream_scan(&stream, &tlv_pos, &ndef_offset, &ndef_len);
+    return ndef_write_into_area(proto, &ctx, &stream, msg);
+}
 
-    for (int page = 7; scan == TLV_SCAN_MORE && page < end_page; page += 4) {
-        uint8_t chunk[16];
-        if (!proto->block_read(proto, page, chunk, sizeof(chunk))) {
-            read_ok = false;
-            break;
-        }
-        // Near the end of the memory a READ wraps around to page 0 (or runs into configuration
-        // pages), so only the pages inside the data area are taken.
-        valid = (size_t)(end_page - page) * 4u;
-        if (valid > sizeof(chunk)) {
-            valid = sizeof(chunk);
-        }
-        if (!stream_append(&stream, chunk, valid)) {
-            no_memory = true;
-            break;
-        }
-        scan = stream_scan(&stream, &tlv_pos, &ndef_offset, &ndef_len);
+/* ---- Type 5: ISO15693 ---- */
+
+/*
+ * Type 5 capability container, from block 0:
+ *   [0] magic: E1 (blocks addressed with one byte) or E2 (two bytes)
+ *   [1] major version in bits 7..6, read access in bits 3..2, write access in bits 1..0
+ *   [2] MLEN: size of the data area after the CC in units of 8 bytes; 0 means that an
+ *       8-byte CC is used and the size is in bytes 6..7
+ *   [3] feature flags
+ * TLVs follow directly after the capability container.
+ */
+static pn5180_ndef_result_t type5_open_area(pn5180_proto_t *proto, const pn5180_uid_t *uid, bool for_write, ndef_area_t *ctx, ndef_stream_t *stream)
+{
+    size_t block_size = (uid->block_size > 0) ? (size_t)uid->block_size : 4u;
+    if (block_size > 32u) {
+        return PN5180_NDEF_ERR_UNSUPPORTED;
     }
-    found = (scan == TLV_SCAN_FOUND);
 
-    return stream_finish(&stream, found, read_ok, no_memory, ndef_offset, ndef_len, out_msg);
+    uint8_t cc[8 + 32] = {0};
+    size_t  cc_have    = 0;
+    do {
+        if (!proto->block_read(proto, (int)(cc_have / block_size), cc + cc_have, block_size)) {
+            return PN5180_NDEF_ERR_READ_FAILED;
+        }
+        cc_have += block_size;
+    } while (cc_have < 4 || (cc[2] == 0 && cc_have < 8));
+
+    if (cc[0] != 0xE1 && cc[0] != 0xE2) {
+        PN5180_LOGD(TAG, "T5: tag is not NDEF formatted (block 0 starts with %02X)", cc[0]);
+        return PN5180_NDEF_ERR_NO_NDEF;
+    }
+    if ((cc[1] >> 6) > 1) {
+        PN5180_LOGD(TAG, "T5: unsupported mapping version %02X", cc[1]);
+        return PN5180_NDEF_ERR_UNSUPPORTED;
+    }
+    // Access nibble: 0h read and write, 3h read only; other values are reserved or proprietary.
+    uint8_t access = cc[1] & 0x0F;
+    if (access != 0x00 && access != 0x03) {
+        PN5180_LOGD(TAG, "T5: unsupported access conditions %02X", cc[1]);
+        return PN5180_NDEF_ERR_UNSUPPORTED;
+    }
+    if (for_write && access == 0x03) {
+        return PN5180_NDEF_ERR_ACCESS_DENIED;
+    }
+    size_t cc_len = 4;
+    size_t mlen   = cc[2];
+    if (mlen == 0) {
+        cc_len = 8;
+        mlen   = ((size_t)cc[6] << 8) | cc[7];
+    }
+
+    *ctx = (ndef_area_t){.stream_base = 0, .area_start = cc_len, .area_end = cc_len + mlen * 8u, .block_size = block_size, .type2 = false};
+    if (uid->blocks_count > 0 && ctx->area_end > (size_t)uid->blocks_count * block_size) {
+        // A capability container must not promise more than the tag has.
+        ctx->area_end = (size_t)uid->blocks_count * block_size;
+    }
+    if (ctx->area_end <= ctx->area_start) {
+        return PN5180_NDEF_ERR_NO_NDEF;
+    }
+    if (cc_have > ctx->area_end) {
+        cc_have = ctx->area_end;
+    }
+    return stream_append(stream, cc, cc_have) ? PN5180_NDEF_OK : PN5180_NDEF_ERR_NO_MEMORY;
+}
+
+static pn5180_ndef_result_t type5_read_ndef(pn5180_proto_t *proto, pn5180_uid_t *uid, pn5180_ndef_message_parsed_t **out_msg)
+{
+    ndef_area_t          ctx;
+    ndef_stream_t        stream = {0};
+    pn5180_ndef_result_t result = type5_open_area(proto, uid, false, &ctx, &stream);
+    if (result != PN5180_NDEF_OK) {
+        free(stream.data);
+        return result;
+    }
+    return ndef_read_from_area(proto, &ctx, &stream, out_msg);
+}
+
+static pn5180_ndef_result_t type5_write_ndef(pn5180_proto_t *proto, const pn5180_uid_t *uid, const pn5180_ndef_message_t *msg)
+{
+    ndef_area_t          ctx;
+    ndef_stream_t        stream = {0};
+    pn5180_ndef_result_t result = type5_open_area(proto, uid, true, &ctx, &stream);
+    if (result != PN5180_NDEF_OK) {
+        free(stream.data);
+        return result;
+    }
+    return ndef_write_into_area(proto, &ctx, &stream, msg);
 }
 
 /* ---- MIFARE Classic: NDEF sectors listed in the MIFARE Application Directory ---- */
@@ -225,7 +613,8 @@ static bool classic_mad_entry_is_ndef(const uint8_t *mad, size_t mad_len, int en
     size_t  offset = 2u + (size_t)entry * 2u;
     uint8_t aid0   = mad[offset];
     uint8_t aid1   = mad[offset + 1u];
-    return (aid0 == 0x03 && aid1 == 0xE1) || (aid0 == 0xE1 && aid1 == 0x03);
+    // NFC Forum AID: application code 03h, then function cluster code E1h.
+    return aid0 == 0x03 && aid1 == 0xE1;
 }
 
 // Sector 16 holds MAD2, so the application sector after 15 is 17.
@@ -329,6 +718,25 @@ static pn5180_ndef_result_t classic_read_sectors(pn5180_proto_t *proto, pn5180_u
             PN5180_LOGD(TAG, "Classic: authentication failed for sector %d", sectors[i]);
             read_ok = false;
             break;
+        }
+        if (i == 0) {
+            // General purpose byte of the NDEF sector trailer: mapping version in bits 7..4 (major
+            // in 7..6), read access in bits 3..2, write access in bits 1..0; 00b grants access.
+            uint8_t trailer[16];
+            if (!proto->block_read(proto, first_block + block_count - 1, trailer, sizeof(trailer))) {
+                read_ok = false;
+                break;
+            }
+            if ((trailer[9] >> 6) > 1) {
+                PN5180_LOGD(TAG, "Classic: unsupported mapping version (general purpose byte %02X)", trailer[9]);
+                free(stream.data);
+                return PN5180_NDEF_ERR_UNSUPPORTED;
+            }
+            if ((trailer[9] & 0x0C) != 0) {
+                PN5180_LOGD(TAG, "Classic: NDEF sectors are read protected (general purpose byte %02X)", trailer[9]);
+                free(stream.data);
+                return PN5180_NDEF_ERR_ACCESS_DENIED;
+            }
         }
 
         // The last block of a sector is its trailer and carries no data.
@@ -435,6 +843,13 @@ static pn5180_ndef_result_t classic_read_ndef(pn5180_proto_t *proto, pn5180_uid_
  *        [14]     Write access
  *   3. SELECT the NDEF file, read NLEN (2 bytes at offset 0), then NLEN bytes from offset 2.
  */
+// A card that refuses a SELECT is alive but carries no NDEF application or file. A SELECT that got
+// no usable answer closed the ISO14443-4 session instead, and the read is worth repeating.
+static pn5180_ndef_result_t type4_select_failure_result(const pn5180_t *pn5180)
+{
+    return pn5180->iso14443_layer4_active ? PN5180_NDEF_ERR_NO_NDEF : PN5180_NDEF_ERR_READ_FAILED;
+}
+
 static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_message_parsed_t **out_msg)
 {
     static const uint8_t ndef_aid[]   = {0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
@@ -445,14 +860,13 @@ static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_m
         PN5180_LOGD(TAG, "T4: ISO14443-4 is not active");
         return PN5180_NDEF_ERR_READ_FAILED;
     }
-    // A card that refuses these selects is alive but carries no NDEF application.
     if (!pn5180_14443_4_select_file(pn5180, ndef_aid, sizeof(ndef_aid))) {
         PN5180_LOGD(TAG, "T4: SELECT NDEF application failed");
-        return PN5180_NDEF_ERR_NO_NDEF;
+        return type4_select_failure_result(pn5180);
     }
     if (!pn5180_14443_4_select_file(pn5180, cc_file_id, sizeof(cc_file_id))) {
         PN5180_LOGD(TAG, "T4: SELECT capability container failed");
-        return PN5180_NDEF_ERR_NO_NDEF;
+        return type4_select_failure_result(pn5180);
     }
 
     uint8_t cc[15];
@@ -462,18 +876,32 @@ static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_m
         return PN5180_NDEF_ERR_READ_FAILED;
     }
 
+    uint16_t cc_len        = (uint16_t)(((uint16_t)cc[0] << 8) | cc[1]);
     uint16_t mle           = (uint16_t)(((uint16_t)cc[3] << 8) | cc[4]);
     uint8_t  ndef_fid[2]   = {cc[9], cc[10]};
     uint16_t max_ndef_size = (uint16_t)(((uint16_t)cc[11] << 8) | cc[12]);
-    if (cc[7] != 0x04 || cc[8] != 0x06 || max_ndef_size < 2) {
-        PN5180_LOGD(TAG, "T4: bad NDEF File Control TLV (T=%02X L=%02X)", cc[7], cc[8]);
-        return PN5180_NDEF_ERR_PARSE_FAILED;
-    }
-    // Mapping versions 1.x to 3.x share this capability container layout; a higher major version may not.
+    // Mapping versions 1.x to 3.x describe the NDEF file with the NDEF File Control TLV (04h) read
+    // here; a higher major version may not.
     uint8_t mapping_major = (uint8_t)(cc[2] >> 4);
     if (mapping_major < 1 || mapping_major > 3) {
         PN5180_LOGD(TAG, "T4: unsupported mapping version %02X", cc[2]);
         return PN5180_NDEF_ERR_UNSUPPORTED;
+    }
+    // A mapping 3.x tag may carry the Extended NDEF File Control TLV (06h) instead: 4-byte file
+    // size and NDEF length, for files above 32 KB.
+    if (cc[7] == 0x06) {
+        PN5180_LOGD(TAG, "T4: extended NDEF file is not supported");
+        return PN5180_NDEF_ERR_UNSUPPORTED;
+    }
+    // The capability container is at least 15 bytes long, MLe at least 15, the NDEF file between
+    // 5 and 7FFFh bytes, and it cannot have the identifier of another file or a reserved one.
+    uint16_t ndef_fid_value = (uint16_t)(((uint16_t)ndef_fid[0] << 8) | ndef_fid[1]);
+    bool     fid_reserved   = ndef_fid_value == 0x0000 || ndef_fid_value == 0xE102 || ndef_fid_value == 0xE103 || ndef_fid_value == 0x3F00 ||
+                              ndef_fid_value == 0x3FFF || ndef_fid_value == 0xFFFF;
+    if (cc[7] != 0x04 || cc[8] != 0x06 || cc_len < 15 || cc_len > 0x7FFF || mle < 15 || max_ndef_size < 5 || max_ndef_size > 0x7FFF || fid_reserved) {
+        PN5180_LOGD(TAG, "T4: bad capability container (CCLEN=%u MLe=%u T=%02X L=%02X file %04X size %u)", cc_len, mle, cc[7], cc[8], ndef_fid_value,
+                    max_ndef_size);
+        return PN5180_NDEF_ERR_PARSE_FAILED;
     }
     // Read access 00h means free access; anything else needs a security setup this driver does not do.
     if (cc[13] != 0x00) {
@@ -483,11 +911,11 @@ static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_m
     // Chunk size: MLe counts data bytes only, so Le = MLe is legal; two bytes of headroom are kept for
     // cards that size MLe to their whole response buffer. Le is one byte and READ BINARY uses a
     // 260-byte buffer, so 248 data bytes is the ceiling.
-    uint16_t chunk_max = (mle <= 2 || mle > 250) ? 248u : (uint16_t)(mle - 2u);
+    uint16_t chunk_max = (mle > 250) ? 248u : (uint16_t)(mle - 2u);
 
     if (!pn5180_14443_4_select_file(pn5180, ndef_fid, sizeof(ndef_fid))) {
         PN5180_LOGD(TAG, "T4: SELECT NDEF file %02X%02X failed", ndef_fid[0], ndef_fid[1]);
-        return PN5180_NDEF_ERR_NO_NDEF;
+        return type4_select_failure_result(pn5180);
     }
 
     uint8_t nlen_buf[2];
@@ -524,78 +952,6 @@ static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_m
     pn5180_ndef_result_t parse_result = pn5180_ndef_parse_message(raw, nlen, out_msg);
     free(raw);
     return parse_result;
-}
-
-/* ---- Type 5: ISO15693 ---- */
-
-/*
- * Type 5 Tag NDEF mapping: the capability container starts at block 0.
- *   [0] magic: E1 (blocks addressed with one byte) or E2 (two bytes)
- *   [1] version and access conditions
- *   [2] MLEN: size of the data area after the CC in units of 8 bytes; 0 means that an
- *       8-byte CC is used and the size is in bytes 6..7
- *   [3] feature flags
- * TLVs follow directly after the capability container.
- */
-static pn5180_ndef_result_t type5_read_ndef(pn5180_proto_t *proto, pn5180_uid_t *uid, pn5180_ndef_message_parsed_t **out_msg)
-{
-    size_t block_size = (uid->block_size > 0) ? (size_t)uid->block_size : 4u;
-    if (block_size > 32u) {
-        return PN5180_NDEF_ERR_UNSUPPORTED;
-    }
-
-    ndef_stream_t stream      = {0};
-    size_t        cc_len      = 4;
-    size_t        total_bytes = 8; // enough to hold either form of the CC; replaced once the CC is known
-    bool          cc_known    = false;
-    size_t        tlv_pos     = 0;
-    size_t        ndef_offset = 0;
-    size_t        ndef_len    = 0;
-    bool          read_ok     = true;
-    bool          no_memory   = false;
-    tlv_scan_t    scan        = TLV_SCAN_MORE;
-
-    for (int block = 0; scan == TLV_SCAN_MORE && (size_t)block * block_size < total_bytes; block++) {
-        if (uid->blocks_count > 0 && block >= uid->blocks_count) {
-            break;
-        }
-        uint8_t data[32];
-        if (!proto->block_read(proto, block, data, block_size)) {
-            read_ok = false;
-            break;
-        }
-        if (!stream_append(&stream, data, block_size)) {
-            no_memory = true;
-            break;
-        }
-
-        if (!cc_known) {
-            if (stream.len < 4) {
-                continue;
-            }
-            if (stream.data[0] != 0xE1 && stream.data[0] != 0xE2) {
-                PN5180_LOGD(TAG, "T5: no capability container (block 0 starts with %02X)", stream.data[0]);
-                break;
-            }
-            size_t mlen = stream.data[2];
-            if (mlen == 0) {
-                if (stream.len < 8) {
-                    continue;
-                }
-                cc_len = 8;
-                mlen   = ((size_t)stream.data[6] << 8) | stream.data[7];
-            }
-            if (mlen == 0) {
-                break;
-            }
-            total_bytes = cc_len + mlen * 8u;
-            tlv_pos     = cc_len;
-            cc_known    = true;
-        }
-        scan = stream_scan(&stream, &tlv_pos, &ndef_offset, &ndef_len);
-    }
-
-    return stream_finish(&stream, cc_known && scan == TLV_SCAN_FOUND, read_ok, no_memory, ndef_offset, ndef_len, out_msg);
 }
 
 /* ---- Dispatcher ---- */
@@ -671,4 +1027,24 @@ pn5180_ndef_result_t pn5180_ndef_read_card_auto(pn5180_proto_t *proto, pn5180_ui
         result = ndef_read_mapping(mapping, proto, uid, out_msg);
     }
     return result;
+}
+
+/* ---- Writing ---- */
+
+pn5180_ndef_result_t pn5180_ndef_write_card_auto(pn5180_proto_t *proto, const pn5180_uid_t *uid, const pn5180_ndef_message_t *msg)
+{
+    if (proto == NULL || proto->block_read == NULL || proto->block_write == NULL || uid == NULL || msg == NULL) {
+        return PN5180_NDEF_ERR_INVALID_PARAM;
+    }
+
+    // MIFARE Classic and Type 4 are not written: a Classic message has to go around the sector
+    // trailers and through the MAD, a Type 4 message into the NDEF file.
+    switch (ndef_mapping_for(uid->subtype)) {
+    case NDEF_MAPPING_TYPE2:
+        return type2_write_ndef(proto, uid, msg);
+    case NDEF_MAPPING_TYPE5:
+        return type5_write_ndef(proto, uid, msg);
+    default:
+        return PN5180_NDEF_ERR_UNSUPPORTED;
+    }
 }
