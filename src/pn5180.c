@@ -28,12 +28,12 @@
 #define MFC_AUTH_TIMEOUT (0x32) // MIFARE Classic authentication timeout
 
 #define LPCD_REFERENCE_VALUE (0x34) // LPCD Gear number
-#define LPCD_FIELD_ON_TIME   (0x36) // LPCD RF on time (μs) = 62 + (8 * LPCD_FIELD_ON_TIME)
-// LPCD wakes up if current AGC > AGC reference + LCPD_THRESHOLD (03..08: very sensitive, 40..50: very robust)
+#define LPCD_FIELD_ON_TIME   (0x36) // LPCD RF on time (μs) = 8 * LPCD_FIELD_ON_TIME
+// LPCD wakes up if |current AGC - AGC reference| > LPCD_THRESHOLD (03..08: very sensitive, 40..50: very robust)
 #define LPCD_THRESHOLD_LEVEL            (0x37)
 #define LPCD_REFVAL_GPO_CONTROL         (0x38) // LPCD Reference Value Selection and GPO control
-#define LPCD_GPO_TOGGLE_BEFORE_FIELD_ON (0x39) //
-#define LPCD_GPO_TOGGLE_AFTER_FIELD_ON  (0x3A) //
+#define LPCD_GPO_TOGGLE_BEFORE_FIELD_ON (0x39) // time from GPO set to field on, 5 μs steps
+#define LPCD_GPO_TOGGLE_AFTER_FIELD_OFF (0x3A) // time from field off to GPO clear, 5 μs steps
 
 static const char TAG[] = "PN5180";
 
@@ -161,6 +161,14 @@ static bool inline wait_busy_level(pn5180_t *pn5180, int level, const char *time
     return true;
 }
 
+// Frees only what pn5180_init() allocated; the SPI structure stays with the caller.
+static void pn5180_free(pn5180_t *pn5180)
+{
+    free(pn5180->send_buf);
+    free(pn5180->recv_buf);
+    free(pn5180);
+}
+
 pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_num_t rst)
 {
     pn5180_t *ret = (pn5180_t *)calloc(1, sizeof(pn5180_t));
@@ -198,24 +206,24 @@ pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_n
     pn5180_delay_ms(100);
     if (!pn5180_reset(ret)) {
         ESP_LOGE(TAG, "Failed to reset PN5180 during init");
-        pn5180_deinit(ret, false);
+        pn5180_free(ret);
         return NULL;
     }
     uint16_t firmware_version = 0;
     if (!pn5180_read_firmware_version(ret, &firmware_version)) {
         ESP_LOGE(TAG, "Failed to read PN5180 firmware version");
-        pn5180_deinit(ret, false);
+        pn5180_free(ret);
         return NULL;
     }
     if (firmware_version < PN5180_MIN_FIRMWARE_VERSION) {
         ESP_LOGE(TAG, "Unsupported PN5180 firmware version 0x%04X", firmware_version);
-        pn5180_deinit(ret, false);
+        pn5180_free(ret);
         return NULL;
     }
 
     uint8_t auth_timeout[2];
     if (!pn5180_readEEprom(ret, MFC_AUTH_TIMEOUT, auth_timeout, sizeof(auth_timeout))) {
-        ESP_LOGW(TAG, "Failed to set MFC_AUTH_TIMEOUT to maximum");
+        ESP_LOGW(TAG, "Failed to read MFC_AUTH_TIMEOUT");
     } else {
         PN5180_LOGD(TAG, "PN5180 firmware version: 0x%04X", firmware_version);
         PN5180_LOGD(TAG, "Current MFC_AUTH_TIMEOUT: 0x%02X 0x%02X", auth_timeout[0], auth_timeout[1]);
@@ -429,7 +437,7 @@ pn5180_transceive_state_t pn5180_getTransceiveState(pn5180_t *pn5180)
     uint32_t status;
     if (!pn5180_readRegister(pn5180, RF_STATUS, &status)) {
         ESP_LOGE(TAG, "Failed to read RF_STATUS register");
-        return PN5180_TS_Idle;
+        return PN5180_TS_RESERVED;
     }
     uint8_t state = ((status >> 24) & 0x07);
     return (pn5180_transceive_state_t)state;
@@ -537,9 +545,7 @@ void pn5180_deinit(pn5180_t *pn5180, bool free_spi_bus)
             spi_bus_free(pn5180->spi->host_id);
         }
         free(pn5180->spi);
-        free(pn5180->send_buf);
-        free(pn5180->recv_buf);
-        free(pn5180);
+        pn5180_free(pn5180);
     }
 }
 
@@ -551,7 +557,7 @@ bool pn5180_prepareLPCD(pn5180_t *pn5180)
     data[0]         = fieldOn;
     if (pn5180_writeEEprom(pn5180, LPCD_FIELD_ON_TIME, data, 1) && pn5180_readEEprom(pn5180, LPCD_FIELD_ON_TIME, response, 1)) {
         fieldOn = response[0];
-        PN5180_LOGD(TAG, "LPCD Field On Time set to %d us", 62 + (fieldOn * 8));
+        PN5180_LOGD(TAG, "LPCD Field On Time set to %d us", fieldOn * 8);
     } else {
         ESP_LOGE(TAG, "Failed to set LPCD Field On Time");
         return false;
@@ -563,13 +569,6 @@ bool pn5180_prepareLPCD(pn5180_t *pn5180)
         PN5180_LOGD(TAG, "LPCD Threshold Level set to %d", threshold);
     } else {
         ESP_LOGE(TAG, "Failed to set LPCD Threshold Level");
-        return false;
-    }
-    if (pn5180_readEEprom(pn5180, LPCD_THRESHOLD_LEVEL, response, 1)) {
-        threshold = response[0];
-        PN5180_LOGD(TAG, "LPCD Threshold Level set to %d", threshold);
-    } else {
-        ESP_LOGE(TAG, "Failed to read back LPCD Threshold Level");
         return false;
     }
     uint8_t lpcdMode = 0x01;
@@ -590,13 +589,13 @@ bool pn5180_prepareLPCD(pn5180_t *pn5180)
         ESP_LOGE(TAG, "Failed to set LPCD GPO Toggle Before Field On");
         return false;
     }
-    uint8_t afterFieldOn = 0xF0;
-    data[0]              = afterFieldOn;
-    if (pn5180_writeEEprom(pn5180, LPCD_GPO_TOGGLE_AFTER_FIELD_ON, data, 1) && pn5180_readEEprom(pn5180, LPCD_GPO_TOGGLE_AFTER_FIELD_ON, response, 1)) {
-        afterFieldOn = response[0];
-        PN5180_LOGD(TAG, "LPCD GPO Toggle After Field On set to 0x%02X", afterFieldOn);
+    uint8_t afterFieldOff = 0xF0;
+    data[0]               = afterFieldOff;
+    if (pn5180_writeEEprom(pn5180, LPCD_GPO_TOGGLE_AFTER_FIELD_OFF, data, 1) && pn5180_readEEprom(pn5180, LPCD_GPO_TOGGLE_AFTER_FIELD_OFF, response, 1)) {
+        afterFieldOff = response[0];
+        PN5180_LOGD(TAG, "LPCD GPO Toggle After Field Off set to 0x%02X", afterFieldOff);
     } else {
-        ESP_LOGE(TAG, "Failed to set LPCD GPO Toggle After Field On");
+        ESP_LOGE(TAG, "Failed to set LPCD GPO Toggle After Field Off");
         return false;
     }
     return true;

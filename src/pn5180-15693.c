@@ -36,6 +36,7 @@ static bool pn5180_iso15693_check_response(const char *operation, const uint8_t 
 #define ISO15693_CMD_INVENTORY        0x01
 #define ISO15693_CMD_STAY_QUIET       0x02
 #define ISO15693_CMD_SELECT           0x25
+#define ISO15693_CMD_RESET_TO_READY   0x26
 #define ISO15693_CMD_READ_SINGLE      0x20
 #define ISO15693_CMD_WRITE_SINGLE     0x21
 #define ISO15693_CMD_READ_SINGLE_EXT  0x23
@@ -337,7 +338,7 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, nfc_uids_array_
         }
 
         // No collision, check data
-        if (num_bytes >= 10) {
+        if (num_bytes >= 10 && num_bytes <= 16) {
             uint8_t rx_buf[16];
             if (pn5180_readData(pn5180, num_bytes, rx_buf)) {
                 // rx_buf[1]=DSFID, [2..9]=UID
@@ -382,10 +383,16 @@ static bool pn5180_iso15693_stay_quiet(pn5180_t *pn5180, uint8_t *uid)
         PN5180_LOGD(TAG, "stay_quiet: build failed");
         return false;
     }
-    bool ret = pn5180_sendData(pn5180, quiet_cmd, cmd_len, 0);
-    PN5180_LOGD(TAG, "stay_quiet: result=%d", ret);
-    pn5180_delay_ms(1);
-    return ret;
+    if (!pn5180_sendData(pn5180, quiet_cmd, cmd_len, 0)) {
+        PN5180_LOGD(TAG, "stay_quiet: send failed");
+        return false;
+    }
+    // Stay Quiet has no response: the frame is done once the transmission has ended.
+    uint32_t irq_status = 0;
+    if (!pn5180_wait_for_irq(pn5180, TX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "ISO15693 Stay Quiet", &irq_status)) {
+        return false;
+    }
+    return (irq_status & GENERAL_ERROR_IRQ_STAT) == 0;
 }
 
 static bool pn5180_iso15693_select_by_uid( //
@@ -433,7 +440,8 @@ static bool _pn5180_15693_select_by_uid(pn5180_proto_t *proto, nfc_uid_t *uid)
     return pn5180_iso15693_select_by_uid(proto->pn5180, uid);
 }
 
-// ISO15693 halt: Stay Quiet on the currently selected tag (no UID in frame).
+// ISO15693 halt: Reset to Ready in Select mode, which returns the selected tag to the Ready state.
+// Stay Quiet cannot be used here: it is only valid in Addressed mode and the UID is not known at this point.
 static bool pn5180_iso15693_halt(pn5180_t *pn5180)
 {
     if (pn5180 == NULL) {
@@ -442,27 +450,22 @@ static bool pn5180_iso15693_halt(pn5180_t *pn5180)
     }
     uint8_t halt_cmd[2];
     halt_cmd[0] = ISO15693_FLAG_SELECTED | ISO15693_FLAG_DATA_RATE_HIGH;
-    halt_cmd[1] = ISO15693_CMD_STAY_QUIET;
+    halt_cmd[1] = ISO15693_CMD_RESET_TO_READY;
 
-    PN5180_LOGD(TAG, "halt: sending Stay Quiet (selected)");
-    bool ret = pn5180_sendData(pn5180, halt_cmd, sizeof(halt_cmd), 0);
-    if (!ret) {
+    PN5180_LOGD(TAG, "halt: sending Reset to Ready (selected)");
+    if (!pn5180_sendData(pn5180, halt_cmd, sizeof(halt_cmd), 0)) {
         PN5180_LOGD(TAG, "halt: send failed");
         return false;
     }
 
-    uint32_t irq_status = 0;
-    uint32_t mask       = TX_IRQ_STAT | IDLE_IRQ_STAT | GENERAL_ERROR_IRQ_STAT;
-    ret                 = pn5180_wait_for_irq(pn5180, mask, "ISO15693 Stay Quiet", &irq_status);
-    if (!ret) {
-        ESP_LOGE(TAG, "halt: timeout waiting for Stay Quiet TX");
+    uint16_t num_bytes = 0;
+    uint8_t  rx_buf[8];
+    if (!pn5180_wait_read_rx(pn5180, RX_IRQ_STAT | TIMER2_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "ISO15693 Reset to Ready", rx_buf, sizeof(rx_buf), &num_bytes,
+                             NULL)) {
+        PN5180_LOGD(TAG, "halt: wait/read failed");
         return false;
     }
-    if (irq_status & GENERAL_ERROR_IRQ_STAT) {
-        ESP_LOGE(TAG, "halt: general error during Stay Quiet");
-        return false;
-    }
-    return true;
+    return pn5180_iso15693_check_response("halt", rx_buf, num_bytes);
 }
 
 static bool _pn5180_15693_halt(pn5180_proto_t *proto)

@@ -17,6 +17,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** @brief Enable debug logging for PN5180 component (comment out to disable) */
 // #define PN5180_DEBUG
 
@@ -53,3 +57,7 @@ bool pn5180_wait_read_rx(     //
     uint16_t   *out_len,      //
     uint32_t   *out_rx_status //
 );
+
+#ifdef __cplusplus
+}
+#endif

@@ -2,6 +2,10 @@
 #include "pn5180.h"
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** @brief Supported RF configurations for ISO15693 */
 typedef enum
 {
@@ -16,3 +20,7 @@ typedef enum
  * @return Protocol interface for ISO15693 operations
  */
 pn5180_proto_t *pn5180_15693_init(pn5180_t *pn5180, pn5180_15693_rf_config_t rf_config);
+
+#ifdef __cplusplus
+}
+#endif

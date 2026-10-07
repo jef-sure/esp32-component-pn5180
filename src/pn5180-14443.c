@@ -372,6 +372,11 @@ static bool pn5180_14443_sendREQA(pn5180_t *pn5180, uint8_t *atqa)
     }
 
     uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
+    if (rxLen > 2) {
+        ESP_LOGE(TAG, "ATQA has invalid length %" PRIu16, rxLen);
+        pn5180_clearAllIRQs(pn5180);
+        return false;
+    }
     if (rxLen > 0) {
         if (!pn5180_readData(pn5180, rxLen, atqa)) {
             ESP_LOGE(TAG, "Failed to read ATQA from FIFO");
@@ -413,6 +418,11 @@ static bool pn5180_14443_sendWUPA(pn5180_t *pn5180, uint8_t *atqa)
 
     // Read ATQA (2 bytes)
     uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
+    if (rxLen > 2) {
+        ESP_LOGE(TAG, "ATQA has invalid length %" PRIu16, rxLen);
+        pn5180_clearAllIRQs(pn5180);
+        return false;
+    }
     if (rxLen > 0) {
         if (!pn5180_readData(pn5180, rxLen, atqa)) {
             ESP_LOGE(TAG, "Failed to read ATQA from FIFO");
@@ -846,7 +856,7 @@ static bool pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, nfc_type_t 
         *blocks_count = 135;
         break;
     case 0x13: // NTAG216 924 bytes total (231 pages)
-        PN5180_LOGD(TAG, "Detected NTAG215 (924 bytes total, 231 pages)");
+        PN5180_LOGD(TAG, "Detected NTAG216 (924 bytes total, 231 pages)");
         *subtype      = PN5180_MIFARE_NTAG216;
         *blocks_count = 231;
         break;
@@ -886,6 +896,11 @@ static bool pn5180_14443_sendRATS(pn5180_t *pn5180)
 
     uint8_t  ats[64];
     uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
+    if (rxLen > sizeof(ats)) {
+        ESP_LOGE(TAG, "ATS too long (%" PRIu16 " bytes)", rxLen);
+        pn5180_clearAllIRQs(pn5180);
+        return false;
+    }
     if (rxLen > 0) {
         if (!pn5180_readData(pn5180, rxLen, ats)) {
             return false;
@@ -1229,22 +1244,31 @@ static bool _pn5180_14443_detect_card_type_and_capacity( //
         pn5180_14443_detect_desfire_capacity(pn5180, blocks_count);
         break;
     case 0x28:
-        PN5180_LOGD(TAG, "Detected MIFARE Plus 4K");
+        PN5180_LOGD(TAG, "Detected MIFARE Classic 1K emulation on an ISO 14443-4 card");
         uid->subtype  = PN5180_MIFARE_CLASSIC_1K; // Emulated 1K
         *blocks_count = 64;
         *block_size   = 16;
         break;
     case 0x38:
-        PN5180_LOGD(TAG, "Detected MIFARE Plus 4K");
+        PN5180_LOGD(TAG, "Detected MIFARE Classic 4K emulation on an ISO 14443-4 card");
         uid->subtype  = PN5180_MIFARE_CLASSIC_4K; // Emulated 4K
         *blocks_count = 256;
         *block_size   = 16;
         break;
     default:
-        PN5180_LOGD(TAG, "Unknown or unsupported MIFARE type (SAK: 0x%02X), defaulting to Classic 1K", uid->sak);
-        uid->subtype  = PN5180_MIFARE_CLASSIC_1K;
-        *blocks_count = 64;
-        *block_size   = 16;
+        if (uid->sak & 0x20) {
+            // SAK bit 6: ISO 14443-4 compliant, whatever the other bits say (e.g. 0x60 with NFC-DEP)
+            PN5180_LOGD(TAG, "Detected ISO 14443-4 card (SAK: 0x%02X)", uid->sak);
+            uid->subtype  = PN5180_MIFARE_DESFIRE;
+            *block_size   = 1;
+            *blocks_count = 0;
+            pn5180_14443_detect_desfire_capacity(pn5180, blocks_count);
+        } else {
+            PN5180_LOGD(TAG, "Unknown or unsupported MIFARE type (SAK: 0x%02X)", uid->sak);
+            uid->subtype  = PN5180_MIFARE_UNKNOWN;
+            *blocks_count = 0;
+            *block_size   = 0;
+        }
         break;
     }
     uid->blocks_count = *blocks_count;

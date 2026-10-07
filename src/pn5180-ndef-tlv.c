@@ -23,7 +23,7 @@ static size_t tlv_parse_length(const uint8_t *data, size_t data_len, size_t offs
     return data[offset];
 }
 
-bool ndef_tlv_find_ndef(const uint8_t *data, size_t data_len, size_t *search_pos, size_t *ndef_offset, size_t *ndef_length)
+bool pn5180_ndef_tlv_find_ndef(const uint8_t *data, size_t data_len, size_t *search_pos, size_t *ndef_offset, size_t *ndef_length)
 {
     size_t i = *search_pos;
     while (i < data_len) {

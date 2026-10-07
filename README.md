@@ -8,8 +8,8 @@ ESP-IDF component for the NXP PN5180 NFC/RFID reader. This implementation provid
 - ✅ **ISO14443A** - Anticollision, multi-cascade UID enumeration, card selection
 - ✅ **ISO15693** - Vicinity tag support with configurable modulation (ASK 100%/10%)
 - ✅ **MIFARE Classic 1K/4K** - Authentication (Key A/B), block read/write
-- ✅ **MIFARE Ultralight** - Read-only support
-- ✅ **NDEF** - Complete message parsing with TLV decoding, Text RTD, URI RTD support
+- ✅ **MIFARE Ultralight / NTAG21x** - Page read and write (no authentication)
+- ✅ **NDEF** - Message reading and writing with TLV decoding, Text RTD, URI RTD support (`pn5180_ndef_*` API)
 - ✅ **Multi-card** - Enumerate up to 14 cards in field
 - ✅ **Error detection** - RX/CRC/collision error handling with clean recovery
 - ✅ **SPI** - Tested at 7 MHz with BUSY line synchronization
@@ -32,7 +32,7 @@ Default wiring for a classic ESP32 board:
 | NSS    | 5          | SPI chip select (active low) |
 | BUSY   | 21         | PN5180 busy indicator |
 
-Uses `VSPI_HOST` in the example source.
+Uses `SPI3_HOST` in the example source.
 
 ### `examples/app_logic`
 
@@ -62,7 +62,7 @@ Adjust the GPIO assignments and SPI host to match your board.
 1. Add the component with the ESP-IDF Component Manager:
 
 ```bash
-idf.py add-dependency "jef-sure/esp32-component-pn5180^0.1.1"
+idf.py add-dependency "jef-sure/esp32-component-pn5180^0.2.0"
 ```
 
 2. Or place this repository under your project's `components/` directory.
@@ -70,8 +70,8 @@ idf.py add-dependency "jef-sure/esp32-component-pn5180^0.1.1"
    - `pn5180.h` - Core driver and shared types
    - `pn5180-14443.h` - ISO14443A protocol (MIFARE, NTAG, etc.)
    - `pn5180-15693.h` - ISO15693 protocol (vicinity tags)
-   - `pn5180-ndef.h` - NDEF message reading and parsing
-   - `pn5180-mifare.h` - MIFARE Classic authentication helpers
+   - `pn5180-ndef.h` - NDEF message reading, writing and parsing
+   - `pn5180-mifare.h` - MIFARE Classic block and Ultralight/NTAG page read/write helpers
 4. Build and flash with `idf.py build flash monitor`.
 
 ## Examples
@@ -136,7 +136,7 @@ enum {
 
 void app_main(void)
 {
-    pn5180_spi_t *spi = pn5180_spi_init(VSPI_HOST, PN5180_SCK, PN5180_MISO, PN5180_MOSI, PN5180_FREQ);
+    pn5180_spi_t *spi = pn5180_spi_init(SPI3_HOST, PN5180_SCK, PN5180_MISO, PN5180_MOSI, PN5180_FREQ);
     pn5180_t *pn5180  = pn5180_init(spi, PN5180_NSS, PN5180_BUSY, PN5180_RST);
 
     pn5180_proto_t *iso14443 = pn5180_14443_init(pn5180);
@@ -221,6 +221,8 @@ void read_iso15693_tags(pn5180_t *pn5180)
 
 ### NDEF Message Reading
 
+All NDEF functions and types are prefixed with `pn5180_ndef_`, constants with `PN5180_NDEF_` (since 0.2.0; earlier versions used `ndef_` / `NDEF_`).
+
 ```c
 #include "pn5180-ndef.h"
 
@@ -232,35 +234,35 @@ void read_ndef_message(pn5180_proto_t *proto)
     int start_block = 4;   // Adjust based on card type
     int block_size  = 16;  // 16 for MIFARE, 4 for ISO15693
 
-    ndef_message_parsed_t *msg = NULL;
+    pn5180_ndef_message_parsed_t *msg = NULL;
     // auth_cb + sector_cb are optional (NULL if not needed)
-    ndef_result_t result = ndef_read_from_selected_card(proto, start_block, block_size, 0,
+    pn5180_ndef_result_t result = pn5180_ndef_read_from_selected_card(proto, start_block, block_size, 0,
                                                         NULL, NULL, NULL, &msg);
 
-    if (result != NDEF_OK || !msg) {
-        ESP_LOGE(TAG, "NDEF read failed: %s", ndef_result_to_string(result));
+    if (result != PN5180_NDEF_OK || !msg) {
+        ESP_LOGE(TAG, "NDEF read failed: %s", pn5180_ndef_result_to_string(result));
         return;
     }
 
     ESP_LOGI(TAG, "Found %zu NDEF records", msg->record_count);
 
     for (size_t i = 0; i < msg->record_count; i++) {
-        ndef_record_t *rec = &msg->records[i];
+        pn5180_ndef_record_t *rec = &msg->records[i];
         ESP_LOGI(TAG, "Record %zu: TNF=0x%02X, Type len=%u, Payload len=%u",
                  i, rec->tnf, rec->type_len, rec->payload_len);
 
         // Check for URI record
-        if (rec->tnf == NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'U') {
+        if (rec->tnf == PN5180_NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'U') {
             // Decode URI - first byte is prefix code
             ESP_LOGI(TAG, "  URI record found");
         }
         // Check for Text record
-        else if (rec->tnf == NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'T') {
+        else if (rec->tnf == PN5180_NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'T') {
             ESP_LOGI(TAG, "  Text record found");
         }
     }
 
-    ndef_free_parsed_message(msg);
+    pn5180_ndef_free_parsed_message(msg);
 }
 ```
 
@@ -313,7 +315,15 @@ void read_ndef_message(pn5180_proto_t *proto)
 
 - **RF field control**: Toggle RF off/on between scans (`pn5180_setRF_off()` / `pn5180_setRF_on()`) and allow 5.1 ms for tags to return to IDLE.
 
-- **Initialization checks**: `pn5180_init()` validates the detected firmware version and fails early if the reader does not meet the minimum supported revision.
+- **Initialization checks**: `pn5180_init()` validates the detected firmware version and fails early if the reader does not meet the minimum supported revision. On failure the `pn5180_spi_t` passed in is left untouched, so `pn5180_init()` can be retried with it.
+
+- **Block writes**: `block_write()` with a 4-byte buffer writes one Ultralight/NTAG page (WRITE, 0xA2); a 16-byte buffer writes one MIFARE Classic block.
+
+- **Card type detection**: a card with an unrecognised SAK is reported as `PN5180_MIFARE_UNKNOWN` with zero blocks; any SAK with the ISO 14443-4 bit (0x20) set is handled as an ISO-DEP card.
+
+- **Halt**: for ISO14443A `halt()` sends HLTA; for ISO15693 it sends Reset to Ready in Select mode, which returns the selected tag to the Ready state. Reset to Ready is an optional ISO15693 command, so `halt()` returns false on tags that do not implement it.
+
+- **NDEF URI prefixes**: abbreviation codes follow NFC Forum URI RTD 1.0. Versions before 0.2.0 used non-standard prefixes for codes 0x0B and above, so tags written by them with such a prefix decode differently now.
 
 - **UID enumeration**: `get_all_uids()` returns a heap-allocated array (max 14 cards). Always free after use; returns NULL if no cards detected.
 

@@ -7,11 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-const uint8_t NDEF_RTD_TEXT[]        = {'T'};
-const uint8_t NDEF_RTD_URI[]         = {'U'};
-const uint8_t NDEF_RTD_SMARTPOSTER[] = {'S', 'p'};
+const uint8_t PN5180_NDEF_RTD_TEXT[]        = {'T'};
+const uint8_t PN5180_NDEF_RTD_URI[]         = {'U'};
+const uint8_t PN5180_NDEF_RTD_SMARTPOSTER[] = {'S', 'p'};
 
-// NFC Forum URI Prefix Code table; index must match the encoded prefix code values.
+// NFC Forum URI RTD 1.0, table 3: URI identifier codes; index must match the encoded prefix code values.
 static const char *const uri_prefix_table[] = {
     "",                           // 0x00 - no prefix
     "http://www.",                // 0x01
@@ -24,58 +24,38 @@ static const char *const uri_prefix_table[] = {
     "ftp://ftp.",                 // 0x08
     "ftps://",                    // 0x09
     "sftp://",                    // 0x0A
-    "smsto:",                     // 0x0B
-    "sms:",                       // 0x0C
-    "mms:",                       // 0x0D
-    "mmsto:",                     // 0x0E
-    "_ndef/_rtd_",                // 0x0F (reserved)
-    "_ndef/_urn_",                // 0x10 (reserved)
-    "_ndef/_pop_",                // 0x11 (reserved)
-    "_ndef/_sip_",                // 0x12 (reserved)
-    "geo:",                       // 0x13
-    "magnet:?",                   // 0x14
-    "urn:",                       // 0x15
-    "urn:epc:id:",                // 0x16
-    "urn:epc:tag:",               // 0x17
-    "urn:epc:pat:",               // 0x18
-    "urn:epc:raw:",               // 0x19
-    "urn:epc:",                   // 0x1A
-    "urn:nfc:",                   // 0x1B
+    "smb://",                     // 0x0B
+    "nfs://",                     // 0x0C
+    "ftp://",                     // 0x0D
+    "dav://",                     // 0x0E
+    "news:",                      // 0x0F
+    "telnet://",                  // 0x10
+    "imap:",                      // 0x11
+    "rtsp://",                    // 0x12
+    "urn:",                       // 0x13
+    "pop:",                       // 0x14
+    "sip:",                       // 0x15
+    "sips:",                      // 0x16
+    "tftp:",                      // 0x17
+    "btspp://",                   // 0x18
+    "btl2cap://",                 // 0x19
+    "btgoep://",                  // 0x1A
+    "tcpobex://",                 // 0x1B
+    "irdaobex://",                // 0x1C
+    "file://",                    // 0x1D
+    "urn:epc:id:",                // 0x1E
+    "urn:epc:tag:",               // 0x1F
+    "urn:epc:pat:",               // 0x20
+    "urn:epc:raw:",               // 0x21
+    "urn:epc:",                   // 0x22
+    "urn:nfc:",                   // 0x23
 };
 
 #define URI_PREFIX_COUNT (sizeof(uri_prefix_table) / sizeof(uri_prefix_table[0]))
 #define TLV_NDEF         0x03
 #define TLV_TERMINATOR   0xFE
 
-// Prefixes sorted by length to ensure longest-prefix match during encoding.
-typedef struct
-{
-    uint8_t code;
-    uint8_t len;
-} uri_encode_order_entry_t;
-
-static const uri_encode_order_entry_t uri_encode_order[] = {
-    {0x07, 26},
-    {0x02, 12},
-    {0x01, 11},
-    {0x08, 9 },
-    {0x04, 8 },
-    {0x09, 7 },
-    {0x0A, 7 },
-    {0x06, 7 },
-    {0x14, 8 },
-    {0x03, 7 },
-    {0x0B, 6 },
-    {0x0E, 6 },
-    {0x05, 4 },
-    {0x0C, 4 },
-    {0x0D, 4 },
-    {0x13, 4 },
-    {0x15, 4 },
-};
-#define URI_ENCODE_ORDER_COUNT (sizeof(uri_encode_order) / sizeof(uri_encode_order[0]))
-
-void ndef_message_init(ndef_message_t *msg, ndef_record_t *records, size_t capacity)
+void pn5180_ndef_message_init(pn5180_ndef_message_t *msg, pn5180_ndef_record_t *records, size_t capacity)
 {
     if (!msg) return;
     msg->records      = records;
@@ -83,7 +63,7 @@ void ndef_message_init(ndef_message_t *msg, ndef_record_t *records, size_t capac
     msg->capacity     = capacity;
 }
 
-bool ndef_message_add(ndef_message_t *msg, const ndef_record_t *rec)
+bool pn5180_ndef_message_add(pn5180_ndef_message_t *msg, const pn5180_ndef_record_t *rec)
 {
     if (!msg || !rec || msg->record_count >= msg->capacity) return false;
     // Shallow copy: caller retains ownership of type/id/payload buffers.
@@ -91,7 +71,7 @@ bool ndef_message_add(ndef_message_t *msg, const ndef_record_t *rec)
     return true;
 }
 
-void ndef_record_init(ndef_record_t *rec, ndef_tnf_t tnf, const uint8_t *type, uint8_t type_len, const uint8_t *id, uint8_t id_len, const uint8_t *payload,
+void pn5180_ndef_record_init(pn5180_ndef_record_t *rec, pn5180_ndef_tnf_t tnf, const uint8_t *type, uint8_t type_len, const uint8_t *id, uint8_t id_len, const uint8_t *payload,
                       uint32_t payload_len)
 {
     if (!rec) return;
@@ -104,7 +84,7 @@ void ndef_record_init(ndef_record_t *rec, ndef_tnf_t tnf, const uint8_t *type, u
     rec->payload     = payload;
 }
 
-static size_t ndef_record_encoded_size(const ndef_record_t *rec, bool is_begin, bool is_end)
+static size_t pn5180_ndef_record_encoded_size(const pn5180_ndef_record_t *rec, bool is_begin, bool is_end)
 {
     if (!rec) return 0;
     bool short_record = rec->payload_len <= 255;
@@ -121,37 +101,37 @@ static size_t ndef_record_encoded_size(const ndef_record_t *rec, bool is_begin, 
     return size;
 }
 
-static uint8_t ndef_build_header_byte(const ndef_record_t *rec, bool is_begin, bool is_end)
+static uint8_t pn5180_ndef_build_header_byte(const pn5180_ndef_record_t *rec, bool is_begin, bool is_end)
 {
     uint8_t hdr = 0;
-    if (is_begin) hdr |= NDEF_MB;
-    if (is_end) hdr |= NDEF_ME;
+    if (is_begin) hdr |= PN5180_NDEF_MB;
+    if (is_end) hdr |= PN5180_NDEF_ME;
     // No chunking support in this simple encoder
-    if (rec->payload_len <= 255) hdr |= NDEF_SR;
-    if (rec->id_len > 0) hdr |= NDEF_IL;
-    hdr |= (uint8_t)(rec->tnf & NDEF_TNF_MASK);
+    if (rec->payload_len <= 255) hdr |= PN5180_NDEF_SR;
+    if (rec->id_len > 0) hdr |= PN5180_NDEF_IL;
+    hdr |= (uint8_t)(rec->tnf & PN5180_NDEF_TNF_MASK);
     return hdr;
 }
 
-size_t ndef_encode_message(const ndef_message_t *msg, uint8_t *out, size_t out_len)
+size_t pn5180_ndef_encode_message(const pn5180_ndef_message_t *msg, uint8_t *out, size_t out_len)
 {
     if (!msg || (!out && out_len > 0)) return 0;
     size_t required = 0;
     for (size_t i = 0; i < msg->record_count; ++i) {
-        const ndef_record_t *rec = &msg->records[i];
-        required += ndef_record_encoded_size(rec, i == 0, i == (msg->record_count - 1));
+        const pn5180_ndef_record_t *rec = &msg->records[i];
+        required += pn5180_ndef_record_encoded_size(rec, i == 0, i == (msg->record_count - 1));
     }
     if (!out || out_len == 0) return required;
     if (out_len < required) return 0;
 
     uint8_t *p = out;
     for (size_t i = 0; i < msg->record_count; ++i) {
-        const ndef_record_t *rec          = &msg->records[i];
+        const pn5180_ndef_record_t *rec          = &msg->records[i];
         bool                 is_begin     = (i == 0);
         bool                 is_end       = (i == (msg->record_count - 1));
         bool                 short_record = rec->payload_len <= 255;
 
-        *p++ = ndef_build_header_byte(rec, is_begin, is_end);
+        *p++ = pn5180_ndef_build_header_byte(rec, is_begin, is_end);
         *p++ = rec->type_len;
         if (short_record) {
             *p++ = (uint8_t)rec->payload_len;
@@ -181,22 +161,23 @@ size_t ndef_encode_message(const ndef_message_t *msg, uint8_t *out, size_t out_l
     return (size_t)(p - out);
 }
 
-static uint8_t ndef_uri_prefix_code(const char *uri, size_t *prefix_len)
+static uint8_t pn5180_ndef_uri_prefix_code(const char *uri, size_t *prefix_len)
 {
-    for (size_t i = 0; i < URI_ENCODE_ORDER_COUNT; ++i) {
-        uint8_t     code   = uri_encode_order[i].code;
-        const char *prefix = uri_prefix_table[code];
-        size_t      len    = uri_encode_order[i].len;
-        if (strncmp(uri, prefix, len) == 0) {
-            if (prefix_len) *prefix_len = len;
-            return code;
+    // Longest matching prefix wins (e.g. "https://www." over "https://").
+    uint8_t best_code = 0x00;
+    size_t  best_len  = 0;
+    for (size_t code = 1; code < URI_PREFIX_COUNT; ++code) {
+        size_t len = strlen(uri_prefix_table[code]);
+        if (len > best_len && strncmp(uri, uri_prefix_table[code], len) == 0) {
+            best_code = (uint8_t)code;
+            best_len  = len;
         }
     }
-    if (prefix_len) *prefix_len = 0;
-    return 0x00;
+    if (prefix_len) *prefix_len = best_len;
+    return best_code;
 }
 
-bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len, bool utf16, uint8_t *payload_buf,
+bool pn5180_ndef_make_text_record(pn5180_ndef_record_t *rec, const char *lang_code, const uint8_t *text, size_t text_len, bool utf16, uint8_t *payload_buf,
                            size_t payload_buf_len)
 {
     if (!rec || !text || !payload_buf) return false;
@@ -210,8 +191,8 @@ bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint
     if (lang_len && lang_code) memcpy(&payload_buf[1], lang_code, lang_len);
     if (text_len && text) memcpy(&payload_buf[1 + lang_len], text, text_len);
 
-    rec->tnf         = NDEF_TNF_WELL_KNOWN;
-    rec->type        = NDEF_RTD_TEXT;
+    rec->tnf         = PN5180_NDEF_TNF_WELL_KNOWN;
+    rec->type        = PN5180_NDEF_RTD_TEXT;
     rec->type_len    = 1;
     rec->id          = NULL;
     rec->id_len      = 0;
@@ -220,12 +201,12 @@ bool ndef_make_text_record(ndef_record_t *rec, const char *lang_code, const uint
     return true;
 }
 
-bool ndef_make_uri_record(ndef_record_t *rec, const char *uri, bool abbreviate, uint8_t *payload_buf, size_t payload_buf_len)
+bool pn5180_ndef_make_uri_record(pn5180_ndef_record_t *rec, const char *uri, bool abbreviate, uint8_t *payload_buf, size_t payload_buf_len)
 {
     if (!rec || !uri || !payload_buf) return false;
     size_t  uri_len       = strlen(uri);
     size_t  prefix_len    = 0;
-    uint8_t code          = abbreviate ? ndef_uri_prefix_code(uri, &prefix_len) : 0x00;
+    uint8_t code          = abbreviate ? pn5180_ndef_uri_prefix_code(uri, &prefix_len) : 0x00;
     size_t  remaining_len = uri_len - prefix_len;
     size_t  needed        = 1 + remaining_len;
     if (payload_buf_len < needed) return false;
@@ -233,8 +214,8 @@ bool ndef_make_uri_record(ndef_record_t *rec, const char *uri, bool abbreviate, 
     payload_buf[0] = code;
     memcpy(&payload_buf[1], uri + prefix_len, remaining_len);
 
-    rec->tnf         = NDEF_TNF_WELL_KNOWN;
-    rec->type        = NDEF_RTD_URI;
+    rec->tnf         = PN5180_NDEF_TNF_WELL_KNOWN;
+    rec->type        = PN5180_NDEF_RTD_URI;
     rec->type_len    = 1;
     rec->id          = NULL;
     rec->id_len      = 0;
@@ -243,7 +224,7 @@ bool ndef_make_uri_record(ndef_record_t *rec, const char *uri, bool abbreviate, 
     return true;
 }
 
-bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, ndef_record_t *out_rec, bool *is_begin, bool *is_end)
+bool pn5180_ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, pn5180_ndef_record_t *out_rec, bool *is_begin, bool *is_end)
 {
     if (!in || !offset || !out_rec) return false;
     // out_rec fields point into the input buffer; do not free or modify input until done.
@@ -251,11 +232,11 @@ bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, ndef_rec
 
     size_t     pos = *offset;
     uint8_t    hdr = in[pos++];
-    bool       mb  = (hdr & NDEF_MB) != 0;
-    bool       me  = (hdr & NDEF_ME) != 0;
-    bool       sr  = (hdr & NDEF_SR) != 0;
-    bool       il  = (hdr & NDEF_IL) != 0;
-    ndef_tnf_t tnf = (ndef_tnf_t)(hdr & NDEF_TNF_MASK);
+    bool       mb  = (hdr & PN5180_NDEF_MB) != 0;
+    bool       me  = (hdr & PN5180_NDEF_ME) != 0;
+    bool       sr  = (hdr & PN5180_NDEF_SR) != 0;
+    bool       il  = (hdr & PN5180_NDEF_IL) != 0;
+    pn5180_ndef_tnf_t tnf = (pn5180_ndef_tnf_t)(hdr & PN5180_NDEF_TNF_MASK);
 
     if (pos >= in_len) return false;
     uint8_t type_len = in[pos++];
@@ -265,7 +246,7 @@ bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, ndef_rec
         if (pos >= in_len) return false;
         payload_len = in[pos++];
     } else {
-        if (pos + 4 > in_len) return false;
+        if (in_len - pos < 4) return false;
         payload_len = ((uint32_t)in[pos] << 24) | ((uint32_t)in[pos + 1] << 16) | ((uint32_t)in[pos + 2] << 8) | ((uint32_t)in[pos + 3]);
         pos += 4;
     }
@@ -278,21 +259,21 @@ bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, ndef_rec
 
     const uint8_t *type_ptr = NULL;
     if (type_len > 0) {
-        if (pos + type_len > in_len) return false;
+        if (type_len > in_len - pos) return false;
         type_ptr = &in[pos];
         pos += type_len;
     }
 
     const uint8_t *id_ptr = NULL;
     if (id_len > 0) {
-        if (pos + id_len > in_len) return false;
+        if (id_len > in_len - pos) return false;
         id_ptr = &in[pos];
         pos += id_len;
     }
 
     const uint8_t *payload_ptr = NULL;
     if (payload_len > 0) {
-        if (pos + payload_len > in_len) return false;
+        if (payload_len > in_len - pos) return false;
         payload_ptr = &in[pos];
         pos += payload_len;
     }
@@ -312,14 +293,14 @@ bool ndef_decode_next(const uint8_t *in, size_t in_len, size_t *offset, ndef_rec
     return true;
 }
 
-size_t ndef_decode_message(const uint8_t *in, size_t in_len, ndef_record_t *records, size_t capacity)
+size_t pn5180_ndef_decode_message(const uint8_t *in, size_t in_len, pn5180_ndef_record_t *records, size_t capacity)
 {
     if (!in || !records || capacity == 0) return 0;
     size_t pos   = 0;
     size_t count = 0;
     while (count < capacity) {
         bool mb = false, me = false;
-        if (!ndef_decode_next(in, in_len, &pos, &records[count], &mb, &me)) {
+        if (!pn5180_ndef_decode_next(in, in_len, &pos, &records[count], &mb, &me)) {
             return 0;
         }
         count++;
@@ -329,39 +310,39 @@ size_t ndef_decode_message(const uint8_t *in, size_t in_len, ndef_record_t *reco
     return count;
 }
 
-static size_t ndef_count_records(const uint8_t *data, size_t data_len)
+static size_t pn5180_ndef_count_records(const uint8_t *data, size_t data_len)
 {
     size_t        count = 0, pos = 0;
-    ndef_record_t rec;
+    pn5180_ndef_record_t rec;
     while (pos < data_len) {
         bool me = false;
-        if (!ndef_decode_next(data, data_len, &pos, &rec, NULL, &me)) break;
+        if (!pn5180_ndef_decode_next(data, data_len, &pos, &rec, NULL, &me)) break;
         count++;
         if (me) break;
     }
     return count;
 }
 
-#define NDEF_DEFAULT_MAX_BLOCKS 256
+#define PN5180_NDEF_DEFAULT_MAX_BLOCKS 256
 #define INIT_SIZES_COUNT        (sizeof(init_sizes) / sizeof(init_sizes[0]))
 
-ndef_result_t ndef_read_from_selected_card( //
+pn5180_ndef_result_t pn5180_ndef_read_from_selected_card( //
     pn5180_proto_t           *proto,        //
     int                       start_block,  //
     int                       block_size,   //
     int                       max_blocks,   //
-    ndef_auth_callback_t      auth_cb,      //
-    ndef_sector_id_callback_t sector_cb,    //
+    pn5180_ndef_auth_callback_t      auth_cb,      //
+    pn5180_ndef_sector_id_callback_t sector_cb,    //
     void                     *auth_ctx,     //
-    ndef_message_parsed_t   **out_msg       //
+    pn5180_ndef_message_parsed_t   **out_msg       //
 )
 {
     if (!proto || !proto->block_read || block_size <= 0 || !out_msg) {
-        return NDEF_ERR_INVALID_PARAM;
+        return PN5180_NDEF_ERR_INVALID_PARAM;
     }
     *out_msg = NULL;
 
-    int block_limit = (max_blocks > 0) ? max_blocks : NDEF_DEFAULT_MAX_BLOCKS;
+    int block_limit = (max_blocks > 0) ? max_blocks : PN5180_NDEF_DEFAULT_MAX_BLOCKS;
 
     // Start with a larger buffer and grow as needed to minimize reallocs on large NDEFs.
     static const size_t init_sizes[] = {1024, 768, 512, 384, 256};
@@ -376,7 +357,7 @@ ndef_result_t ndef_read_from_selected_card( //
             }
         }
     }
-    if (!buf) return NDEF_ERR_NO_MEMORY;
+    if (!buf) return PN5180_NDEF_ERR_NO_MEMORY;
 
     size_t len         = 0;
     size_t tlv_pos     = 0;
@@ -393,7 +374,7 @@ ndef_result_t ndef_read_from_selected_card( //
             uint8_t *new_buf = realloc(buf, capacity);
             if (!new_buf) {
                 free(buf);
-                return NDEF_ERR_NO_MEMORY;
+                return PN5180_NDEF_ERR_NO_MEMORY;
             }
             buf = new_buf;
         }
@@ -421,7 +402,7 @@ ndef_result_t ndef_read_from_selected_card( //
         }
         len += block_size;
 
-        if (ndef_tlv_find_ndef(buf, len, &tlv_pos, &ndef_offset, &ndef_len)) {
+        if (pn5180_ndef_tlv_find_ndef(buf, len, &tlv_pos, &ndef_offset, &ndef_len)) {
             if (ndef_offset + ndef_len <= len) {
                 found = true;
                 break;
@@ -432,36 +413,36 @@ ndef_result_t ndef_read_from_selected_card( //
     // If no NDEF TLV was found, distinguish between empty/unsupported and read failure.
     if (!found || ndef_len == 0) {
         free(buf);
-        return read_ok ? NDEF_ERR_NO_NDEF : NDEF_ERR_READ_FAILED;
+        return read_ok ? PN5180_NDEF_ERR_NO_NDEF : PN5180_NDEF_ERR_READ_FAILED;
     }
 
-    size_t count = ndef_count_records(buf + ndef_offset, ndef_len);
+    size_t count = pn5180_ndef_count_records(buf + ndef_offset, ndef_len);
     if (count == 0) {
         free(buf);
-        return NDEF_ERR_PARSE_FAILED;
+        return PN5180_NDEF_ERR_PARSE_FAILED;
     }
 
     // Single allocation: header + records array + raw NDEF data
     // Single allocation: header + records array + raw NDEF data for one-shot free.
-    size_t records_size = sizeof(ndef_record_t) * count;
-    size_t total_size   = sizeof(ndef_message_parsed_t) + records_size + ndef_len;
+    size_t records_size = sizeof(pn5180_ndef_record_t) * count;
+    size_t total_size   = sizeof(pn5180_ndef_message_parsed_t) + records_size + ndef_len;
 
     uint8_t *block_ptr = malloc(total_size);
     if (!block_ptr) {
         free(buf);
-        return NDEF_ERR_NO_MEMORY;
+        return PN5180_NDEF_ERR_NO_MEMORY;
     }
 
-    ndef_message_parsed_t *result    = (ndef_message_parsed_t *)block_ptr;
-    ndef_record_t         *records   = (ndef_record_t *)(block_ptr + sizeof(ndef_message_parsed_t));
-    uint8_t               *ndef_data = block_ptr + sizeof(ndef_message_parsed_t) + records_size;
+    pn5180_ndef_message_parsed_t *result    = (pn5180_ndef_message_parsed_t *)block_ptr;
+    pn5180_ndef_record_t         *records   = (pn5180_ndef_record_t *)(block_ptr + sizeof(pn5180_ndef_message_parsed_t));
+    uint8_t               *ndef_data = block_ptr + sizeof(pn5180_ndef_message_parsed_t) + records_size;
 
     memcpy(ndef_data, buf + ndef_offset, ndef_len);
     free(buf);
 
-    if (ndef_decode_message(ndef_data, ndef_len, records, count) != count) {
+    if (pn5180_ndef_decode_message(ndef_data, ndef_len, records, count) != count) {
         free(block_ptr);
-        return NDEF_ERR_PARSE_FAILED;
+        return PN5180_NDEF_ERR_PARSE_FAILED;
     }
 
     result->raw_data     = ndef_data;
@@ -469,20 +450,20 @@ ndef_result_t ndef_read_from_selected_card( //
     result->records      = records;
     result->record_count = count;
     *out_msg             = result;
-    return NDEF_OK;
+    return PN5180_NDEF_OK;
 }
 
-void ndef_free_parsed_message(ndef_message_parsed_t *msg)
+void pn5180_ndef_free_parsed_message(pn5180_ndef_message_parsed_t *msg)
 {
     // Single allocation; freeing the head releases all associated buffers.
     free(msg);
 }
 
-bool ndef_extract_text(const ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out, char *lang_buf, bool *is_utf16)
+bool pn5180_ndef_extract_text(const pn5180_ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out, char *lang_buf, bool *is_utf16)
 {
     if (!rec || !text_out || !text_len_out) return false;
 
-    if (rec->tnf != NDEF_TNF_WELL_KNOWN) return false;
+    if (rec->tnf != PN5180_NDEF_TNF_WELL_KNOWN) return false;
     if (rec->type_len != 1 || !rec->type) return false;
     if (rec->type[0] != 'T') return false;
     if (!rec->payload || rec->payload_len < 1) return false;
@@ -507,11 +488,11 @@ bool ndef_extract_text(const ndef_record_t *rec, const uint8_t **text_out, size_
     return true;
 }
 
-size_t ndef_extract_uri(const ndef_record_t *rec, char *uri_buf, size_t uri_buf_len)
+size_t pn5180_ndef_extract_uri(const pn5180_ndef_record_t *rec, char *uri_buf, size_t uri_buf_len)
 {
     if (!rec) return 0;
 
-    if (rec->tnf != NDEF_TNF_WELL_KNOWN) return 0;
+    if (rec->tnf != PN5180_NDEF_TNF_WELL_KNOWN) return 0;
     if (rec->type_len != 1 || !rec->type) return 0;
     if (rec->type[0] != 'U') return 0;
     if (!rec->payload || rec->payload_len < 1) return 0;
@@ -538,15 +519,15 @@ size_t ndef_extract_uri(const ndef_record_t *rec, char *uri_buf, size_t uri_buf_
     return total_len;
 }
 
-ndef_result_t ndef_write_to_selected_card(pn5180_proto_t *proto, const ndef_message_t *msg, int start_block, int block_size, int max_blocks)
+pn5180_ndef_result_t pn5180_ndef_write_to_selected_card(pn5180_proto_t *proto, const pn5180_ndef_message_t *msg, int start_block, int block_size, int max_blocks)
 {
     if (!proto || !proto->block_write || !msg || block_size <= 0) {
-        return NDEF_ERR_INVALID_PARAM;
+        return PN5180_NDEF_ERR_INVALID_PARAM;
     }
 
-    size_t ndef_len = ndef_encode_message(msg, NULL, 0);
+    size_t ndef_len = pn5180_ndef_encode_message(msg, NULL, 0);
     if (ndef_len == 0) {
-        return NDEF_ERR_INVALID_PARAM;
+        return PN5180_NDEF_ERR_INVALID_PARAM;
     }
 
     // Wrap NDEF in a TLV with a short or extended length and a terminator byte.
@@ -556,13 +537,13 @@ ndef_result_t ndef_write_to_selected_card(pn5180_proto_t *proto, const ndef_mess
     size_t blocks_needed = (total_len + block_size - 1) / block_size;
 
     if (max_blocks > 0 && (int)blocks_needed > max_blocks) {
-        return NDEF_ERR_CARD_FULL;
+        return PN5180_NDEF_ERR_CARD_FULL;
     }
 
     size_t   buf_size = blocks_needed * block_size;
     uint8_t *buf      = calloc(buf_size, 1);
     if (!buf) {
-        return NDEF_ERR_NO_MEMORY;
+        return PN5180_NDEF_ERR_NO_MEMORY;
     }
 
     size_t pos = 0;
@@ -577,9 +558,9 @@ ndef_result_t ndef_write_to_selected_card(pn5180_proto_t *proto, const ndef_mess
         buf[pos++] = (uint8_t)(ndef_len & 0xFF);
     }
 
-    if (ndef_encode_message(msg, buf + pos, ndef_len) != ndef_len) {
+    if (pn5180_ndef_encode_message(msg, buf + pos, ndef_len) != ndef_len) {
         free(buf);
-        return NDEF_ERR_INVALID_PARAM;
+        return PN5180_NDEF_ERR_INVALID_PARAM;
     }
     pos += ndef_len;
 
@@ -589,61 +570,61 @@ ndef_result_t ndef_write_to_selected_card(pn5180_proto_t *proto, const ndef_mess
         int block_num = start_block + (int)i;
         if (proto->block_write(proto, block_num, buf + (i * block_size), (size_t)block_size) < 0) {
             free(buf);
-            return NDEF_ERR_WRITE_FAILED;
+            return PN5180_NDEF_ERR_WRITE_FAILED;
         }
     }
 
     free(buf);
-    return NDEF_OK;
+    return PN5180_NDEF_OK;
 }
 
-ndef_record_type_t ndef_get_record_type(const ndef_record_t *rec)
+pn5180_ndef_record_type_t pn5180_ndef_get_record_type(const pn5180_ndef_record_t *rec)
 {
-    if (!rec) return NDEF_RECORD_TYPE_UNKNOWN;
+    if (!rec) return PN5180_NDEF_RECORD_TYPE_UNKNOWN;
 
-    if (rec->tnf == NDEF_TNF_EMPTY) {
-        return NDEF_RECORD_TYPE_EMPTY;
+    if (rec->tnf == PN5180_NDEF_TNF_EMPTY) {
+        return PN5180_NDEF_RECORD_TYPE_EMPTY;
     }
 
-    if (rec->tnf == NDEF_TNF_MEDIA_TYPE) {
-        return NDEF_RECORD_TYPE_MIME;
+    if (rec->tnf == PN5180_NDEF_TNF_MEDIA_TYPE) {
+        return PN5180_NDEF_RECORD_TYPE_MIME;
     }
 
-    if (rec->tnf == NDEF_TNF_EXTERNAL) {
-        return NDEF_RECORD_TYPE_EXTERNAL;
+    if (rec->tnf == PN5180_NDEF_TNF_EXTERNAL) {
+        return PN5180_NDEF_RECORD_TYPE_EXTERNAL;
     }
 
-    if (rec->tnf == NDEF_TNF_WELL_KNOWN && rec->type && rec->type_len > 0) {
+    if (rec->tnf == PN5180_NDEF_TNF_WELL_KNOWN && rec->type && rec->type_len > 0) {
         if (rec->type_len == 1 && rec->type[0] == 'T') {
-            return NDEF_RECORD_TYPE_TEXT;
+            return PN5180_NDEF_RECORD_TYPE_TEXT;
         }
         if (rec->type_len == 1 && rec->type[0] == 'U') {
-            return NDEF_RECORD_TYPE_URI;
+            return PN5180_NDEF_RECORD_TYPE_URI;
         }
         if (rec->type_len == 2 && rec->type[0] == 'S' && rec->type[1] == 'p') {
-            return NDEF_RECORD_TYPE_SMARTPOSTER;
+            return PN5180_NDEF_RECORD_TYPE_SMARTPOSTER;
         }
     }
 
-    return NDEF_RECORD_TYPE_UNKNOWN;
+    return PN5180_NDEF_RECORD_TYPE_UNKNOWN;
 }
 
-bool ndef_record_is_text(const ndef_record_t *rec)
+bool pn5180_ndef_record_is_text(const pn5180_ndef_record_t *rec)
 {
-    return ndef_get_record_type(rec) == NDEF_RECORD_TYPE_TEXT;
+    return pn5180_ndef_get_record_type(rec) == PN5180_NDEF_RECORD_TYPE_TEXT;
 }
 
-bool ndef_record_is_uri(const ndef_record_t *rec)
+bool pn5180_ndef_record_is_uri(const pn5180_ndef_record_t *rec)
 {
-    return ndef_get_record_type(rec) == NDEF_RECORD_TYPE_URI;
+    return pn5180_ndef_get_record_type(rec) == PN5180_NDEF_RECORD_TYPE_URI;
 }
 
-bool ndef_record_is_smartposter(const ndef_record_t *rec)
+bool pn5180_ndef_record_is_smartposter(const pn5180_ndef_record_t *rec)
 {
-    return ndef_get_record_type(rec) == NDEF_RECORD_TYPE_SMARTPOSTER;
+    return pn5180_ndef_get_record_type(rec) == PN5180_NDEF_RECORD_TYPE_SMARTPOSTER;
 }
 
-bool ndef_make_mime_record(ndef_record_t *rec, const char *mime_type, const uint8_t *data, size_t data_len, uint8_t *type_buf, size_t type_buf_len)
+bool pn5180_ndef_make_mime_record(pn5180_ndef_record_t *rec, const char *mime_type, const uint8_t *data, size_t data_len, uint8_t *type_buf, size_t type_buf_len)
 {
     if (!rec || !mime_type || !type_buf) return false;
 
@@ -652,7 +633,7 @@ bool ndef_make_mime_record(ndef_record_t *rec, const char *mime_type, const uint
 
     memcpy(type_buf, mime_type, type_len);
 
-    rec->tnf         = NDEF_TNF_MEDIA_TYPE;
+    rec->tnf         = PN5180_NDEF_TNF_MEDIA_TYPE;
     rec->type        = type_buf;
     rec->type_len    = (uint8_t)type_len;
     rec->id          = NULL;
@@ -662,7 +643,7 @@ bool ndef_make_mime_record(ndef_record_t *rec, const char *mime_type, const uint
     return true;
 }
 
-bool ndef_make_external_record(ndef_record_t *rec, const char *type_name, const uint8_t *data, size_t data_len, uint8_t *type_buf, size_t type_buf_len)
+bool pn5180_ndef_make_external_record(pn5180_ndef_record_t *rec, const char *type_name, const uint8_t *data, size_t data_len, uint8_t *type_buf, size_t type_buf_len)
 {
     if (!rec || !type_name || !type_buf) return false;
 
@@ -671,7 +652,7 @@ bool ndef_make_external_record(ndef_record_t *rec, const char *type_name, const 
 
     memcpy(type_buf, type_name, type_len);
 
-    rec->tnf         = NDEF_TNF_EXTERNAL;
+    rec->tnf         = PN5180_NDEF_TNF_EXTERNAL;
     rec->type        = type_buf;
     rec->type_len    = (uint8_t)type_len;
     rec->id          = NULL;
@@ -681,34 +662,34 @@ bool ndef_make_external_record(ndef_record_t *rec, const char *type_name, const 
     return true;
 }
 
-size_t ndef_decode_smartposter(const ndef_record_t *rec, ndef_record_t *records, size_t capacity)
+size_t pn5180_ndef_decode_smartposter(const pn5180_ndef_record_t *rec, pn5180_ndef_record_t *records, size_t capacity)
 {
-    if (!ndef_record_is_smartposter(rec)) return 0;
+    if (!pn5180_ndef_record_is_smartposter(rec)) return 0;
     if (!rec->payload || rec->payload_len == 0) return 0;
 
-    return ndef_decode_message(rec->payload, rec->payload_len, records, capacity);
+    return pn5180_ndef_decode_message(rec->payload, rec->payload_len, records, capacity);
 }
 
-const char *ndef_result_to_string(ndef_result_t result)
+const char *pn5180_ndef_result_to_string(pn5180_ndef_result_t result)
 {
     switch (result) {
-    case NDEF_OK:
+    case PN5180_NDEF_OK:
         return "Success";
-    case NDEF_ERR_INVALID_PARAM:
+    case PN5180_NDEF_ERR_INVALID_PARAM:
         return "Invalid parameter";
-    case NDEF_ERR_NO_MEMORY:
+    case PN5180_NDEF_ERR_NO_MEMORY:
         return "Memory allocation failed";
-    case NDEF_ERR_READ_FAILED:
+    case PN5180_NDEF_ERR_READ_FAILED:
         return "Card read failed";
-    case NDEF_ERR_WRITE_FAILED:
+    case PN5180_NDEF_ERR_WRITE_FAILED:
         return "Card write failed";
-    case NDEF_ERR_NO_NDEF:
+    case PN5180_NDEF_ERR_NO_NDEF:
         return "No NDEF data found";
-    case NDEF_ERR_PARSE_FAILED:
+    case PN5180_NDEF_ERR_PARSE_FAILED:
         return "NDEF parse failed";
-    case NDEF_ERR_BUFFER_TOO_SMALL:
+    case PN5180_NDEF_ERR_BUFFER_TOO_SMALL:
         return "Buffer too small";
-    case NDEF_ERR_CARD_FULL:
+    case PN5180_NDEF_ERR_CARD_FULL:
         return "Card capacity exceeded";
     default:
         return "Unknown error";

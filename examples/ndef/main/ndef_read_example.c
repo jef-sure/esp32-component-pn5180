@@ -1,7 +1,7 @@
 /**
  * Example: Reading NDEF messages from NFC cards
  *
- * This example demonstrates how to use ndef_read_from_selected_card() to read
+ * This example demonstrates how to use pn5180_ndef_read_from_selected_card() to read
  * and parse complete NDEF messages from NFC cards.
  */
 
@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static const char *TAG = "NDEF_READ";
+static const char *TAG = "PN5180_NDEF_READ";
 
 void example_read_ndef_from_card(pn5180_proto_t *proto)
 {
@@ -21,11 +21,11 @@ void example_read_ndef_from_card(pn5180_proto_t *proto)
 
     ESP_LOGI(TAG, "Reading NDEF message from card...");
 
-    ndef_message_parsed_t *msg    = NULL;
-    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 0, NULL, NULL, NULL, &msg);
+    pn5180_ndef_message_parsed_t *msg    = NULL;
+    pn5180_ndef_result_t          result = pn5180_ndef_read_from_selected_card(proto, start_block, block_size, 0, NULL, NULL, NULL, &msg);
 
-    if (result != NDEF_OK || !msg) {
-        ESP_LOGE(TAG, "Failed to read NDEF message: %s", ndef_result_to_string(result));
+    if (result != PN5180_NDEF_OK || !msg) {
+        ESP_LOGE(TAG, "Failed to read NDEF message: %s", pn5180_ndef_result_to_string(result));
         return;
     }
 
@@ -34,7 +34,7 @@ void example_read_ndef_from_card(pn5180_proto_t *proto)
     ESP_LOGI(TAG, "  Record count: %zu", msg->record_count);
 
     for (size_t i = 0; i < msg->record_count; i++) {
-        ndef_record_t *rec = &msg->records[i];
+        pn5180_ndef_record_t *rec = &msg->records[i];
 
         ESP_LOGI(TAG, "\nRecord %zu:", i + 1);
         ESP_LOGI(TAG, "  TNF: 0x%02X", (unsigned)rec->tnf);
@@ -46,7 +46,7 @@ void example_read_ndef_from_card(pn5180_proto_t *proto)
         }
 
         // Check for Text RTD
-        if (rec->tnf == NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'T') {
+        if (rec->tnf == PN5180_NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'T') {
 
             ESP_LOGI(TAG, "  Type: Text RTD");
 
@@ -75,7 +75,7 @@ void example_read_ndef_from_card(pn5180_proto_t *proto)
             }
         }
         // Check for URI RTD
-        else if (rec->tnf == NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'U') {
+        else if (rec->tnf == PN5180_NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'U') {
 
             ESP_LOGI(TAG, "  Type: URI RTD");
 
@@ -119,7 +119,7 @@ void example_read_ndef_from_card(pn5180_proto_t *proto)
         }
     }
 
-    ndef_free_parsed_message(msg);
+    pn5180_ndef_free_parsed_message(msg);
     ESP_LOGI(TAG, "NDEF message freed");
 }
 
@@ -130,15 +130,15 @@ void example_read_ndef_from_type5(pn5180_proto_t *proto)
 
     ESP_LOGI(TAG, "Reading NDEF message from Type 5 tag...");
 
-    ndef_message_parsed_t *msg    = NULL;
-    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 0, NULL, NULL, NULL, &msg);
+    pn5180_ndef_message_parsed_t *msg    = NULL;
+    pn5180_ndef_result_t          result = pn5180_ndef_read_from_selected_card(proto, start_block, block_size, 0, NULL, NULL, NULL, &msg);
 
-    if (result != NDEF_OK || !msg) {
-        ESP_LOGE(TAG, "Failed to read NDEF message from Type 5 tag: %s", ndef_result_to_string(result));
+    if (result != PN5180_NDEF_OK || !msg) {
+        ESP_LOGE(TAG, "Failed to read NDEF message from Type 5 tag: %s", pn5180_ndef_result_to_string(result));
         return;
     }
 
     ESP_LOGI(TAG, "Type 5 tag - Found %zu record(s)", msg->record_count);
 
-    ndef_free_parsed_message(msg);
+    pn5180_ndef_free_parsed_message(msg);
 }

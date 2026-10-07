@@ -296,11 +296,11 @@ static void process_card(pn5180_proto_t *proto, nfc_uid_t *uid)
         .uid = uid,
     };
 
-    ndef_message_parsed_t *msg;
-    ndef_result_t          result = ndef_read_from_selected_card(proto, start_block, block_size, 256 /* NDEF_DEFAULT_MAX_BLOCKS*/, ndef_auth_callback,
+    pn5180_ndef_message_parsed_t *msg;
+    pn5180_ndef_result_t          result = pn5180_ndef_read_from_selected_card(proto, start_block, block_size, 256 /* PN5180_NDEF_DEFAULT_MAX_BLOCKS*/, ndef_auth_callback,
                                                                  ndef_sector_id_callback, &auth_ctx, &msg);
 
-    if (result != NDEF_OK) {
+    if (result != PN5180_NDEF_OK) {
         ESP_LOGE(TAG, "Failed to read NDEF message");
         if (uid->subtype != PN5180_MIFARE_DESFIRE) {
             read_card_blocks(proto, uid, blocks_count, block_size);
@@ -311,7 +311,7 @@ static void process_card(pn5180_proto_t *proto, nfc_uid_t *uid)
     ESP_LOGI(TAG, "  Raw data length: %zu bytes", msg->raw_data_len);
     ESP_LOGI(TAG, "  Record count: %zu", msg->record_count);
     for (size_t i = 0; i < msg->record_count; i++) {
-        ndef_record_t *rec = &msg->records[i];
+        pn5180_ndef_record_t *rec = &msg->records[i];
 
         ESP_LOGI(TAG, "\nRecord %zu:", i + 1);
         ESP_LOGI(TAG, "  TNF: 0x%02X", (unsigned)rec->tnf);
@@ -322,7 +322,7 @@ static void process_card(pn5180_proto_t *proto, nfc_uid_t *uid)
             ESP_LOG_BUFFER_HEX_LEVEL(TAG, rec->type, rec->type_len, ESP_LOG_INFO);
         }
 
-        if (rec->tnf == NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'T') {
+        if (rec->tnf == PN5180_NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'T') {
 
             ESP_LOGI(TAG, "  Type: Text RTD");
 

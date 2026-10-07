@@ -72,8 +72,59 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
     return true;
 }
 
+// Ultralight/NTAG WRITE (0xA2): one frame with the page address and 4 data bytes, answered by a 4-bit ACK.
+static int pn5180_mifare_page_write(pn5180_t *pn5180, int pageno, const uint8_t *buffer)
+{
+    uint8_t cmd_buf[6];
+    cmd_buf[0] = 0xA2; // Ultralight Write command
+    cmd_buf[1] = (uint8_t)pageno;
+    memcpy(&cmd_buf[2], buffer, 4);
+    PN5180_LOGD(TAG, "Sending Ultralight Write command: 0x%02X 0x%02X", cmd_buf[0], cmd_buf[1]);
+    if (!pn5180_sendData(pn5180, cmd_buf, sizeof(cmd_buf), 0x00)) {
+        ESP_LOGE(TAG, "Failed to send Ultralight Write command for page %d", pageno);
+        return -1;
+    }
+
+    uint32_t irqStatus;
+    if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "Ultralight Write ACK", &irqStatus)) {
+        ESP_LOGE(TAG, "Timeout waiting for Ultralight page %d write ACK", pageno);
+        return -1;
+    }
+
+    if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
+        ESP_LOGE(TAG, "Error during Ultralight page %d write ACK", pageno);
+        pn5180_clearAllIRQs(pn5180);
+        return -1;
+    }
+
+    uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
+    if (rxLen != 1) {
+        ESP_LOGE(TAG, "Ultralight page %d write ACK returned incorrect length: %u", pageno, (unsigned)rxLen);
+        pn5180_clearAllIRQs(pn5180);
+        return -2;
+    }
+
+    uint8_t ack;
+    if (!pn5180_readData(pn5180, 1, &ack)) {
+        ESP_LOGE(TAG, "Failed to read Ultralight page %d write ACK", pageno);
+        pn5180_clearAllIRQs(pn5180);
+        return -2;
+    }
+
+    pn5180_clearAllIRQs(pn5180);
+
+    if ((ack & 0x0F) != 0x0A) {
+        ESP_LOGE(TAG, "Ultralight page %d write NACK received: 0x%02X", pageno, ack);
+        return -3;
+    }
+    return 0;
+}
+
 int pn5180_mifare_block_write(pn5180_t *pn5180, int blockno, const uint8_t *buffer, size_t buffer_len)
 {
+    if (buffer_len == 4) {
+        return pn5180_mifare_page_write(pn5180, blockno, buffer);
+    }
     if (buffer_len < 16) {
         ESP_LOGE(TAG, "MIFARE block %d write buffer too small: %zu", blockno, buffer_len);
         return -1;

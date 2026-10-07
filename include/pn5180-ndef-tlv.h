@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief Find the NDEF TLV in a byte buffer
  * @param data Input buffer containing TLV data
@@ -13,10 +17,14 @@
  * @param ndef_length Out: length of NDEF value field
  * @return true if an NDEF TLV was found and offsets are valid
  */
-bool ndef_tlv_find_ndef(        //
+bool pn5180_ndef_tlv_find_ndef(        //
     const uint8_t *data,        //
     size_t         data_len,    //
     size_t        *search_pos,  //
     size_t        *ndef_offset, //
     size_t        *ndef_length  //
 );
+
+#ifdef __cplusplus
+}
+#endif

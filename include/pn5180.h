@@ -3,6 +3,10 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define MIFARE_CLASSIC_KEYA 0x60 // Mifare Classic key A
 #define MIFARE_CLASSIC_KEYB 0x61 // Mifare Classic key B
 
@@ -80,7 +84,7 @@
 
 // SYSTEM_CONFIG register bit masks
 #define SYSTEM_CONFIG_MFC_CRYPTO_ON      (1 << 6)   // Bit 6 - MIFARE Crypto1 enabled
-#define SYSTEM_CONFIG_TX_MODE_MASK       0x00000003 // Bits 0-2 - Transceiver mode
+#define SYSTEM_CONFIG_TX_MODE_MASK       0x00000007 // Bits 0-2 - Transceiver mode
 #define SYSTEM_CONFIG_TX_MODE_IDLE       0x00000000
 #define SYSTEM_CONFIG_TX_MODE_TRANSCEIVE 0x00000003
 #define SYSTEM_CONFIG_CLEAR_CRYPTO_MASK  0xFFFFFFBF // ~(1<<6) - Clear MFC_CRYPTO_ON bit
@@ -90,19 +94,6 @@
 #define CRC_RX_CONFIG_RX_BIT_ALIGN_POS               6u
 #define CRC_RX_CONFIG_RX_BIT_ALIGN_MASK              0x000001C0u  // Bits [8:6] - RX bit alignment
 #define CRC_RX_CONFIG_VALUES_AFTER_COLLISION_MASK     0x00000200u  // Bit 9 - Keep bit values after collision
-
-#define TIMER1_RELOAD                    (0x0c)
-#define TIMER1_CONFIG                    (0x0f)
-#define RX_WAIT_CONFIG                   (0x11)
-#define CRC_RX_CONFIG                    (0x12)
-#define RX_STATUS                        (0x13)
-#define TX_WAIT_CONFIG                   (0x17)
-#define TX_CONFIG                        (0x18)
-#define CRC_TX_CONFIG                    (0x19)
-#define RF_STATUS                        (0x1d)
-#define SYSTEM_STATUS                    (0x24)
-#define TEMP_CONTROL                     (0x25)
-#define AGC_REF_CONFIG                   (0x26)
 
 /** @brief SPI configuration and handle for PN5180 */
 typedef struct _pn5180_spi_t
@@ -281,7 +272,9 @@ typedef int func_block_write_t(struct _pn5180_proto_t *pn5180_proto, int blockno
  * @brief Callback: Halt or deselect the currently selected card
  * @param pn5180_proto Protocol interface
  * @return true on success, false on failure
- * @note After HALT, card must receive WUPA (not REQA) to wake up
+ * @note ISO14443A: after HALT, card must receive WUPA (not REQA) to wake up
+ * @note ISO15693: sends Reset to Ready in Select mode; the tag returns to the Ready state.
+ *       The command is optional in ISO15693, so this fails on tags that do not implement it.
  */
 typedef bool func_halt_t(struct _pn5180_proto_t *pn5180_proto);
 
@@ -320,7 +313,7 @@ typedef enum
     PN5180_TS_WaitForData  = 4, /**< Waiting for data from card */
     PN5180_TS_Receiving    = 5, /**< Receiving data from card */
     PN5180_TS_LoopBack     = 6, /**< Loopback mode active */
-    PN5180_TS_RESERVED     = 7  /**< Reserved state */
+    PN5180_TS_RESERVED     = 7  /**< Reserved state; also returned when the state cannot be read */
 } pn5180_transceive_state_t;
 
 /**
@@ -340,7 +333,8 @@ pn5180_spi_t *pn5180_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_nu
  * @param nss NSS (chip select) GPIO pin
  * @param busy BUSY GPIO pin for monitoring device state
  * @param rst RESET GPIO pin
- * @return Pointer to initialized PN5180 structure, or NULL on failure
+ * @return Pointer to initialized PN5180 structure, or NULL on failure.
+ *         On failure @p spi is left untouched and can be passed to pn5180_init() again.
  */
 pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_num_t rst);
 
@@ -616,3 +610,7 @@ static bool inline pn5180_set_transceiver_idle(pn5180_t *pn5180)
     }
     return ret;
 }
+
+#ifdef __cplusplus
+}
+#endif

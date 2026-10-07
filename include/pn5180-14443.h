@@ -2,6 +2,10 @@
 #include "pn5180.h"
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief Initialize ISO14443A/MIFARE protocol wrapper
  * @param pn5180 Pointer to PN5180 device structure
@@ -9,3 +13,6 @@
  */
 pn5180_proto_t *pn5180_14443_init(pn5180_t *pn5180);
 
+#ifdef __cplusplus
+}
+#endif
