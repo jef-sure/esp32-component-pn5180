@@ -19,14 +19,14 @@ enum {
 
 static bool read_version(pn5180_t *pn5180, uint8_t addr, const char *name) {
   uint8_t version[2];
-  if (!pn5180_readEEprom(pn5180, addr, version, sizeof(version))) {
+  if (!pn5180_read_eeprom(pn5180, addr, version, sizeof(version))) {
     ESP_LOGE(TAG, "Failed to read %s", name);
     return false;
   }
 
   ESP_LOGI(TAG, "%s: %d.%d", name, version[1], version[0]);
 
-  if (addr == PRODUCT_VERSION && version[1] == 0xff) {
+  if (addr == PN5180_PRODUCT_VERSION && version[1] == 0xff) {
     ESP_LOGE(TAG, "Initialization failed - invalid product version");
     return false;
   }
@@ -50,9 +50,9 @@ static bool init_pn5180_hardware(pn5180_t **pn5180_out) {
 
   ESP_LOGI(TAG, "PN5180 initialized successfully");
 
-  if (!read_version(pn5180, PRODUCT_VERSION, "Product version") ||
-      !read_version(pn5180, FIRMWARE_VERSION, "Firmware version") ||
-      !read_version(pn5180, EEPROM_VERSION, "EEPROM version")) {
+  if (!read_version(pn5180, PN5180_PRODUCT_VERSION, "Product version") ||
+      !read_version(pn5180, PN5180_FIRMWARE_VERSION, "Firmware version") ||
+      !read_version(pn5180, PN5180_EEPROM_VERSION, "EEPROM version")) {
     pn5180_deinit(pn5180, true);
     return false;
   }
@@ -61,20 +61,17 @@ static bool init_pn5180_hardware(pn5180_t **pn5180_out) {
   return true;
 }
 
-static void scan_protocol(pn5180_proto_t *proto, const char *label,
-                          uint8_t rf_config) {
+static void scan_protocol(pn5180_proto_t *proto, const char *label) {
   ESP_LOGI(TAG, "Scanning for %s cards...", label);
 
-  proto->pn5180->rf_config = rf_config;
-
-  pn5180_setRF_off(proto->pn5180);
+  pn5180_set_rf_off(proto->pn5180);
   pn5180_delay_ms(5);
   if (!proto->setup_rf(proto)) {
     ESP_LOGE(TAG, "Failed to set up RF for %s", label);
     return;
   }
 
-  nfc_uids_array_t *uids = proto->get_all_uids(proto);
+  pn5180_uids_array_t *uids = proto->get_all_uids(proto);
   if (uids == NULL) {
     ESP_LOGI(TAG, "No cards found");
     return;
@@ -118,8 +115,8 @@ void app_main(void) {
   ESP_LOGI(TAG, "ISO15693 protocol initialized successfully");
 
   while (true) {
-    scan_protocol(proto_14443, "ISO14443A", 0x00);
-    scan_protocol(proto_15693, "ISO15693", PN5180_15693_26KASK100);
+    scan_protocol(proto_14443, "ISO14443A");
+    scan_protocol(proto_15693, "ISO15693");
 
     pn5180_delay_ms(2000);
   }

@@ -13,63 +13,52 @@ bool pn5180_mifare_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, si
     cmd_buf[1] = (uint8_t)blockno;
     PN5180_LOGD(TAG, "READ data: 0x%02X 0x%02X", cmd_buf[0], cmd_buf[1]);
 
-    pn5180_clearAllIRQs(pn5180);
-
-    if (!pn5180_sendData(pn5180, cmd_buf, 2, 0x00)) {
-        ESP_LOGE(TAG, "Failed to send MIFARE Read command for block %d", blockno);
+    uint8_t            rx_buf[16];
+    size_t             rx_len = 0;
+    pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, cmd_buf, sizeof(cmd_buf), 0, rx_buf, sizeof(rx_buf), &rx_len, PN5180_TIMEOUT_MIFARE_READ_US, NULL);
+    if (result != PN5180_RF_OK) {
+        // A NAK (4 bits) arrives as an RX error; a missing answer as a timeout.
+        PN5180_LOGD(TAG, "MIFARE block %d read failed (result=%d)", blockno, (int)result);
         return false;
     }
 
-    uint32_t irqStatus;
-    if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "MIFARE Read", &irqStatus)) {
-        ESP_LOGE(TAG, "Timeout waiting for MIFARE block %d read response", blockno);
-        return false;
-    }
-
-    if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
-        ESP_LOGE(TAG, "Error during MIFARE block %d read", blockno);
-        return false;
-    }
-
-    uint32_t rxStatus;
-    if (!pn5180_readRegister(pn5180, RX_STATUS, &rxStatus)) {
-        ESP_LOGE(TAG, "Failed to read RX_STATUS for block %d", blockno);
-        return false;
-    }
-
-    if (rxStatus & (RX_PROTOCOL_ERROR | RX_DATA_INTEGRITY_ERROR)) {
-        PN5180_LOGD(TAG, "RX error during MIFARE block %d read (RX_STATUS=0x%08" PRIX32 ")", blockno, rxStatus);
-        pn5180_clearAllIRQs(pn5180);
-        return false;
-    }
-
-    uint16_t rxLen = rxStatus & RX_BYTES_RECEIVED_MASK;
     // TODO: If Ultralight field issues resurface, re-check whether some readers return
     // 16 bytes here with only the first 4 bytes valid and the trailing bytes undefined.
-    if (rxLen != 16 && rxLen != 4) {
-        ESP_LOGE(TAG, "MIFARE block %d read returned incorrect length: %u (expected 16 for Classic or 4 for Ultralight)", blockno, (unsigned)rxLen);
-        pn5180_clearAllIRQs(pn5180);
-        return false;
-    } else {
-        PN5180_LOGD(TAG, "MIFARE block %d read returned %u bytes", blockno, (unsigned)rxLen);
-    }
-
-    uint8_t  temp_buffer[16];
-    uint8_t *read_buffer = (rxLen <= buffer_len) ? buffer : temp_buffer;
-
-    if (!pn5180_readData(pn5180, rxLen, read_buffer)) {
-        ESP_LOGE(TAG, "Failed to read MIFARE block %d data", blockno);
-        pn5180_clearAllIRQs(pn5180);
+    if (rx_len != 16 && rx_len != 4) {
+        ESP_LOGE(TAG, "MIFARE block %d read returned incorrect length: %u (expected 16 for Classic or 4 for Ultralight)", blockno, (unsigned)rx_len);
         return false;
     }
+    PN5180_LOGD(TAG, "MIFARE block %d read returned %u bytes", blockno, (unsigned)rx_len);
 
-    if (rxLen > buffer_len) {
-        PN5180_LOGD(TAG, "MIFARE block %d read returned %u bytes, but buffer is only %zu bytes, return required length", blockno, (unsigned)rxLen, buffer_len);
-        memcpy(buffer, temp_buffer, buffer_len);
-    }
-
-    pn5180_clearAllIRQs(pn5180);
+    memcpy(buffer, rx_buf, (rx_len <= buffer_len) ? rx_len : buffer_len);
     return true;
+}
+
+// Sends one frame of a write sequence and checks the 4-bit ACK that answers it.
+// Returns 0 on ACK, -1 if there was no usable answer, -2 if the answer is not a 4-bit frame, -3 on NAK.
+static int pn5180_mifare_send_expect_ack(pn5180_t *pn5180, const uint8_t *frame, size_t frame_len, uint32_t timeout_us, const char *what, int blockno)
+{
+    uint8_t            ack    = 0;
+    size_t             rx_len = 0;
+    pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, frame, frame_len, 0, &ack, 1, &rx_len, timeout_us, NULL);
+    // The ACK is a 4-bit frame without CRC, so with RX CRC enabled it is reported as an RX error.
+    if (result != PN5180_RF_OK && result != PN5180_RF_RX_ERROR) {
+        if (result == PN5180_RF_OVERFLOW) {
+            ESP_LOGE(TAG, "%s %d: ACK has incorrect length", what, blockno);
+            return -2;
+        }
+        ESP_LOGE(TAG, "%s %d: no ACK (result=%d)", what, blockno, (int)result);
+        return -1;
+    }
+    if (rx_len != 1) {
+        ESP_LOGE(TAG, "%s %d: ACK returned incorrect length: %u", what, blockno, (unsigned)rx_len);
+        return -2;
+    }
+    if ((ack & 0x0F) != 0x0A) {
+        ESP_LOGE(TAG, "%s %d: NACK received: 0x%02X", what, blockno, ack);
+        return -3;
+    }
+    return 0;
 }
 
 // Ultralight/NTAG WRITE (0xA2): one frame with the page address and 4 data bytes, answered by a 4-bit ACK.
@@ -80,44 +69,7 @@ static int pn5180_mifare_page_write(pn5180_t *pn5180, int pageno, const uint8_t 
     cmd_buf[1] = (uint8_t)pageno;
     memcpy(&cmd_buf[2], buffer, 4);
     PN5180_LOGD(TAG, "Sending Ultralight Write command: 0x%02X 0x%02X", cmd_buf[0], cmd_buf[1]);
-    if (!pn5180_sendData(pn5180, cmd_buf, sizeof(cmd_buf), 0x00)) {
-        ESP_LOGE(TAG, "Failed to send Ultralight Write command for page %d", pageno);
-        return -1;
-    }
-
-    uint32_t irqStatus;
-    if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "Ultralight Write ACK", &irqStatus)) {
-        ESP_LOGE(TAG, "Timeout waiting for Ultralight page %d write ACK", pageno);
-        return -1;
-    }
-
-    if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
-        ESP_LOGE(TAG, "Error during Ultralight page %d write ACK", pageno);
-        pn5180_clearAllIRQs(pn5180);
-        return -1;
-    }
-
-    uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
-    if (rxLen != 1) {
-        ESP_LOGE(TAG, "Ultralight page %d write ACK returned incorrect length: %u", pageno, (unsigned)rxLen);
-        pn5180_clearAllIRQs(pn5180);
-        return -2;
-    }
-
-    uint8_t ack;
-    if (!pn5180_readData(pn5180, 1, &ack)) {
-        ESP_LOGE(TAG, "Failed to read Ultralight page %d write ACK", pageno);
-        pn5180_clearAllIRQs(pn5180);
-        return -2;
-    }
-
-    pn5180_clearAllIRQs(pn5180);
-
-    if ((ack & 0x0F) != 0x0A) {
-        ESP_LOGE(TAG, "Ultralight page %d write NACK received: 0x%02X", pageno, ack);
-        return -3;
-    }
-    return 0;
+    return pn5180_mifare_send_expect_ack(pn5180, cmd_buf, sizeof(cmd_buf), PN5180_TIMEOUT_MIFARE_WRITE_US, "Ultralight write page", pageno);
 }
 
 int pn5180_mifare_block_write(pn5180_t *pn5180, int blockno, const uint8_t *buffer, size_t buffer_len)
@@ -133,79 +85,21 @@ int pn5180_mifare_block_write(pn5180_t *pn5180, int blockno, const uint8_t *buff
     cmd_buf[0] = 0xA0; // MIFARE Write command
     cmd_buf[1] = (uint8_t)blockno;
     PN5180_LOGD(TAG, "Sending MIFARE Write command: 0x%02X 0x%02X", cmd_buf[0], cmd_buf[1]);
-    if (!pn5180_sendData(pn5180, cmd_buf, 2, 0x00)) {
-        ESP_LOGE(TAG, "Failed to send MIFARE Write command for block %d", blockno);
-        return -1;
-    }
-
-    uint32_t irqStatus;
-    if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "MIFARE Write ACK", &irqStatus)) {
-        ESP_LOGE(TAG, "Timeout waiting for MIFARE block %d write ACK", blockno);
-        return -1;
-    }
-
-    if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
-        ESP_LOGE(TAG, "Error during MIFARE block %d write ACK", blockno);
-        pn5180_clearAllIRQs(pn5180);
-        return -1;
-    }
-
-    uint16_t rxLen = pn5180_rxBytesReceived(pn5180);
-    if (rxLen != 1) {
-        ESP_LOGE(TAG, "MIFARE block %d write ACK returned incorrect length: %u", blockno, (unsigned)rxLen);
-        pn5180_clearAllIRQs(pn5180);
-        return -2;
-    }
-
-    uint8_t ack;
-    if (!pn5180_readData(pn5180, 1, &ack)) {
-        ESP_LOGE(TAG, "Failed to read MIFARE block %d write ACK", blockno);
-        pn5180_clearAllIRQs(pn5180);
-        return -2;
-    }
-
-    pn5180_clearAllIRQs(pn5180);
-
-    if ((ack & 0x0F) != 0x0A) {
-        ESP_LOGE(TAG, "MIFARE block %d write NACK received: 0x%02X", blockno, ack);
-        return -3;
+    int rc = pn5180_mifare_send_expect_ack(pn5180, cmd_buf, sizeof(cmd_buf), PN5180_TIMEOUT_MIFARE_READ_US, "MIFARE write block", blockno);
+    if (rc != 0) {
+        return rc; // -1, -2 or -3
     }
 
     PN5180_LOGD(TAG, "Sending 16 bytes of write data for block %d", blockno);
-    if (!pn5180_sendData(pn5180, buffer, 16, 0x00)) {
-        ESP_LOGE(TAG, "Failed to send MIFARE block %d data for writing", blockno);
-        return -4;
+    rc = pn5180_mifare_send_expect_ack(pn5180, buffer, 16, PN5180_TIMEOUT_MIFARE_WRITE_US, "MIFARE write data block", blockno);
+    switch (rc) {
+    case 0:
+        return 0;
+    case -1:
+        return -5; // no final ACK
+    case -2:
+        return -6; // final ACK with incorrect length
+    default:
+        return -8; // final NACK
     }
-
-    if (!pn5180_wait_for_irq(pn5180, RX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "MIFARE Write Final ACK", &irqStatus)) {
-        ESP_LOGE(TAG, "Timeout waiting for MIFARE block %d write final ACK", blockno);
-        return -5;
-    }
-
-    if (irqStatus & GENERAL_ERROR_IRQ_STAT) {
-        ESP_LOGE(TAG, "Error during MIFARE block %d write final ACK", blockno);
-        pn5180_clearAllIRQs(pn5180);
-        return -5;
-    }
-
-    rxLen = pn5180_rxBytesReceived(pn5180);
-    if (rxLen != 1) {
-        ESP_LOGE(TAG, "MIFARE block %d write final ACK returned incorrect length: %u", blockno, (unsigned)rxLen);
-        pn5180_clearAllIRQs(pn5180);
-        return -6;
-    }
-
-    if (!pn5180_readData(pn5180, 1, &ack)) {
-        ESP_LOGE(TAG, "Failed to read MIFARE block %d write final ACK", blockno);
-        pn5180_clearAllIRQs(pn5180);
-        return -7;
-    }
-
-    pn5180_clearAllIRQs(pn5180);
-
-    if ((ack & 0x0F) != 0x0A) {
-        ESP_LOGE(TAG, "MIFARE block %d write final NACK received: 0x%02X", blockno, ack);
-        return -8;
-    }
-    return 0;
 }

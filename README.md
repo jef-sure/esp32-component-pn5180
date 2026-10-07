@@ -12,7 +12,8 @@ ESP-IDF component for the NXP PN5180 NFC/RFID reader. This implementation provid
 - ✅ **NDEF** - Message reading and writing with TLV decoding, Text RTD, URI RTD support (`pn5180_ndef_*` API)
 - ✅ **Multi-card** - Enumerate up to 14 cards in field
 - ✅ **Error detection** - RX/CRC/collision error handling with clean recovery
-- ✅ **SPI** - Tested at 7 MHz with BUSY line synchronization
+- ✅ **SPI** - Tested at 7 MHz with BUSY line synchronization; own bus or a bus shared with other devices
+- ✅ **Timing** - Receive timeout on the PN5180 hardware timer; optional IRQ pin instead of polling
 - ✅ **ESP-IDF 6.0** - Updated examples and core sources for current ESP-IDF builds
 
 ## Hardware
@@ -62,7 +63,7 @@ Adjust the GPIO assignments and SPI host to match your board.
 1. Add the component with the ESP-IDF Component Manager:
 
 ```bash
-idf.py add-dependency "jef-sure/esp32-component-pn5180^0.2.0"
+idf.py add-dependency "jef-sure/esp32-component-pn5180^0.3.0"
 ```
 
 2. Or place this repository under your project's `components/` directory.
@@ -96,19 +97,19 @@ typedef enum {
     PN5180_MIFARE_DESFIRE,
     PN5180_15693,
     // ... see pn5180.h for complete list
-} nfc_type_t;
+} pn5180_card_type_t;
 
 // Protocol interface - all protocols implement this
 typedef struct {
     pn5180_t                 *pn5180;
-    func_setup_rf_t          *setup_rf;
-    funct_get_all_uids_t     *get_all_uids;
-    func_select_by_uid_t     *select_by_uid;
-    func_authenticate_t      *authenticate;
-    func_block_read_t        *block_read;
-    func_block_write_t       *block_write;
-    funct_detect_card_type_t *detect_card_type_and_capacity;
-    func_halt_t              *halt;
+    pn5180_func_setup_rf_t         *setup_rf;
+    pn5180_func_get_all_uids_t     *get_all_uids;
+    pn5180_func_select_by_uid_t    *select_by_uid;
+    pn5180_func_authenticate_t     *authenticate;
+    pn5180_func_block_read_t       *block_read;
+    pn5180_func_block_write_t      *block_write;
+    pn5180_func_detect_card_type_t *detect_card_type_and_capacity;
+    pn5180_func_halt_t             *halt;
     // ...
 } pn5180_proto_t;
 ```
@@ -142,10 +143,10 @@ void app_main(void)
     pn5180_proto_t *iso14443 = pn5180_14443_init(pn5180);
     iso14443->setup_rf(iso14443);
 
-    nfc_uids_array_t *uids = iso14443->get_all_uids(iso14443);
+    pn5180_uids_array_t *uids = iso14443->get_all_uids(iso14443);
     if (uids) {
         for (int i = 0; i < uids->uids_count; i++) {
-            nfc_uid_t *uid = &uids->uids[i];
+            pn5180_uid_t *uid = &uids->uids[i];
             printf("Card %d: Type=%d, UID len=%d\n", i, uid->subtype, uid->uid_length);
         }
         free(uids);
@@ -163,7 +164,7 @@ void app_main(void)
 #include "pn5180-14443.h"
 #include "pn5180-mifare.h"
 
-void read_mifare_classic(pn5180_proto_t *proto, nfc_uid_t *uid)
+void read_mifare_classic(pn5180_proto_t *proto, pn5180_uid_t *uid)
 {
     // Select the card first
     if (!proto->select_by_uid(proto, uid)) {
@@ -175,7 +176,7 @@ void read_mifare_classic(pn5180_proto_t *proto, nfc_uid_t *uid)
     uint8_t key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // Default key
     int block = 4;  // First block of sector 1
 
-    if (!proto->authenticate(proto, key, MIFARE_CLASSIC_KEYA, uid, block)) {
+    if (!proto->authenticate(proto, key, PN5180_MIFARE_CLASSIC_KEYA, uid, block)) {
         ESP_LOGE(TAG, "Authentication failed");
         return;
     }
@@ -202,7 +203,7 @@ void read_iso15693_tags(pn5180_t *pn5180)
     iso15693->setup_rf(iso15693);
 
     // Enumerate tags
-    nfc_uids_array_t *uids = iso15693->get_all_uids(iso15693);
+    pn5180_uids_array_t *uids = iso15693->get_all_uids(iso15693);
     if (uids && uids->uids_count > 0) {
         // Select first tag
         if (iso15693->select_by_uid(iso15693, &uids->uids[0])) {
@@ -221,7 +222,7 @@ void read_iso15693_tags(pn5180_t *pn5180)
 
 ### NDEF Message Reading
 
-All NDEF functions and types are prefixed with `pn5180_ndef_`, constants with `PN5180_NDEF_` (since 0.2.0; earlier versions used `ndef_` / `NDEF_`).
+All NDEF functions and types are prefixed with `pn5180_ndef_`, constants with `PN5180_NDEF_` (since 0.2.0; earlier versions used `ndef_` / `NDEF_`). Since 0.3.0 the remaining types and macros are prefixed as well (`pn5180_uid_t`, `PN5180_IRQ_STATUS`, ...) and all function names are snake_case (`pn5180_read_register()`, `pn5180_set_rf_on()`, ...); see CHANGES.md for the full list of renames.
 
 ```c
 #include "pn5180-ndef.h"
@@ -302,7 +303,15 @@ void read_ndef_message(pn5180_proto_t *proto)
 
 ## Notes
 
-- **Blocking calls & timeouts**: All APIs are synchronous and wait for hardware completion using `BUSY`, IRQ, and transceiver-state polling. Operations respect internal timeouts and return promptly on error.
+- **Blocking calls & timeouts**: All APIs are synchronous. The wait for a card response is timed by PN5180 Timer1 (started at the end of the transmission, stopped when a reception begins), so a missing card is reported within a few milliseconds. `pn5180_set_hw_rx_timeout(pn5180, false)` falls back to a host-side timeout.
+
+- **IRQ pin (optional)**: call `pn5180_irq_attach(pn5180, gpio)` after `pn5180_init()` to wait on the PN5180 IRQ pin instead of polling `IRQ_STATUS` over SPI. Without it the driver polls, busy for the first 5 ms and yielding to other tasks after that. The IRQ pin is required for `pn5180_lpcd_wait()`.
+
+- **Custom RF exchanges**: `pn5180_rf_transceive()` sends a frame and receives the response with an explicit timeout; the protocol code in this component is built on it.
+
+- **Shared SPI bus**: if the bus is used by other devices, initialize it in the application and use `pn5180_spi_attach(host, clock_hz)` instead of `pn5180_spi_init()`. `pn5180_deinit()` then leaves the bus alone.
+
+- **Recovery**: `pn5180_recover()` resets the reader and restores the RF configuration and the field state.
 
 - **Error handling**: The component detects RX errors and performs limited automatic recovery where implemented, including ISO14443-4 receive retries for timeout/protocol errors. Applications should still handle persistent failures and card removal.
 
@@ -313,7 +322,7 @@ void read_ndef_message(pn5180_proto_t *proto)
 
 - **CRC policy (ISO14443A)**: Anticollision runs with CRC disabled; SELECT uses CRC enabled. After SELECT, CRC remains enabled.
 
-- **RF field control**: Toggle RF off/on between scans (`pn5180_setRF_off()` / `pn5180_setRF_on()`) and allow 5.1 ms for tags to return to IDLE.
+- **RF field control**: Toggle RF off/on between scans (`pn5180_set_rf_off()` / `pn5180_set_rf_on()`) and allow 5.1 ms for tags to return to IDLE. After switching the field on the driver waits a guard time (5.1 ms by default, `pn5180_set_rf_guard_time_us()`) before the first command. `pn5180_set_rfca(pn5180, false)` disables RF collision avoidance.
 
 - **Initialization checks**: `pn5180_init()` validates the detected firmware version and fails early if the reader does not meet the minimum supported revision. On failure the `pn5180_spi_t` passed in is left untouched, so `pn5180_init()` can be retried with it.
 

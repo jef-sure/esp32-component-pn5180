@@ -37,26 +37,17 @@ extern "C" {
 /** @brief Warning log macro (always enabled) */
 #define PN5180_LOGW(tag, format, ...) ESP_LOGW(tag, format, ##__VA_ARGS__)
 
-/**
- * @brief Wait for RX IRQ and read received data into a buffer
- * @param pn5180 Pointer to PN5180 device structure
- * @param irq_mask IRQ flags to wait for (RX_IRQ_STAT, timeout, etc.)
- * @param operation Description of operation (for logging)
- * @param buffer Destination buffer for RX data (can be NULL to skip copy)
- * @param buffer_len Size of destination buffer in bytes
- * @param out_len Optional pointer to receive RX byte count
- * @param out_rx_status Optional pointer to receive RX_STATUS register value
- * @return true on successful RX and read, false on error/timeout
+/*
+ * Response timeouts for pn5180_rf_transceive(), in microseconds. They bound the time until a card
+ * starts to answer, so they decide how long a missing card costs. All are several times the delay
+ * the standards and datasheets allow, because a timeout that is too short breaks a working card.
  */
-bool pn5180_wait_read_rx(     //
-    pn5180_t   *pn5180,       //
-    uint32_t    irq_mask,     //
-    const char *operation,    //
-    uint8_t    *buffer,       //
-    size_t      buffer_len,   //
-    uint16_t   *out_len,      //
-    uint32_t   *out_rx_status //
-);
+#define PN5180_TIMEOUT_14443A_ACTIVATION_US 5000u  /**< REQA, WUPA, anticollision, SELECT (FDT is below 0.2 ms) */
+#define PN5180_TIMEOUT_14443A_RATS_US       20000u /**< RATS: activation frame waiting time is about 5 ms */
+#define PN5180_TIMEOUT_MIFARE_READ_US       10000u /**< READ, GET_VERSION and the ACK after a write command */
+#define PN5180_TIMEOUT_MIFARE_WRITE_US      20000u /**< ACK after the data was programmed (Ultralight: up to 4 ms) */
+#define PN5180_TIMEOUT_15693_US             10000u /**< Inventory, Select, Read, Get System Info, Reset to Ready */
+#define PN5180_TIMEOUT_15693_WRITE_US       40000u /**< Write Single Block: the tag answers after programming (up to 20 ms) */
 
 #ifdef __cplusplus
 }

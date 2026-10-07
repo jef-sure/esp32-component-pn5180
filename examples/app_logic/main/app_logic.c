@@ -52,9 +52,9 @@ static const uint8_t mifare_keys[][6] = {
     {0x53, 0x3C, 0xB6, 0xC7, 0x23, 0xF6},
     {0x8F, 0xD0, 0xA4, 0xF2, 0x56, 0xE9},
 };
-static const uint8_t key_types[] = {MIFARE_CLASSIC_KEYA, MIFARE_CLASSIC_KEYB};
+static const uint8_t key_types[] = {PN5180_MIFARE_CLASSIC_KEYA, PN5180_MIFARE_CLASSIC_KEYB};
 
-static const char *get_card_type_name(nfc_type_t subtype)
+static const char *get_card_type_name(pn5180_card_type_t subtype)
 {
     switch (subtype) {
     case PN5180_MIFARE_CLASSIC_1K:
@@ -88,13 +88,13 @@ static const char *get_card_type_name(nfc_type_t subtype)
     }
 }
 
-static bool requires_authentication(nfc_type_t subtype)
+static bool requires_authentication(pn5180_card_type_t subtype)
 {
     return (subtype == PN5180_MIFARE_CLASSIC_1K || subtype == PN5180_MIFARE_CLASSIC_MINI || subtype == PN5180_MIFARE_CLASSIC_4K ||
             subtype == PN5180_MIFARE_PLUS_2K || subtype == PN5180_MIFARE_PLUS_4K);
 }
 
-static int get_sector_from_block(nfc_type_t subtype, int block)
+static int get_sector_from_block(pn5180_card_type_t subtype, int block)
 {
     if (subtype == PN5180_MIFARE_CLASSIC_4K && block >= 128) {
         return 32 + (block - 128) / 16;
@@ -103,7 +103,7 @@ static int get_sector_from_block(nfc_type_t subtype, int block)
     }
 }
 
-static int get_sector_first_block(nfc_type_t subtype, int sector)
+static int get_sector_first_block(pn5180_card_type_t subtype, int sector)
 {
     if (subtype == PN5180_MIFARE_CLASSIC_4K && sector >= 32) {
         return 128 + (sector - 32) * 16;
@@ -119,7 +119,7 @@ typedef enum
     AUTH_RESULT_NO_CARD,
 } auth_result_t;
 
-static auth_result_t authenticate_sector_with_key(pn5180_proto_t *proto, nfc_uid_t *uid, int sector_block, const uint8_t *key, uint8_t key_type)
+static auth_result_t authenticate_sector_with_key(pn5180_proto_t *proto, pn5180_uid_t *uid, int sector_block, const uint8_t *key, uint8_t key_type)
 {
     if (!proto || !proto->authenticate) return AUTH_RESULT_FAIL;
 
@@ -141,7 +141,7 @@ static auth_result_t authenticate_sector_with_key(pn5180_proto_t *proto, nfc_uid
     return AUTH_RESULT_FAIL;
 }
 
-static bool authenticate_sector(pn5180_proto_t *proto, nfc_uid_t *uid, int sector_block)
+static bool authenticate_sector(pn5180_proto_t *proto, pn5180_uid_t *uid, int sector_block)
 {
     if (proto->authenticate == NULL) {
         return false;
@@ -153,7 +153,7 @@ static bool authenticate_sector(pn5180_proto_t *proto, nfc_uid_t *uid, int secto
             auth_result_t result = authenticate_sector_with_key(proto, uid, sector_block, mifare_keys[ki], key_types[kt]);
             if (result == AUTH_RESULT_OK) {
                 int sector = get_sector_from_block(uid->subtype, sector_block);
-                ESP_LOGI(TAG, "Sector %2d authenticated with key %zu (%s)", sector, ki, (key_types[kt] == MIFARE_CLASSIC_KEYA) ? "KeyA" : "KeyB");
+                ESP_LOGI(TAG, "Sector %2d authenticated with key %zu (%s)", sector, ki, (key_types[kt] == PN5180_MIFARE_CLASSIC_KEYA) ? "KeyA" : "KeyB");
                 return true;
             }
             if (result == AUTH_RESULT_NO_CARD) {
@@ -166,7 +166,7 @@ static bool authenticate_sector(pn5180_proto_t *proto, nfc_uid_t *uid, int secto
 
 typedef struct
 {
-    nfc_uid_t *uid;
+    pn5180_uid_t *uid;
 } ndef_auth_ctx_t;
 
 static bool ndef_auth_callback(pn5180_proto_t *proto, int blockno, void *user_ctx)
@@ -204,7 +204,7 @@ static void print_block_data(int block, const uint8_t *data, int size)
     printf("\n");
 }
 
-static void read_card_blocks(pn5180_proto_t *proto, nfc_uid_t *uid, int blocks_count, int block_size)
+static void read_card_blocks(pn5180_proto_t *proto, pn5180_uid_t *uid, int blocks_count, int block_size)
 {
     if (blocks_count <= 0 || block_size <= 0 || proto->block_read == NULL) {
         return;
@@ -263,7 +263,7 @@ static void read_card_blocks(pn5180_proto_t *proto, nfc_uid_t *uid, int blocks_c
     if (block_data != small_block_data) free(block_data);
 }
 
-static void process_card(pn5180_proto_t *proto, nfc_uid_t *uid)
+static void process_card(pn5180_proto_t *proto, pn5180_uid_t *uid)
 {
     printf("UID Length=%d, UID=", uid->uid_length);
     for (int j = 0; j < uid->uid_length; j++) {
@@ -356,14 +356,14 @@ static void process_card(pn5180_proto_t *proto, nfc_uid_t *uid)
 static bool read_version(pn5180_t *pn5180, uint8_t addr, const char *name)
 {
     uint8_t version[2];
-    if (!pn5180_readEEprom(pn5180, addr, version, sizeof(version))) {
+    if (!pn5180_read_eeprom(pn5180, addr, version, sizeof(version))) {
         ESP_LOGE(TAG, "Failed to read %s", name);
         return false;
     }
 
     ESP_LOGI(TAG, "%s: %d.%d", name, version[1], version[0]);
 
-    if (addr == PRODUCT_VERSION && version[1] == 0xff) {
+    if (addr == PN5180_PRODUCT_VERSION && version[1] == 0xff) {
         ESP_LOGE(TAG, "Initialization failed - invalid product version");
         return false;
     }
@@ -387,8 +387,8 @@ static bool init_pn5180_hardware(pn5180_t **pn5180_out)
 
     ESP_LOGI(TAG, "PN5180 initialized successfully");
 
-    if (!read_version(pn5180, PRODUCT_VERSION, "Product version") || !read_version(pn5180, FIRMWARE_VERSION, "Firmware version") ||
-        !read_version(pn5180, EEPROM_VERSION, "EEPROM version")) {
+    if (!read_version(pn5180, PN5180_PRODUCT_VERSION, "Product version") || !read_version(pn5180, PN5180_FIRMWARE_VERSION, "Firmware version") ||
+        !read_version(pn5180, PN5180_EEPROM_VERSION, "EEPROM version")) {
         pn5180_deinit(pn5180, true);
         return false;
     }
@@ -397,13 +397,11 @@ static bool init_pn5180_hardware(pn5180_t **pn5180_out)
     return true;
 }
 
-static void scan_protocol(pn5180_proto_t *proto, const char *label, uint8_t rf_config)
+static void scan_protocol(pn5180_proto_t *proto, const char *label)
 {
     ESP_LOGI(TAG, "Scanning for %s cards...", label);
 
-    proto->pn5180->rf_config = rf_config;
-
-    pn5180_setRF_off(proto->pn5180);
+    pn5180_set_rf_off(proto->pn5180);
     pn5180_delay_ms(5);
     esp_rom_delay_us(1000);
     if (!proto->setup_rf(proto)) {
@@ -411,7 +409,7 @@ static void scan_protocol(pn5180_proto_t *proto, const char *label, uint8_t rf_c
         return;
     }
 
-    nfc_uids_array_t *uids = proto->get_all_uids(proto);
+    pn5180_uids_array_t *uids = proto->get_all_uids(proto);
     if (uids == NULL) {
         ESP_LOGI(TAG, "No cards found");
         return;
@@ -458,8 +456,8 @@ void app_run(void)
     ESP_LOGI(TAG, "ISO15693 protocol initialized successfully");
 
     while (true) {
-        scan_protocol(proto_14443, "ISO14443A", 0x00);
-        scan_protocol(proto_15693, "ISO15693", PN5180_15693_26KASK100);
+        scan_protocol(proto_14443, "ISO14443A");
+        scan_protocol(proto_15693, "ISO15693");
 
         pn5180_delay_ms(2000);
     }

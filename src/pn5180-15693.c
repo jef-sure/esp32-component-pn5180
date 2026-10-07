@@ -57,21 +57,19 @@ static bool pn5180_iso15693_check_response(const char *operation, const uint8_t 
 #define PN5180_15693_26KASK10 0x0E
 #endif
 
-static bool pn5180_15693_setupRF(pn5180_t *pn5180)
+static bool pn5180_15693_setup_rf(pn5180_t *pn5180, uint8_t rf_config)
 {
-    uint8_t desired_rf = pn5180->rf_config;
-    pn5180_writeRegisterWithAndMask(pn5180, SYSTEM_CONFIG, SYSTEM_CONFIG_CLEAR_CRYPTO_MASK);
+    pn5180_write_register_and_mask(pn5180, PN5180_SYSTEM_CONFIG, PN5180_SYSTEM_CONFIG_CLEAR_CRYPTO_MASK);
     pn5180_set_transceiver_idle(pn5180);
     if (pn5180->is_rf_on) {
-        pn5180_setRF_off(pn5180);
+        pn5180_set_rf_off(pn5180);
     }
-    bool ret = pn5180_loadRFConfig(pn5180, desired_rf);
+    bool ret = pn5180_load_rf_config(pn5180, rf_config);
     if (!ret) {
         ESP_LOGE(TAG, "Failed to load RF config for 15693");
         return false;
     }
-    pn5180->rf_config = desired_rf;
-    ret               = pn5180_setRF_on(pn5180);
+    ret = pn5180_set_rf_on(pn5180);
     if (!ret) {
         ESP_LOGE(TAG, "Failed to turn RF on for 15693");
         return false;
@@ -79,33 +77,22 @@ static bool pn5180_15693_setupRF(pn5180_t *pn5180)
     return true;
 }
 
-static bool pn5180_wait_for_irq_quiet(pn5180_t *pn5180, uint32_t irq_mask, uint32_t *irqStatus)
+// Sends a request and receives the response frame. Returns true only for an error-free reception.
+static bool pn5180_iso15693_exchange(pn5180_t *pn5180, const uint8_t *cmd, size_t cmd_len, uint8_t *rx, size_t rx_size, uint16_t *num_bytes,
+                                     uint32_t timeout_us)
 {
-    int64_t deadline = esp_timer_get_time() + (1000LL * pn5180->timeout_ms);
-    int     spin     = 0;
-    while (true) {
-        *irqStatus = pn5180_getIRQStatus(pn5180);
-        if (*irqStatus & (irq_mask | GENERAL_ERROR_IRQ_STAT)) {
-            pn5180_clearAllIRQs(pn5180);
-            return true;
-        }
-        if (esp_timer_get_time() > deadline) {
-            pn5180_clearAllIRQs(pn5180);
-            return false;
-        }
-        esp_rom_delay_us(10);
-        if ((++spin % 2000) == 0) {
-            vTaskDelay(1);
-        }
-    }
+    size_t             rx_len = 0;
+    pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, cmd, cmd_len, 0, rx, rx_size, &rx_len, timeout_us, NULL);
+    *num_bytes                = (uint16_t)rx_len;
+    return result == PN5180_RF_OK;
 }
 
-static bool _pn5180_15693_setupRF(pn5180_proto_t *proto)
+static bool _pn5180_15693_setup_rf(pn5180_proto_t *proto)
 {
-    return pn5180_15693_setupRF(proto->pn5180);
+    return pn5180_15693_setup_rf(proto->pn5180, proto->rf_config);
 }
 
-static void pn5180_iso15693_fill_uid(nfc_uid_t *entry, const uint8_t *uid, uint8_t uid_len, uint16_t agc)
+static void pn5180_iso15693_fill_uid(pn5180_uid_t *entry, const uint8_t *uid, uint8_t uid_len, uint16_t agc)
 {
     entry->uid_length = uid_len;
     entry->sak        = 0;
@@ -131,14 +118,14 @@ static size_t pn5180_iso15693_build_cmd(uint8_t *cmd, size_t cmd_size, uint8_t f
     return 10;
 }
 
-static bool pn5180_iso15693_collect_uid(nfc_uids_array_t **uids, const uint8_t *uid, uint8_t uid_len, uint16_t agc)
+static bool pn5180_iso15693_collect_uid(pn5180_uids_array_t **uids, const uint8_t *uid, uint8_t uid_len, uint16_t agc)
 {
     if (uids == NULL) {
         PN5180_LOGD(TAG, "collect_uid: uids container is NULL");
         return false;
     }
 
-    if (uid == NULL || uid_len == 0 || uid_len > sizeof(((nfc_uid_t *)0)->uid)) {
+    if (uid == NULL || uid_len == 0 || uid_len > sizeof(((pn5180_uid_t *)0)->uid)) {
         PN5180_LOGD(TAG, "collect_uid: invalid uid");
         return false;
     }
@@ -154,7 +141,7 @@ static bool pn5180_iso15693_collect_uid(nfc_uids_array_t **uids, const uint8_t *
     }
 
     if (*uids == NULL) {
-        *uids = calloc(1, sizeof(nfc_uids_array_t));
+        *uids = calloc(1, sizeof(pn5180_uids_array_t));
         if (*uids == NULL) {
             ESP_LOGE(TAG, "Memory allocation failed for ISO15693 UIDs");
             return false;
@@ -165,28 +152,27 @@ static bool pn5180_iso15693_collect_uid(nfc_uids_array_t **uids, const uint8_t *
         return true;
     }
 
-    nfc_uids_array_t *new_uids = realloc(*uids, sizeof(nfc_uids_array_t) + ((*uids)->uids_count * sizeof(nfc_uid_t)));
+    pn5180_uids_array_t *new_uids = realloc(*uids, sizeof(pn5180_uids_array_t) + ((*uids)->uids_count * sizeof(pn5180_uid_t)));
     if (new_uids == NULL) {
         ESP_LOGE(TAG, "Memory allocation failed for ISO15693 UIDs");
         return false;
     }
-    *uids              = new_uids;
-    nfc_uid_t *new_uid = &(*uids)->uids[(*uids)->uids_count];
+    *uids                 = new_uids;
+    pn5180_uid_t *new_uid = &(*uids)->uids[(*uids)->uids_count];
     pn5180_iso15693_fill_uid(new_uid, uid, uid_len, agc);
     (*uids)->uids_count++;
     return true;
 }
 
 /**
- * @brief Send inventory command
+ * @brief Build an inventory request (flags, command, mask) into send_buf, which must hold 12 bytes
  * @param single_slot If true, requests 1 slot. If false, requests 16 slots.
  * @param mask_len Length of mask in bits (0-60)
  * @param mask_val Mask value (up to 64 bits, but only mask_len used)
  */
-static bool pn5180_iso15693_send_inventory_cmd(pn5180_t *pn5180, bool single_slot, uint8_t mask_len, uint64_t mask_val)
+static size_t pn5180_iso15693_build_inventory_cmd(pn5180_t *pn5180, uint8_t *send_buf, bool single_slot, uint8_t mask_len, uint64_t mask_val)
 {
-    uint8_t send_buf[12]; // ample space for mask
-    int     idx = 0;
+    size_t idx = 0;
 
     // Enable full CRC for proper error detection
     pn5180_enable_crc(pn5180);
@@ -211,19 +197,15 @@ static bool pn5180_iso15693_send_inventory_cmd(pn5180_t *pn5180, bool single_slo
         }
     }
 
-    if (!pn5180_sendData(pn5180, send_buf, idx, 0)) {
-        PN5180_LOGD(TAG, "inventory: send failed");
-        return false;
-    }
-    PN5180_LOGD(TAG, "inventory: sent (%s) mask_len=%u val=%" PRIx64, single_slot ? "single-slot" : "16-slot", (unsigned)mask_len, mask_val);
-    return true;
+    PN5180_LOGD(TAG, "inventory: (%s) mask_len=%u val=%" PRIx64, single_slot ? "single-slot" : "16-slot", (unsigned)mask_len, mask_val);
+    return idx;
 }
 
 /**
  * @brief Try single-slot inventory to read one tag at a time.
  * Uses a Stack-based Depth-First Search (DFS) to resolve collisions.
  */
-static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, nfc_uids_array_t **uids)
+static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_array_t **uids)
 {
     const int max_total_scans = 64; // Safety limit
     int       scan_count      = 0;
@@ -254,26 +236,21 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, nfc_uids_array_
         scan_count++;
 
         // Send single-slot inventory with current mask
-        if (!pn5180_iso15693_send_inventory_cmd(pn5180, true, current.len, current.val)) {
-            continue;
-        }
+        uint8_t inv_cmd[12];
+        size_t  inv_len = pn5180_iso15693_build_inventory_cmd(pn5180, inv_cmd, true, current.len, current.val);
 
-        uint32_t irq_status = 0;
-        if (!pn5180_wait_for_irq_quiet(pn5180, RX_IRQ_STAT | TIMER2_IRQ_STAT, &irq_status)) {
+        uint8_t            rx_buf[16];
+        size_t             rx_len    = 0;
+        uint32_t           rx_status = 0;
+        pn5180_rf_result_t result    = pn5180_rf_transceive(pn5180, inv_cmd, inv_len, 0, rx_buf, sizeof(rx_buf), &rx_len, PN5180_TIMEOUT_15693_US, &rx_status);
+        if (result == PN5180_RF_TIMEOUT || result == PN5180_RF_FATAL) {
             // Timeout - no tags match this mask
-            // PN5180_LOGD(TAG, "scan %d: timeout (mask_len=%d)", scan_count, current.len);
             continue;
         }
 
-        if (!(irq_status & RX_IRQ_STAT)) {
-            continue;
-        }
-
-        uint32_t rx_status = 0;
-        pn5180_readRegister(pn5180, RX_STATUS, &rx_status);
-        uint16_t num_bytes    = (rx_status >> RX_BYTES_RECEIVED_START) & RX_BYTES_RECEIVED_MASK;
-        bool     collision    = (rx_status & RX_COLLISION_DETECTED) != 0;
-        bool     protocol_err = (rx_status & RX_PROTOCOL_ERROR) != 0;
+        uint16_t num_bytes    = (rx_status >> PN5180_RX_BYTES_RECEIVED_START) & PN5180_RX_BYTES_RECEIVED_MASK;
+        bool     collision    = (result == PN5180_RF_COLLISION);
+        bool     protocol_err = (rx_status & PN5180_RX_PROTOCOL_ERROR) != 0;
 
         PN5180_LOGD(TAG, "scan %d: rx_status=0x%08" PRIx32 " len=%u val=0x%" PRIx64 " collision=%d bytes=%u", scan_count, rx_status, (unsigned)current.len,
                     current.val, collision, (unsigned)num_bytes);
@@ -314,7 +291,7 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, nfc_uids_array_
             // we will catch them in the next iteration's "abandoning noisy branch" check.
             // So we proceed to split here for len=0 even if noisy.
 
-            // If retries exhausted OR it looks like a clean collisionData, SPLIT
+            // If retries exhausted OR it looks like a clean collision, SPLIT
             if (current.len < 16) {
                 if (stack_ptr + 2 <= ARRAY_SIZE(stack)) {
                     // Push '1' branch
@@ -338,9 +315,9 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, nfc_uids_array_
         }
 
         // No collision, check data
-        if (num_bytes >= 10 && num_bytes <= 16) {
-            uint8_t rx_buf[16];
-            if (pn5180_readData(pn5180, num_bytes, rx_buf)) {
+        // A frame flagged with an RX error is still taken if it is complete, as before.
+        if (rx_len >= 10) {
+            {
                 // rx_buf[1]=DSFID, [2..9]=UID
                 // Check flags in rx_buf[0]? Usually 0x00.
 
@@ -351,8 +328,8 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, nfc_uids_array_
                              uid_ptr[6], uid_ptr[7]);
 
                     uint32_t agc_reg = 0;
-                    pn5180_readRegister(pn5180, RF_STATUS, &agc_reg);
-                    uint16_t current_agc = (uint16_t)(agc_reg & RF_STATUS_AGC_MASK);
+                    pn5180_read_register(pn5180, PN5180_RF_STATUS, &agc_reg);
+                    uint16_t current_agc = (uint16_t)(agc_reg & PN5180_RF_STATUS_AGC_MASK);
                     ESP_LOGI(TAG, "AGC Value: %u", (unsigned)current_agc);
 
                     bool is_new = pn5180_iso15693_collect_uid(uids, uid_ptr, 8, current_agc);
@@ -383,21 +360,13 @@ static bool pn5180_iso15693_stay_quiet(pn5180_t *pn5180, uint8_t *uid)
         PN5180_LOGD(TAG, "stay_quiet: build failed");
         return false;
     }
-    if (!pn5180_sendData(pn5180, quiet_cmd, cmd_len, 0)) {
-        PN5180_LOGD(TAG, "stay_quiet: send failed");
-        return false;
-    }
     // Stay Quiet has no response: the frame is done once the transmission has ended.
-    uint32_t irq_status = 0;
-    if (!pn5180_wait_for_irq(pn5180, TX_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "ISO15693 Stay Quiet", &irq_status)) {
-        return false;
-    }
-    return (irq_status & GENERAL_ERROR_IRQ_STAT) == 0;
+    return pn5180_rf_transceive(pn5180, quiet_cmd, cmd_len, 0, NULL, 0, NULL, 0, NULL) == PN5180_RF_OK;
 }
 
 static bool pn5180_iso15693_select_by_uid( //
-    pn5180_t  *pn5180,                     //
-    nfc_uid_t *uid                         //
+    pn5180_t     *pn5180,                  //
+    pn5180_uid_t *uid                      //
 )
 {
     if (pn5180 == NULL || uid == NULL) {
@@ -417,14 +386,10 @@ static bool pn5180_iso15693_select_by_uid( //
         return false;
     }
 
-    if (!pn5180_sendData(pn5180, select_cmd, cmd_len, 0)) {
-        PN5180_LOGD(TAG, "select_by_uid: send failed");
-        return false;
-    }
     uint16_t num_bytes = 0;
     uint8_t  rx_buf[8];
-    if (!pn5180_wait_read_rx(pn5180, RX_IRQ_STAT | TIMER2_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "ISO15693 Select", rx_buf, sizeof(rx_buf), &num_bytes, NULL)) {
-        PN5180_LOGD(TAG, "select_by_uid: wait/read failed");
+    if (!pn5180_iso15693_exchange(pn5180, select_cmd, cmd_len, rx_buf, sizeof(rx_buf), &num_bytes, PN5180_TIMEOUT_15693_US)) {
+        PN5180_LOGD(TAG, "select_by_uid: no valid response");
         return false;
     }
     if (!pn5180_iso15693_check_response("select_by_uid", rx_buf, num_bytes)) {
@@ -435,7 +400,7 @@ static bool pn5180_iso15693_select_by_uid( //
     return true;
 }
 
-static bool _pn5180_15693_select_by_uid(pn5180_proto_t *proto, nfc_uid_t *uid)
+static bool _pn5180_15693_select_by_uid(pn5180_proto_t *proto, pn5180_uid_t *uid)
 {
     return pn5180_iso15693_select_by_uid(proto->pn5180, uid);
 }
@@ -453,16 +418,10 @@ static bool pn5180_iso15693_halt(pn5180_t *pn5180)
     halt_cmd[1] = ISO15693_CMD_RESET_TO_READY;
 
     PN5180_LOGD(TAG, "halt: sending Reset to Ready (selected)");
-    if (!pn5180_sendData(pn5180, halt_cmd, sizeof(halt_cmd), 0)) {
-        PN5180_LOGD(TAG, "halt: send failed");
-        return false;
-    }
-
     uint16_t num_bytes = 0;
     uint8_t  rx_buf[8];
-    if (!pn5180_wait_read_rx(pn5180, RX_IRQ_STAT | TIMER2_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "ISO15693 Reset to Ready", rx_buf, sizeof(rx_buf), &num_bytes,
-                             NULL)) {
-        PN5180_LOGD(TAG, "halt: wait/read failed");
+    if (!pn5180_iso15693_exchange(pn5180, halt_cmd, sizeof(halt_cmd), rx_buf, sizeof(rx_buf), &num_bytes, PN5180_TIMEOUT_15693_US)) {
+        PN5180_LOGD(TAG, "halt: no valid response");
         return false;
     }
     return pn5180_iso15693_check_response("halt", rx_buf, num_bytes);
@@ -487,14 +446,9 @@ static bool pn5180_iso15693_get_system_info(pn5180_t *pn5180, uint8_t *buf, size
         return false;
     }
 
-    if (!pn5180_sendData(pn5180, cmd, cmd_len, 0)) {
-        PN5180_LOGD(TAG, "sysinfo: send failed");
-        return false;
-    }
-
     uint16_t num_bytes = 0;
-    if (!pn5180_wait_read_rx(pn5180, RX_IRQ_STAT | TIMER2_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "ISO15693 SysInfo", buf, buf_len, &num_bytes, NULL)) {
-        PN5180_LOGD(TAG, "sysinfo: wait/read failed");
+    if (!pn5180_iso15693_exchange(pn5180, cmd, cmd_len, buf, buf_len, &num_bytes, PN5180_TIMEOUT_15693_US)) {
+        PN5180_LOGD(TAG, "sysinfo: no valid response");
         return false;
     }
     if (!pn5180_iso15693_check_response("sysinfo", buf, num_bytes)) {
@@ -533,15 +487,10 @@ static bool pn5180_iso15693_block_read(pn5180_t *pn5180, int blockno, uint8_t *b
         cmd_len = 4;
     }
 
-    if (!pn5180_sendData(pn5180, cmd, cmd_len, 0)) {
-        PN5180_LOGD(TAG, "block_read: send failed block=%d", blockno);
-        return false;
-    }
-
     uint8_t  temp[64];
     uint16_t num_bytes = 0;
-    if (!pn5180_wait_read_rx(pn5180, RX_IRQ_STAT | TIMER2_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "ISO15693 Read", temp, sizeof(temp), &num_bytes, NULL)) {
-        PN5180_LOGD(TAG, "block_read: wait/read failed");
+    if (!pn5180_iso15693_exchange(pn5180, cmd, cmd_len, temp, sizeof(temp), &num_bytes, PN5180_TIMEOUT_15693_US)) {
+        PN5180_LOGD(TAG, "block_read: no valid response block=%d", blockno);
         return false;
     }
     if (num_bytes < 2) {
@@ -590,15 +539,10 @@ static int pn5180_iso15693_block_write(pn5180_t *pn5180, int blockno, const uint
     memcpy(&cmd[cmd_len], buffer, buffer_len);
     cmd_len += buffer_len;
 
-    if (!pn5180_sendData(pn5180, cmd, cmd_len, 0)) {
-        PN5180_LOGD(TAG, "block_write: send failed block=%d", blockno);
-        return -3;
-    }
-
     uint8_t  temp[32];
     uint16_t num_bytes = 0;
-    if (!pn5180_wait_read_rx(pn5180, RX_IRQ_STAT | TIMER2_IRQ_STAT | GENERAL_ERROR_IRQ_STAT, "ISO15693 Write", temp, sizeof(temp), &num_bytes, NULL)) {
-        PN5180_LOGD(TAG, "block_write: wait/read failed");
+    if (!pn5180_iso15693_exchange(pn5180, cmd, cmd_len, temp, sizeof(temp), &num_bytes, PN5180_TIMEOUT_15693_WRITE_US)) {
+        PN5180_LOGD(TAG, "block_write: no valid response block=%d", blockno);
         return -4;
     }
     if (num_bytes == 0) {
@@ -623,10 +567,10 @@ static int _pn5180_15693_block_write(pn5180_proto_t *proto, int blockno, const u
 }
 
 static bool _pn5180_15693_detect_card_type_and_capacity( //
-    pn5180_t  *pn5180,                                   //
-    nfc_uid_t *uid,                                      //
-    int       *blocks_count,                             //
-    int       *block_size                                //
+    pn5180_t     *pn5180,                                //
+    pn5180_uid_t *uid,                                   //
+    int          *blocks_count,                          //
+    int          *block_size                             //
 )
 {
     if (pn5180 == NULL || uid == NULL || blocks_count == NULL || block_size == NULL) {
@@ -664,15 +608,14 @@ static bool _pn5180_15693_detect_card_type_and_capacity( //
     return false;
 }
 
-static nfc_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
+static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
 {
     if (pn5180 == NULL) {
         PN5180_LOGD(TAG, "get_all_uids: pn5180 is NULL");
         return NULL;
     }
 
-    nfc_uids_array_t *uids        = NULL;
-    uint8_t           original_rf = pn5180->rf_config;
+    pn5180_uids_array_t *uids = NULL;
 
     // Prioritize ASK 10% (0x0E) which provides better power stability prevents
     // tags from resetting their "Stay Quiet" state during modulation.
@@ -681,13 +624,8 @@ static nfc_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
 
     PN5180_LOGD(TAG, "get_all_uids: start");
 
-    // Temporarily reduce timeout for faster scanning
-    int old_timeout    = pn5180->timeout_ms;
-    pn5180->timeout_ms = 40;
-
     for (size_t rf_idx = 0; rf_idx < ARRAY_SIZE(rf_fallbacks); rf_idx++) {
-        pn5180->rf_config = rf_fallbacks[rf_idx];
-        if (!pn5180_15693_setupRF(pn5180)) {
+        if (!pn5180_15693_setup_rf(pn5180, rf_fallbacks[rf_idx])) {
             continue;
         }
 
@@ -720,9 +658,6 @@ static nfc_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
         }
     }
 
-    pn5180->rf_config  = original_rf;
-    pn5180->timeout_ms = old_timeout; // Restore timeout
-
     if (uids != NULL && uids->uids_count == 0) {
         free(uids);
         uids = NULL;
@@ -733,7 +668,7 @@ static nfc_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
         for (int i = 0; i < uids->uids_count - 1; i++) {
             for (int j = 0; j < uids->uids_count - i - 1; j++) {
                 if (uids->uids[j].agc > uids->uids[j + 1].agc) {
-                    nfc_uid_t temp    = uids->uids[j];
+                    pn5180_uid_t temp = uids->uids[j];
                     uids->uids[j]     = uids->uids[j + 1];
                     uids->uids[j + 1] = temp;
                 }
@@ -745,7 +680,7 @@ static nfc_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180)
     return uids;
 }
 
-static nfc_uids_array_t *_pn5180_15693_get_all_uids(pn5180_proto_t *proto)
+static pn5180_uids_array_t *_pn5180_15693_get_all_uids(pn5180_proto_t *proto)
 {
     return pn5180_15693_get_all_uids(proto->pn5180);
 }
@@ -757,9 +692,9 @@ pn5180_proto_t *pn5180_15693_init(pn5180_t *pn5180, pn5180_15693_rf_config_t rf_
     if (proto == NULL) {
         return NULL;
     }
-    pn5180->rf_config                    = (uint8_t)rf_config;
+    proto->rf_config                     = (uint8_t)rf_config;
     proto->pn5180                        = pn5180;
-    proto->setup_rf                      = _pn5180_15693_setupRF;
+    proto->setup_rf                      = _pn5180_15693_setup_rf;
     proto->get_all_uids                  = _pn5180_15693_get_all_uids;
     proto->select_by_uid                 = _pn5180_15693_select_by_uid;
     proto->halt                          = _pn5180_15693_halt;
