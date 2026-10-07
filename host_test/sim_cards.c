@@ -382,8 +382,15 @@ static pn5180_rf_result_t sim_a_iso_dep(sim_a_card_t *card, const uint8_t *tx, s
         if (!card->response_pending_after_wtx) {
             return PN5180_RF_TIMEOUT;
         }
-        card->response_pending_after_wtx = false;
-        out_len                          = sim_a_response_block(card, out);
+        if (card->wtx_requests > 0) {
+            card->wtx_requests--; // still not ready: ask again
+            out[0]  = 0xF2;
+            out[1]  = 0x02;
+            out_len = 2;
+        } else {
+            card->response_pending_after_wtx = false;
+            out_len                          = sim_a_response_block(card, out);
+        }
     } else if ((pcb & 0xF7) == 0xC2) { // S(DESELECT)
         card->deselect_count++;
         sim_a_leave_selected_state(card, true);

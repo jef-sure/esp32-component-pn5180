@@ -338,6 +338,7 @@ pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_n
         pn5180_free(ret);
         return NULL;
     }
+    ret->firmware_version = firmware_version;
     if (firmware_version < PN5180_MIN_FIRMWARE_VERSION) {
         ESP_LOGE(TAG, "Unsupported PN5180 firmware version 0x%04X", firmware_version);
         pn5180_free(ret);
@@ -380,7 +381,28 @@ pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_n
  * @param recv_data_len Length of data to receive
  * @return true on success, false on failure
  */
-static bool transceive_command_locked(pn5180_t *pn5180, const uint8_t *send_data, size_t send_data_len, uint8_t *recv_data, size_t recv_data_len)
+// One SPI transfer framed by NSS. The bus is held only while NSS is low: with NSS high the PN5180
+// ignores the bus, so other devices on a shared bus may use it while the PN5180 is busy with the command.
+static bool pn5180_spi_transfer(pn5180_t *pn5180, spi_transaction_t *trans, const char *busy_msg)
+{
+    if (spi_device_acquire_bus(pn5180->spi->spi_handle, portMAX_DELAY) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to acquire SPI bus");
+        return false;
+    }
+    gpio_set_level(pn5180->nss, 0);
+    esp_rom_delay_us(10);
+    bool ok = spi_device_polling_transmit(pn5180->spi->spi_handle, trans) == ESP_OK;
+    if (!ok) {
+        ESP_LOGE(TAG, "SPI transfer failed");
+    } else {
+        ok = wait_busy_level(pn5180, 1, busy_msg);
+    }
+    gpio_set_level(pn5180->nss, 1);
+    spi_device_release_bus(pn5180->spi->spi_handle);
+    return ok;
+}
+
+static bool transceive_command(pn5180_t *pn5180, const uint8_t *send_data, size_t send_data_len, uint8_t *recv_data, size_t recv_data_len)
 {
     if (send_data_len > PN5180_MAX_BUF_SIZE || recv_data_len > PN5180_MAX_BUF_SIZE) {
         ESP_LOGE(TAG, "transceive_command: Buffer size exceeds maximum");
@@ -397,18 +419,10 @@ static bool transceive_command_locked(pn5180_t *pn5180, const uint8_t *send_data
     if (!wait_busy_level(pn5180, 0, "before transfer")) {
         return false;
     }
-    gpio_set_level(pn5180->nss, 0);
-    esp_rom_delay_us(10);
-    if (spi_device_polling_transmit(pn5180->spi->spi_handle, &trans) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to transmit command via SPI");
-        gpio_set_level(pn5180->nss, 1);
+    if (!pn5180_spi_transfer(pn5180, &trans, "wait for busy after transfer")) {
         return false;
     }
-    if (!wait_busy_level(pn5180, 1, "wait for busy after transfer")) {
-        gpio_set_level(pn5180->nss, 1);
-        return false;
-    }
-    gpio_set_level(pn5180->nss, 1);
+    // The PN5180 executes the command now; this can take long (RF_ON, LOAD_RF_CONFIG) and does not need the bus.
     if (!wait_busy_level(pn5180, 0, "wait for idle after send")) {
         return false;
     }
@@ -420,36 +434,14 @@ static bool transceive_command_locked(pn5180_t *pn5180, const uint8_t *send_data
     trans.tx_buffer = pn5180->send_buf;
     trans.rx_buffer = pn5180->recv_buf;
     trans.length    = recv_data_len * 8;
-    gpio_set_level(pn5180->nss, 0);
-    esp_rom_delay_us(10);
-    if (spi_device_polling_transmit(pn5180->spi->spi_handle, &trans) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to transmit SPI transaction");
-        gpio_set_level(pn5180->nss, 1);
+    if (!pn5180_spi_transfer(pn5180, &trans, "wait for busy after recv")) {
         return false;
     }
-    if (!wait_busy_level(pn5180, 1, "wait for busy after recv")) {
-        gpio_set_level(pn5180->nss, 1);
-        return false;
-    }
-    gpio_set_level(pn5180->nss, 1);
     if (!wait_busy_level(pn5180, 0, "wait for idle after recv")) {
         return false;
     }
     memcpy(recv_data, pn5180->recv_buf, recv_data_len);
     return true;
-}
-
-// A command and its response are two SPI transfers framed by the manually driven NSS, so the bus
-// is held for the whole command: another device on a shared bus must not get in between.
-static bool transceive_command(pn5180_t *pn5180, const uint8_t *send_data, size_t send_data_len, uint8_t *recv_data, size_t recv_data_len)
-{
-    if (spi_device_acquire_bus(pn5180->spi->spi_handle, portMAX_DELAY) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to acquire SPI bus");
-        return false;
-    }
-    bool ret = transceive_command_locked(pn5180, send_data, send_data_len, recv_data, recv_data_len);
-    spi_device_release_bus(pn5180->spi->spi_handle);
-    return ret;
 }
 
 static bool write_register_command(pn5180_t *pn5180, uint8_t cmd, uint8_t reg, uint32_t value)
@@ -738,14 +730,19 @@ bool pn5180_lpcd_enter(pn5180_t *pn5180, uint16_t wakeup_counter_ms)
         return false;
     }
 
-    // LPCD self calibration takes its reference from AGC_REF_CONFIG: reading the register runs the
-    // calibration, and the value read has to be written back before LPCD is started.
-    uint32_t agc_ref = 0;
-    if (!pn5180_read_register(pn5180, PN5180_AGC_REF_CONFIG, &agc_ref) || !pn5180_write_register(pn5180, PN5180_AGC_REF_CONFIG, agc_ref)) {
-        ESP_LOGE(TAG, "Failed to set the LPCD reference value");
-        return false;
+    // Firmware 3.A and later: with LPCD mode 01b (self calibration, set by pn5180_lpcd_prepare()) the
+    // reference is taken from AGC_REF_CONFIG. Reading the register runs the calibration, and the value read
+    // has to be written back before LPCD is started (datasheet rev. 4.0, tables 73 and 112).
+    // Earlier firmware gives the mode bits another meaning and measures the reference by itself when LPCD
+    // starts; there the step would only switch the field on once more, so it is skipped.
+    if (pn5180->firmware_version >= PN5180_FIRMWARE_VERSION_3_A) {
+        uint32_t agc_ref = 0;
+        if (!pn5180_read_register(pn5180, PN5180_AGC_REF_CONFIG, &agc_ref) || !pn5180_write_register(pn5180, PN5180_AGC_REF_CONFIG, agc_ref)) {
+            ESP_LOGE(TAG, "Failed to set the LPCD reference value");
+            return false;
+        }
+        PN5180_LOGD(TAG, "LPCD reference AGC_REF_CONFIG=0x%08" PRIx32, agc_ref);
     }
-    PN5180_LOGD(TAG, "LPCD reference AGC_REF_CONFIG=0x%08" PRIx32, agc_ref);
 
     // LPCD_IRQ and GENERAL_ERROR_IRQ are non-maskable; writing IRQ_ENABLE still takes the flags of the last
     // RF exchange off the IRQ pin, and is what the NXP reader library does before entering LPCD.
@@ -1237,9 +1234,16 @@ bool pn5180_irq_attach(pn5180_t *pn5180, gpio_num_t irq)
 // With the IRQ pin the wait still wakes up this often to poll IRQ_STATUS, in case an edge was missed.
 #define PN5180_IRQ_RECHECK_MS 20
 
+typedef enum
+{
+    PN5180_WAIT_IRQ,      /**< One of the awaited flags is set */
+    PN5180_WAIT_DEADLINE, /**< The deadline passed */
+    PN5180_WAIT_SPI_ERROR /**< IRQ_STATUS could not be read */
+} pn5180_wait_result_t;
+
 // Waits until one of the irq_mask flags or GENERAL_ERROR is set, or the deadline passes.
 // IRQ flags are left as they are; *irq_status gets the last IRQ_STATUS value read.
-static bool pn5180_wait_irq_until(pn5180_t *pn5180, uint32_t irq_mask, int64_t deadline, uint32_t *irq_status)
+static pn5180_wait_result_t pn5180_wait_irq_until(pn5180_t *pn5180, uint32_t irq_mask, int64_t deadline, uint32_t *irq_status)
 {
     irq_mask |= PN5180_GENERAL_ERROR_IRQ_STAT;
     if (pn5180->irq_sem != NULL) {
@@ -1248,13 +1252,17 @@ static bool pn5180_wait_irq_until(pn5180_t *pn5180, uint32_t irq_mask, int64_t d
     }
     int64_t spin_until = esp_timer_get_time() + PN5180_IRQ_SPIN_US;
     while (true) {
-        *irq_status = pn5180_get_irq_status(pn5180);
+        // A failed read must not look like "no flag set yet", which would end as an ordinary RF timeout.
+        if (!pn5180_read_register(pn5180, PN5180_IRQ_STATUS, irq_status)) {
+            *irq_status = 0;
+            return PN5180_WAIT_SPI_ERROR;
+        }
         if (*irq_status & irq_mask) {
-            return true;
+            return PN5180_WAIT_IRQ;
         }
         int64_t now = esp_timer_get_time();
         if (now > deadline) {
-            return false;
+            return PN5180_WAIT_DEADLINE;
         }
         if (pn5180->irq_sem != NULL) {
             int64_t wait_ms = (deadline - now) / 1000 + 1;
@@ -1273,7 +1281,7 @@ static bool pn5180_wait_irq_until(pn5180_t *pn5180, uint32_t irq_mask, int64_t d
 bool pn5180_wait_for_irq(pn5180_t *pn5180, uint32_t irq_mask, const char *operation, uint32_t *irq_status)
 {
     int64_t deadline = esp_timer_get_time() + (1000LL * pn5180->timeout_ms);
-    bool    ret      = pn5180_wait_irq_until(pn5180, irq_mask, deadline, irq_status);
+    bool    ret      = pn5180_wait_irq_until(pn5180, irq_mask, deadline, irq_status) == PN5180_WAIT_IRQ;
     if (!ret) {
         ESP_LOGE(TAG, "Timeout waiting for %s", operation);
     } else if (*irq_status & PN5180_GENERAL_ERROR_IRQ_STAT) {
@@ -1377,9 +1385,12 @@ pn5180_rf_result_t pn5180_rf_transceive( //
         if (use_timer) {
             mask |= PN5180_TIMER1_IRQ_STAT;
         }
-        bool got_irq = pn5180_wait_irq_until(pn5180, mask, deadline, &irq);
+        pn5180_wait_result_t wait_result = pn5180_wait_irq_until(pn5180, mask, deadline, &irq);
+        bool                 got_irq     = (wait_result == PN5180_WAIT_IRQ);
 
-        if (!expect_rx) {
+        if (wait_result == PN5180_WAIT_SPI_ERROR) {
+            result = PN5180_RF_FATAL;
+        } else if (!expect_rx) {
             if (!got_irq) {
                 ESP_LOGE(TAG, "rf_transceive: transmission did not finish");
                 result = PN5180_RF_FATAL;

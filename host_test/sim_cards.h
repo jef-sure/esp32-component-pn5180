@@ -71,7 +71,7 @@ typedef struct
     bool    response_pending_after_wtx;
     int     drop_responses; /**< next N answers are lost on the way to the reader */
     int     drop_commands;  /**< next N commands are not received by the card */
-    int     wtx_requests;   /**< next N APDUs are preceded by a waiting time extension request */
+    int     wtx_requests;   /**< the card asks N more times for a waiting time extension before it answers */
     int     deselect_count;
     int     rats_count;
     /* Type 4 application */

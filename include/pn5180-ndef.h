@@ -35,6 +35,7 @@ typedef enum
     PN5180_NDEF_ERR_BUFFER_TOO_SMALL = -7, /**< Output buffer too small */
     PN5180_NDEF_ERR_CARD_FULL        = -8, /**< Card capacity exceeded */
     PN5180_NDEF_ERR_UNSUPPORTED      = -9, /**< Card type has no NDEF mapping in this driver */
+    PN5180_NDEF_ERR_ACCESS_DENIED    = -10, /**< The NDEF data is read protected */
 } pn5180_ndef_result_t;
 
 /** @name NDEF Record flag bits (header byte)

@@ -94,8 +94,8 @@ static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, ui
         uint8_t t0 = ats[idx++];
         fsci       = (uint8_t)(t0 & 0x0F);
         if (fsci >= (sizeof(pn5180_iso14443_4_fs_table) / sizeof(pn5180_iso14443_4_fs_table[0]))) {
-            ESP_LOGE(TAG, "Unsupported ATS FSCI %u", fsci);
-            return false;
+            // Reserved values: use the largest defined frame size instead of refusing the card.
+            fsci = (uint8_t)((sizeof(pn5180_iso14443_4_fs_table) / sizeof(pn5180_iso14443_4_fs_table[0])) - 1u);
         }
 
         if (t0 & 0x10) {
@@ -817,6 +817,9 @@ static bool pn5180_14443_4_activate(pn5180_t *pn5180)
 #define ISO_DEP_MAX_RETRIES    3
 // Longest frame waiting time ISO14443-4 allows (FWI 14); a waiting time extension cannot go beyond it.
 #define ISO_DEP_FWT_MAX_MS 4949
+// Waiting time extensions accepted in a row for one block. The standard sets no limit, but a card that
+// keeps asking must not hold the caller forever; a legitimate card needs a few at most.
+#define ISO_DEP_MAX_WTX 10
 // The PN5180 transmit buffer holds 260 bytes, the receive buffer below 260: keep blocks within 256 bytes.
 #define ISO_DEP_MAX_INF 253
 
@@ -881,6 +884,7 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
     bool    rx_chaining   = false; // the card is sending a chained response
     size_t  total_payload = 0;
     int     retries       = 0;
+    int     wtx_count     = 0;
     bool    ok            = false;
 
     pn5180_iso_dep_build_i_block(pn5180, tx);
@@ -911,6 +915,25 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
         }
 
         uint8_t rx_pcb = rx_buf[0];
+
+        // Blocks with CID or NAD are not for this exchange (neither was negotiated), and the fixed bits of
+        // I- and R-blocks must be right: anything else is an invalid block, handled like a damaged one.
+        bool is_i_block    = (rx_pcb & 0xC0) == 0x00;
+        bool is_r_block    = (rx_pcb & 0xC0) == 0x80;
+        bool invalid_block = (is_i_block && (rx_pcb & 0x2E) != 0x02) || (is_r_block && (rx_pcb & 0x2E) != 0x22) || (rx_pcb & 0xC0) == 0x40;
+        if (invalid_block) {
+            if (++retries > ISO_DEP_MAX_RETRIES) {
+                ESP_LOGE(TAG, "ISO-DEP exchange failed: invalid block 0x%02X", rx_pcb);
+                break;
+            }
+            ctrl_block[0] = (uint8_t)((rx_chaining ? ISO_DEP_PCB_R_ACK : ISO_DEP_PCB_R_NAK) | (pn5180->iso14443_block_number & 0x01));
+            next_tx       = ctrl_block;
+            next_tx_len   = 1;
+            continue;
+        }
+        if ((rx_pcb & 0xF7) != ISO_DEP_PCB_S_WTX) {
+            wtx_count = 0;
+        }
 
         if ((rx_pcb & 0xC0) == 0x00) { // I-block
             if (tx->tx_chaining) {
@@ -982,6 +1005,10 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
             uint8_t wtxm = (received >= 2) ? (uint8_t)(rx_buf[1] & 0x3F) : 0;
             if (wtxm == 0 || wtxm > 59) {
                 ESP_LOGE(TAG, "Invalid WTX frame received");
+                break;
+            }
+            if (++wtx_count > ISO_DEP_MAX_WTX) {
+                ESP_LOGE(TAG, "ISO-DEP: card asked for more time %d times in a row, giving up", wtx_count);
                 break;
             }
             ctrl_block[0] = ISO_DEP_PCB_S_WTX;

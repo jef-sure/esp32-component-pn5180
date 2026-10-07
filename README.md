@@ -17,7 +17,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/esp32-component-pn5180^0.4.0"
+idf.py add-dependency "jef-sure/esp32-component-pn5180^0.4.1"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.x or 6.0 is required.
@@ -163,7 +163,7 @@ if (result == PN5180_NDEF_OK) {
 }
 ```
 
-`PN5180_NDEF_ERR_NO_NDEF` means that the card works but carries no message; `PN5180_NDEF_ERR_UNSUPPORTED` that the card type has no NDEF mapping here.
+`PN5180_NDEF_ERR_NO_NDEF` means that the card works but carries no message; `PN5180_NDEF_ERR_UNSUPPORTED` that the card type has no NDEF mapping here; `PN5180_NDEF_ERR_ACCESS_DENIED` that a Type 4 tag protects its NDEF file against reading.
 
 ### Write a URI to an NTAG
 
@@ -306,7 +306,7 @@ pn5180_spi_t *spi    = pn5180_spi_attach(SPI2_HOST, 7000000);
 pn5180_t     *pn5180 = pn5180_init(spi, GPIO_NUM_5, GPIO_NUM_21, GPIO_NUM_12);
 ```
 
-A PN5180 command is two SPI transfers framed by NSS; the driver holds the bus for both, so other devices cannot get in between. A bus that was attached is never freed by `pn5180_deinit()`.
+A PN5180 command is two SPI transfers, each framed by NSS. The driver holds the bus only while NSS is low; while the PN5180 executes a command (BUSY high, up to milliseconds for RF on) other devices can use the bus. A bus that was attached is never freed by `pn5180_deinit()`.
 
 ## Troubleshooting
 

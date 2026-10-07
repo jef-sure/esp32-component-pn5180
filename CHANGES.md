@@ -1,5 +1,16 @@
 # Changelog
 
+## v 0.4.1 - 2026-10-07
+
+### Fixes from a review of 0.4.0
+
+- ISO14443-4: a card that keeps requesting waiting time extensions is given up on after 10 requests in a row; it could hold the caller indefinitely before.
+- ISO14443-4: received blocks with wrong fixed bits or with CID / NAD are treated as invalid blocks; a reserved frame size in the ATS (FSCI 13 to 15) no longer makes the activation fail.
+- An SPI failure while waiting for the card's answer is reported as `PN5180_RF_FATAL`; it used to look like an ordinary timeout.
+- Shared SPI bus: the bus is held only while NSS is low, not while the PN5180 executes the command, so other devices are not blocked during long commands such as RF on.
+- LPCD: the reference value is set through `AGC_REF_CONFIG` only on firmware 3.A and later, where the datasheet requires it; on earlier firmware the step is skipped. `pn5180_t` has a new `firmware_version` field.
+- Type 4 NDEF: an NDEF length that does not fit the file is `PN5180_NDEF_ERR_PARSE_FAILED` (was `NO_NDEF`); a read-protected NDEF file is the new `PN5180_NDEF_ERR_ACCESS_DENIED` without a second read attempt; an unknown mapping version is `PN5180_NDEF_ERR_UNSUPPORTED`.
+
 ## v 0.4.0 - 2026-10-07
 
 ### ISO14443-4 rework and public APDU API, automatic NDEF reading for all tag types, host tests

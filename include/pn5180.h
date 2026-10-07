@@ -60,6 +60,7 @@ extern "C" {
 #define PN5180_EEPROM_MIN_ADDR      0x16u
 #define PN5180_EEPROM_MAX_ADDR      0xFDu
 #define PN5180_MIN_FIRMWARE_VERSION 0x0304u
+#define PN5180_FIRMWARE_VERSION_3_A 0x030Au // First firmware with the LPCD reference modes of datasheet rev. 4.0
 #define PN5180_MAX_WAKEUP_COUNTER_MS 2690u
 
 // PN5180 EEPROM Addresses - LPCD (Low Power Card Detection)
@@ -140,6 +141,7 @@ typedef struct _pn5180_t
     uint8_t       tx_config;        /**< RF configuration last loaded with pn5180_load_rf_config() */
     bool          rf_config_loaded; /**< tx_config is valid */
     bool          is_rf_on;
+    uint16_t      firmware_version; /**< Firmware version read from EEPROM at init, major in the high byte */
     bool          hw_rx_timeout;    /**< Use Timer1 as the receive timeout in pn5180_rf_transceive() */
     bool          rfca_disabled;    /**< Switch the field on without RF collision avoidance */
     uint32_t      rf_guard_time_us; /**< Delay after the field has been switched on */

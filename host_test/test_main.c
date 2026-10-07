@@ -481,7 +481,7 @@ static void test_iso_dep_chaining_in_both_directions(void)
 static void test_iso_dep_recovers_from_lost_frames_and_wtx(void)
 {
     sim_a_init_iso_dep(&s_card_a, 0x20, 8);
-    activate_card_a();
+    pn5180_uid_t         uid   = activate_card_a();
     static const uint8_t aid[] = {0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
     static const uint8_t cc[]  = {0xE1, 0x03};
     uint8_t              data[15];
@@ -501,6 +501,17 @@ static void test_iso_dep_recovers_from_lost_frames_and_wtx(void)
     TEST_ASSERT_TRUE(pn5180_14443_4_read_binary(s_pn5180, 0, 15, data, &got));
     TEST_ASSERT_EQUAL(15, got);
     TEST_ASSERT_EQUAL_MEMORY(s_card_a.cc_file, data, 15);
+
+    // A card that keeps asking for more time is given up on, instead of being waited for forever.
+    s_card_a.wtx_requests = 1000;
+    got                   = sizeof(data);
+    TEST_ASSERT_FALSE(pn5180_14443_4_read_binary(s_pn5180, 0, 15, data, &got));
+    s_card_a.wtx_requests = 0;
+    // The abandoned exchange left reader and card out of step: release the card and start a new session.
+    TEST_ASSERT_TRUE(s_proto_a->halt(s_proto_a));
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    TEST_ASSERT_TRUE(pn5180_14443_4_select_file(s_pn5180, aid, sizeof(aid)));
+    TEST_ASSERT_TRUE(pn5180_14443_4_select_file(s_pn5180, cc, sizeof(cc)));
 
     // Both directions lost several times in a row: the exchange gives up, and the next one works.
     s_card_a.drop_commands = 10;
@@ -534,6 +545,22 @@ static void test_type4_ndef_read(void)
     s_card_a.ndef_file[0]  = 0;
     s_card_a.ndef_file[1]  = 0;
     TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_NO_NDEF, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+
+    // A length that does not fit the file is a damaged tag.
+    s_card_a.ndef_file[0] = 0x7F;
+    s_card_a.ndef_file[1] = 0x00;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_PARSE_FAILED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+
+    // A read-protected NDEF file is reported as such, without a second attempt.
+    s_card_a.cc_file[13] = 0x80;
+    int frames           = fake_frame_count();
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_ACCESS_DENIED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_EQUAL(3, fake_frame_count() - frames); // application select, CC select, CC read: no retry
+    s_card_a.cc_file[13] = 0x00;
+
+    // An unknown mapping version is not guessed at.
+    s_card_a.cc_file[2] = 0x40;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_UNSUPPORTED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
 }
 
 static void test_type4_select_falls_back_for_mapping_version_1(void)
@@ -549,6 +576,16 @@ static void test_type4_select_falls_back_for_mapping_version_1(void)
     TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
     assert_uri_message(parsed, "mailto:a@example.com");
     pn5180_ndef_free_parsed_message(parsed);
+}
+
+static void test_iso_dep_reserved_frame_size_is_accepted(void)
+{
+    // FSCI 13 is reserved; the card is used with the largest defined frame size instead of being refused.
+    sim_a_init_iso_dep(&s_card_a, 0x20, 13);
+    activate_card_a();
+    TEST_ASSERT_TRUE(s_pn5180->iso14443_layer4_active);
+    static const uint8_t aid[] = {0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01};
+    TEST_ASSERT_TRUE(pn5180_14443_4_select_file(s_pn5180, aid, sizeof(aid)));
 }
 
 static void test_classic_emulation_card_stays_on_layer_3_unless_asked(void)
@@ -663,6 +700,7 @@ int main(void)
     RUN_TEST(test_iso_dep_recovers_from_lost_frames_and_wtx);
     RUN_TEST(test_type4_ndef_read);
     RUN_TEST(test_type4_select_falls_back_for_mapping_version_1);
+    RUN_TEST(test_iso_dep_reserved_frame_size_is_accepted);
     RUN_TEST(test_classic_emulation_card_stays_on_layer_3_unless_asked);
     RUN_TEST(test_iso15693_poll_select_detect_and_ndef);
     RUN_TEST(test_iso15693_block_write_and_read);

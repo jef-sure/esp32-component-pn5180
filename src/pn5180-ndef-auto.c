@@ -441,6 +441,17 @@ static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_m
         PN5180_LOGD(TAG, "T4: bad NDEF File Control TLV (T=%02X L=%02X)", cc[7], cc[8]);
         return PN5180_NDEF_ERR_PARSE_FAILED;
     }
+    // Mapping versions 1.x to 3.x share this capability container layout; a higher major version may not.
+    uint8_t mapping_major = (uint8_t)(cc[2] >> 4);
+    if (mapping_major < 1 || mapping_major > 3) {
+        PN5180_LOGD(TAG, "T4: unsupported mapping version %02X", cc[2]);
+        return PN5180_NDEF_ERR_UNSUPPORTED;
+    }
+    // Read access 00h means free access; anything else needs a security setup this driver does not do.
+    if (cc[13] != 0x00) {
+        PN5180_LOGD(TAG, "T4: NDEF file is read protected (access byte %02X)", cc[13]);
+        return PN5180_NDEF_ERR_ACCESS_DENIED;
+    }
     // Chunk size: MLe counts data bytes only, so Le = MLe is legal; two bytes of headroom are kept for
     // cards that size MLe to their whole response buffer. Le is one byte and READ BINARY uses a
     // 260-byte buffer, so 248 data bytes is the ceiling.
@@ -457,8 +468,12 @@ static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_m
         return PN5180_NDEF_ERR_READ_FAILED;
     }
     uint16_t nlen = (uint16_t)(((uint16_t)nlen_buf[0] << 8) | nlen_buf[1]);
-    if (nlen == 0 || (uint32_t)nlen + 2u > max_ndef_size) {
+    if (nlen == 0) {
         return PN5180_NDEF_ERR_NO_NDEF;
+    }
+    if ((uint32_t)nlen + 2u > max_ndef_size) {
+        // The length does not fit the file the capability container describes: the tag is inconsistent.
+        return PN5180_NDEF_ERR_PARSE_FAILED;
     }
 
     uint8_t *raw = malloc(nlen);

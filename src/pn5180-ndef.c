@@ -847,6 +847,8 @@ const char *pn5180_ndef_result_to_string(pn5180_ndef_result_t result)
         return "Card capacity exceeded";
     case PN5180_NDEF_ERR_UNSUPPORTED:
         return "Card type not supported";
+    case PN5180_NDEF_ERR_ACCESS_DENIED:
+        return "NDEF data is read protected";
     default:
         return "Unknown error";
     }
