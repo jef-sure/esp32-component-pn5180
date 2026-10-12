@@ -1,4 +1,3 @@
 dependencies:
-  jef-sure/esp32-component-pn5180:
+  jef-sure/pn5180:
     version: "*"
-    override_path: '../../../'

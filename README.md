@@ -17,7 +17,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/esp32-component-pn5180^0.5.1"
+idf.py add-dependency "jef-sure/pn5180^0.5.2"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.x or 6.0 is required.
@@ -132,6 +132,12 @@ Every protocol is then used the same way through its callbacks: `setup_rf`, `get
 - `examples/simple_main` — minimal scanning loop for ISO14443A and ISO15693 on a classic ESP32.
 - `examples/app_logic` — a fuller application on ESP32-S3: card classification, NDEF first and raw block dump as fallback, MIFARE Classic authentication with a key list.
 - `examples/ndef` — NDEF parsing snippets (not a standalone project).
+
+Inside the repository the examples build against the repository itself. To get one as a separate project with the component taken from the registry:
+
+```sh
+idf.py create-project-from-example "jef-sure/pn5180:simple_main"
+```
 
 ## Common Tasks
 

@@ -344,6 +344,7 @@ static void process_card(pn5180_proto_t *proto, pn5180_uid_t *uid)
             }
         }
     }
+    pn5180_ndef_free_parsed_message(msg);
 }
 
 static bool read_version(pn5180_t *pn5180, uint8_t addr, const char *name)
@@ -375,6 +376,7 @@ static bool init_pn5180_hardware(pn5180_t **pn5180_out)
     pn5180_t *pn5180 = pn5180_init(spi, PN5180_NSS, PN5180_BUSY, PN5180_RST);
     if (pn5180 == NULL) {
         ESP_LOGE(TAG, "Failed to initialize PN5180");
+        pn5180_spi_deinit(spi, true);
         return false;
     }
 

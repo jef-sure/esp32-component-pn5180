@@ -45,6 +45,7 @@ static bool init_pn5180_hardware(pn5180_t **pn5180_out) {
   pn5180_t *pn5180 = pn5180_init(spi, PN5180_NSS, PN5180_BUSY, PN5180_RST);
   if (pn5180 == NULL) {
     ESP_LOGE(TAG, "Failed to initialize PN5180");
+    pn5180_spi_deinit(spi, true);
     return false;
   }
 

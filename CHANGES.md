@@ -1,5 +1,39 @@
 # Changelog
 
+## v 0.5.2 - 2026-10-12
+
+### Fixes from a review of 0.5.1
+
+Behaviour changes to be aware of:
+
+- ISO15693 inventory no longer makes a second pass at the low data rate. The PN5180 has no receive configuration for it, so the pass could not find a tag and only doubled the time of an empty scan. The field `iso15693_use_high_rate` of `pn5180_t` is removed.
+- ISO15693 inventory takes a UID only from a response received without errors. A response with a CRC or protocol error was accepted if it was long enough, so a damaged frame could be reported as a tag. Such a response is now asked for again, up to three times.
+
+ISO15693:
+
+- Collision resolution goes on to the full 64 bits of the UID; it stopped at a mask of 16 bits, so tags with the same first 16 transmitted UID bits were not told apart. The scan limit is 192 inventory requests instead of 64.
+- `block_read()` and `block_write()` refuse a negative block number and one above 65535. They were cut to one or two bytes and addressed another block.
+
+NDEF:
+
+- `pn5180_ndef_message_add()` returns false for a message initialized without a record array; it wrote through the NULL pointer.
+
+Examples:
+
+- `examples/app_logic` frees the NDEF message it has read; every successful read leaked it.
+- `examples/app_logic` and `examples/simple_main` release the SPI structure when `pn5180_init()` fails, and name `esp_driver_spi` and `esp_driver_gpio` as requirements only from ESP-IDF 5.3 on, like the component does.
+- `examples/ndef/main/ndef_read_example.c` reads with `pn5180_ndef_read_card_auto()`. It called `pn5180_ndef_read_from_selected_card()` from page 4 with 16-byte blocks, which on a Type 2 tag reads overlapping pages and damages any message longer than the first read.
+
+Documentation:
+
+- `pn5180_read_eeprom()` / `pn5180_write_eeprom()`: the last EEPROM address is 253 (`PN5180_EEPROM_MAX_ADDR`), not 254.
+- `pn5180_ndef_read_from_selected_card()`: `max_blocks` of 0 means the default limit of 256 blocks, not "no limit".
+
+Component name in the ESP Component Registry (`jef-sure/pn5180`; `esp32-component-pn5180` is the name of the repository):
+
+- README: the install command is `idf.py add-dependency "jef-sure/pn5180^0.5.2"`. It named `jef-sure/esp32-component-pn5180`, which the registry does not have.
+- `examples/app_logic` and `examples/simple_main` depend on `jef-sure/pn5180`. With the old name a project made with `idf.py create-project-from-example` asked for a component that does not exist. Inside the repository the examples take the component from the repository itself and switch the component manager off, so they build whatever the directory of the clone is called.
+
 ## v 0.5.1 - 2026-10-07
 
 ### Fixes from a review of 0.5.0

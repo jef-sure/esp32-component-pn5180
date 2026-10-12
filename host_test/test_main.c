@@ -1341,6 +1341,141 @@ static void test_iso15693_block_write_and_read(void)
     TEST_ASSERT_FALSE(s_proto_v->halt(s_proto_v));
 }
 
+// Two tags in the field: both answering an inventory is a collision, as the reader reports it.
+typedef struct
+{
+    sim_v_card_t tags[2];
+    bool         damage_inventory; // inventory answers arrive with a CRC error
+} sim_v_field_t;
+
+static pn5180_rf_result_t sim_v_field(void *ctx, const uint8_t *tx, size_t tx_len, uint8_t tx_last_bits, uint8_t *rx, size_t rx_size, size_t *rx_len,
+                                      uint32_t timeout_us, uint32_t *rx_status)
+{
+    sim_v_field_t     *field = ctx;
+    uint8_t            answers[2][64];
+    size_t             lens[2]  = {0, 0};
+    int                answered = 0;
+    int                last     = 0;
+    pn5180_rf_result_t result   = PN5180_RF_TIMEOUT;
+    for (int i = 0; i < 2; i++) {
+        pn5180_rf_result_t r = sim_v_card(&field->tags[i], tx, tx_len, tx_last_bits, answers[i], sizeof(answers[i]), &lens[i], timeout_us, NULL);
+        if (r != PN5180_RF_TIMEOUT) {
+            answered++;
+            last   = i;
+            result = r;
+        }
+    }
+    if (answered == 0) {
+        return PN5180_RF_TIMEOUT;
+    }
+    size_t count = (lens[last] < rx_size) ? lens[last] : rx_size;
+    if (rx != NULL) {
+        memcpy(rx, answers[last], count);
+    }
+    if (rx_len != NULL) {
+        *rx_len = count;
+    }
+    bool inventory = tx_len > 0 && (tx[0] & 0x04) != 0;
+    if (answered == 2) {
+        if (rx_status != NULL) {
+            *rx_status = (uint32_t)count | PN5180_RX_COLLISION_DETECTED;
+        }
+        return PN5180_RF_COLLISION;
+    }
+    if (inventory && field->damage_inventory) {
+        if (rx_status != NULL) {
+            *rx_status = (uint32_t)count | PN5180_RX_DATA_INTEGRITY_ERROR;
+        }
+        return PN5180_RF_RX_ERROR;
+    }
+    if (rx_status != NULL) {
+        *rx_status = (uint32_t)count;
+    }
+    return result;
+}
+
+static sim_v_field_t s_field_v;
+
+// Tags whose UIDs differ only in the last transmitted bit need a mask of 63 bits.
+static void test_iso15693_inventory_resolves_long_common_prefix(void)
+{
+    sim_v_init(&s_field_v.tags[0]);
+    sim_v_init(&s_field_v.tags[1]);
+    s_field_v.tags[1].uid[7] ^= 0x80;
+    s_field_v.damage_inventory = false;
+    fake_set_card(sim_v_field, NULL, &s_field_v);
+    TEST_ASSERT_TRUE(s_proto_v->setup_rf(s_proto_v));
+
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_15693_get_all_uids_ex(s_proto_v, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(2, uids->uids_count);
+    bool found[2] = {false, false};
+    for (int i = 0; i < 2; i++) {
+        for (int t = 0; t < 2; t++) {
+            if (memcmp(uids->uids[i].uid, s_field_v.tags[t].uid, 8) == 0) found[t] = true;
+        }
+    }
+    free(uids);
+    TEST_ASSERT_TRUE(found[0]);
+    TEST_ASSERT_TRUE(found[1]);
+}
+
+// An inventory answer with a CRC error is not a UID.
+static void test_iso15693_inventory_rejects_damaged_response(void)
+{
+    sim_v_init(&s_field_v.tags[0]);
+    sim_v_init(&s_field_v.tags[1]);
+    s_field_v.tags[1].quiet    = true; // one tag in the field
+    s_field_v.damage_inventory = true;
+    fake_set_card(sim_v_field, NULL, &s_field_v);
+    TEST_ASSERT_TRUE(s_proto_v->setup_rf(s_proto_v));
+
+    pn5180_poll_status_t status = PN5180_POLL_FOUND;
+    TEST_ASSERT_NULL(pn5180_15693_get_all_uids_ex(s_proto_v, &status));
+    TEST_ASSERT_EQUAL(PN5180_POLL_NO_TARGET, status);
+    TEST_ASSERT_FALSE(s_field_v.tags[0].quiet);
+
+    // The same tag is found once its answer arrives intact.
+    s_field_v.damage_inventory = false;
+    pn5180_uids_array_t *uids  = pn5180_15693_get_all_uids_ex(s_proto_v, &status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(1, uids->uids_count);
+    free(uids);
+}
+
+// Block numbers that do not fit the two-byte address are refused before anything is sent.
+static void test_iso15693_block_number_range(void)
+{
+    sim_v_init(&s_card_v);
+    fake_set_card(sim_v_card, NULL, &s_card_v);
+    TEST_ASSERT_TRUE(s_proto_v->setup_rf(s_proto_v));
+    pn5180_uids_array_t *uids = s_proto_v->get_all_uids(s_proto_v);
+    TEST_ASSERT_NOT_NULL(uids);
+    pn5180_uid_t uid = uids->uids[0];
+    free(uids);
+    TEST_ASSERT_TRUE(s_proto_v->select_by_uid(s_proto_v, &uid));
+
+    const uint8_t data[4] = {1, 2, 3, 4};
+    uint8_t       readback[4];
+    int           frames = fake_frame_count();
+    TEST_ASSERT_FALSE(s_proto_v->block_read(s_proto_v, -1, readback, sizeof(readback)));
+    TEST_ASSERT_FALSE(s_proto_v->block_read(s_proto_v, 0x10000, readback, sizeof(readback))); // would be sent as block 0
+    TEST_ASSERT_EQUAL(-1, s_proto_v->block_write(s_proto_v, -1, data, sizeof(data)));
+    TEST_ASSERT_EQUAL(-1, s_proto_v->block_write(s_proto_v, 0x10007, data, sizeof(data)));
+    TEST_ASSERT_EQUAL(frames, fake_frame_count());
+}
+
+static void test_ndef_message_add_without_storage(void)
+{
+    pn5180_ndef_message_t msg;
+    pn5180_ndef_record_t  rec;
+    pn5180_ndef_record_init(&rec, PN5180_NDEF_TNF_EMPTY, NULL, 0, NULL, 0, NULL, 0);
+    pn5180_ndef_message_init(&msg, NULL, 2);
+    TEST_ASSERT_FALSE(pn5180_ndef_message_add(&msg, &rec));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -1389,5 +1524,9 @@ int main(void)
     RUN_TEST(test_iso15693_poll_select_detect_and_ndef);
     RUN_TEST(test_iso15693_ndef_write_then_read);
     RUN_TEST(test_iso15693_block_write_and_read);
+    RUN_TEST(test_iso15693_inventory_resolves_long_common_prefix);
+    RUN_TEST(test_iso15693_inventory_rejects_damaged_response);
+    RUN_TEST(test_iso15693_block_number_range);
+    RUN_TEST(test_ndef_message_add_without_storage);
     return UNITY_END();
 }

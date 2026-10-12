@@ -64,7 +64,7 @@ void pn5180_ndef_message_init(pn5180_ndef_message_t *msg, pn5180_ndef_record_t *
 
 bool pn5180_ndef_message_add(pn5180_ndef_message_t *msg, const pn5180_ndef_record_t *rec)
 {
-    if (!msg || !rec || msg->record_count >= msg->capacity) return false;
+    if (!msg || !rec || !msg->records || msg->record_count >= msg->capacity) return false;
     // Shallow copy: caller retains ownership of type/id/payload buffers.
     msg->records[msg->record_count++] = *rec;
     return true;

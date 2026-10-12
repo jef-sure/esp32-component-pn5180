@@ -1,7 +1,7 @@
 /**
  * Example: Reading NDEF messages from NFC cards
  *
- * This example demonstrates how to use pn5180_ndef_read_from_selected_card() to read
+ * This example demonstrates how to use pn5180_ndef_read_card_auto() to read
  * and parse complete NDEF messages from NFC cards.
  */
 
@@ -14,15 +14,16 @@
 
 static const char *TAG = "PN5180_NDEF_READ";
 
-void example_read_ndef_from_card(pn5180_proto_t *proto)
+// The card must be selected and its type detected (proto->select_by_uid(), then
+// proto->detect_card_type_and_capacity(), and a second select if that one asks for it).
+// The NDEF mapping is chosen from uid->subtype: Type 2 (Ultralight / NTAG), MIFARE Classic with
+// the public NDEF keys, Type 4 (ISO14443-4) or Type 5 (ISO15693).
+void example_read_ndef_from_card(pn5180_proto_t *proto, pn5180_uid_t *uid)
 {
-    int start_block = 4;
-    int block_size  = 16;
-
     ESP_LOGI(TAG, "Reading NDEF message from card...");
 
     pn5180_ndef_message_parsed_t *msg    = NULL;
-    pn5180_ndef_result_t          result = pn5180_ndef_read_from_selected_card(proto, start_block, block_size, 0, NULL, NULL, NULL, &msg);
+    pn5180_ndef_result_t          result = pn5180_ndef_read_card_auto(proto, uid, &msg);
 
     if (result != PN5180_NDEF_OK || !msg) {
         ESP_LOGE(TAG, "Failed to read NDEF message: %s", pn5180_ndef_result_to_string(result));
@@ -121,24 +122,4 @@ void example_read_ndef_from_card(pn5180_proto_t *proto)
 
     pn5180_ndef_free_parsed_message(msg);
     ESP_LOGI(TAG, "NDEF message freed");
-}
-
-void example_read_ndef_from_type5(pn5180_proto_t *proto)
-{
-    int start_block = 1;
-    int block_size  = 4;
-
-    ESP_LOGI(TAG, "Reading NDEF message from Type 5 tag...");
-
-    pn5180_ndef_message_parsed_t *msg    = NULL;
-    pn5180_ndef_result_t          result = pn5180_ndef_read_from_selected_card(proto, start_block, block_size, 0, NULL, NULL, NULL, &msg);
-
-    if (result != PN5180_NDEF_OK || !msg) {
-        ESP_LOGE(TAG, "Failed to read NDEF message from Type 5 tag: %s", pn5180_ndef_result_to_string(result));
-        return;
-    }
-
-    ESP_LOGI(TAG, "Type 5 tag - Found %zu record(s)", msg->record_count);
-
-    pn5180_ndef_free_parsed_message(msg);
 }

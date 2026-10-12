@@ -46,6 +46,8 @@ static bool pn5180_iso15693_check_response(const char *operation, const uint8_t 
 #define ISO15693_FLAG_SLOT_ONE        0x20
 #define ISO15693_FLAG_SELECTED        0x10
 #define ISO15693_FLAG_ADDRESS         0x20
+#define ISO15693_MAX_MASK_BITS        64 // the whole UID
+#define ISO15693_MAX_BLOCK_NUMBER     0xFFFF // two-byte block number of the extended commands
 #define ARRAY_SIZE(arr)               (sizeof(arr) / sizeof((arr)[0]))
 
 // PN5180 RF config constants (from datasheet)
@@ -173,7 +175,7 @@ static bool pn5180_iso15693_collect_uid(pn5180_uids_array_t **uids, const uint8_
 /**
  * @brief Build an inventory request (flags, command, mask) into send_buf, which must hold 12 bytes
  * @param single_slot If true, requests 1 slot. If false, requests 16 slots.
- * @param mask_len Length of mask in bits (0-60)
+ * @param mask_len Length of mask in bits (0-64 with one slot, 0-60 with 16 slots)
  * @param mask_val Mask value (up to 64 bits, but only mask_len used)
  */
 static size_t pn5180_iso15693_build_inventory_cmd(pn5180_t *pn5180, uint8_t *send_buf, bool single_slot, uint8_t mask_len, uint64_t mask_val)
@@ -183,12 +185,10 @@ static size_t pn5180_iso15693_build_inventory_cmd(pn5180_t *pn5180, uint8_t *sen
     // Enable full CRC for proper error detection
     pn5180_enable_crc(pn5180);
 
-    send_buf[idx] = ISO15693_FLAG_INVENTORY;
+    // Always the high data rate: the PN5180 has no receive configuration for the low one.
+    send_buf[idx] = ISO15693_FLAG_INVENTORY | ISO15693_FLAG_DATA_RATE_HIGH;
     if (single_slot) {
         send_buf[idx] |= ISO15693_FLAG_SLOT_ONE;
-    }
-    if (pn5180->iso15693_use_high_rate) {
-        send_buf[idx] |= ISO15693_FLAG_DATA_RATE_HIGH;
     }
     idx++;
 
@@ -213,7 +213,8 @@ static size_t pn5180_iso15693_build_inventory_cmd(pn5180_t *pn5180, uint8_t *sen
  */
 static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_array_t **uids, bool *fatal)
 {
-    const int max_total_scans = 64; // Safety limit
+    // Safety limit. Two tags that differ only in the last UID bit take 2 * 64 + 1 scans.
+    const int max_total_scans = 192;
     int       scan_count      = 0;
     int       total_found     = 0;
 
@@ -225,7 +226,7 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
         int      retries;
     } mask_t;
 
-    mask_t stack[20]; // masks of up to 16 bits: at most 17 entries wait at a time
+    mask_t stack[ISO15693_MAX_MASK_BITS + 2]; // one branch waits per mask bit, plus the two just pushed
     int    stack_ptr = 0;
 
     // Push initial global search
@@ -303,7 +304,7 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
             // So we proceed to split here for len=0 even if noisy.
 
             // If retries exhausted OR it looks like a clean collision, SPLIT
-            if (current.len < 16) {
+            if (current.len < ISO15693_MAX_MASK_BITS) {
                 if ((size_t)stack_ptr + 2 <= ARRAY_SIZE(stack)) {
                     // Push '1' branch
                     stack[stack_ptr].len     = current.len + 1;
@@ -325,8 +326,18 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
             continue;
         }
 
-        // No collision, check data
-        // A frame flagged with an RX error is still taken if it is complete, as before.
+        if (result != PN5180_RF_OK) {
+            // CRC or protocol error: the bytes are not a UID. One tag disturbed by noise answers
+            // again; if the error stays, the mask is given up like a noisy collision.
+            if (current.retries < 3) {
+                PN5180_LOGD(TAG, "scan %d: damaged response, retrying (retry %d)", scan_count, current.retries);
+                current.retries++;
+                stack[stack_ptr++] = current;
+            }
+            continue;
+        }
+
+        // Error-free frame, check data
         if (rx_len >= 10) {
             {
                 // rx_buf[1]=DSFID, [2..9]=UID
@@ -477,7 +488,7 @@ static bool pn5180_iso15693_get_system_info(pn5180_t *pn5180, uint8_t *buf, size
 
 static bool pn5180_iso15693_block_read(pn5180_t *pn5180, int blockno, uint8_t *buffer, size_t buffer_len)
 {
-    if (pn5180 == NULL || buffer == NULL || buffer_len == 0) {
+    if (pn5180 == NULL || buffer == NULL || buffer_len == 0 || blockno < 0 || blockno > ISO15693_MAX_BLOCK_NUMBER) {
         PN5180_LOGD(TAG, "block_read: invalid args");
         return false;
     }
@@ -523,7 +534,7 @@ static bool pn5180_iso15693_block_read(pn5180_t *pn5180, int blockno, uint8_t *b
 
 static int pn5180_iso15693_block_write(pn5180_t *pn5180, int blockno, const uint8_t *buffer, size_t buffer_len)
 {
-    if (pn5180 == NULL || buffer == NULL) {
+    if (pn5180 == NULL || buffer == NULL || blockno < 0 || blockno > ISO15693_MAX_BLOCK_NUMBER) {
         PN5180_LOGD(TAG, "block_write: invalid args");
         return -1;
     }
@@ -642,20 +653,7 @@ static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180, bool *fa
             continue;
         }
 
-        // Try high data rate first
-        pn5180->iso15693_use_high_rate = true;
         pn5180_15693_inventory_single_slot(pn5180, &uids, fatal);
-
-        if (uids == NULL || uids->uids_count == 0) {
-            if (uids != NULL) {
-                free(uids);
-                uids = NULL;
-            }
-            // Retry with low data rate
-            pn5180->iso15693_use_high_rate = false;
-            PN5180_LOGD(TAG, "get_all_uids: retry with low data rate");
-            pn5180_15693_inventory_single_slot(pn5180, &uids, fatal);
-        }
 
         // ASK 100 % is only the fallback: tags found with the first configuration end the search.
         // A second pass would also leave the other RF configuration loaded and mix the signal

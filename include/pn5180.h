@@ -152,9 +152,6 @@ typedef struct _pn5180_t
     uint16_t iso14443_frame_size;       // Max ISO14443-4 frame size excluding CRC bytes
     int64_t  iso14443_fwt_ms;           // Frame waiting time derived from ATS
     bool    iso14443_layer4_active;
-
-    // ISO15693 State
-    bool iso15693_use_high_rate;
 } pn5180_t;
 
 /**
@@ -549,9 +546,9 @@ bool pn5180_read_register(pn5180_t *pn5180, uint8_t reg, uint32_t *value);
 /**
  * @brief Read data from PN5180 EEPROM
  * @param pn5180 Pointer to PN5180 device structure
- * @param addr EEPROM start address (0-254)
+ * @param addr EEPROM start address (0-253, PN5180_EEPROM_MAX_ADDR)
  * @param buffer Buffer to store read data
- * @param len Number of bytes to read
+ * @param len Number of bytes to read; addr + len must not pass the last address
  * @return true on success, false on failure
  */
 bool pn5180_read_eeprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len);
@@ -559,9 +556,9 @@ bool pn5180_read_eeprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len
 /**
  * @brief Write data to PN5180 EEPROM
  * @param pn5180 Pointer to PN5180 device structure
- * @param addr EEPROM start address
+ * @param addr EEPROM start address (22-253, PN5180_EEPROM_MIN_ADDR to PN5180_EEPROM_MAX_ADDR)
  * @param buffer Data to write
- * @param len Number of bytes to write
+ * @param len Number of bytes to write; addr + len must not pass the last address
  * @return true on success, false on failure
  */
 bool pn5180_write_eeprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len);

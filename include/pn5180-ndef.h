@@ -276,7 +276,7 @@ typedef int (*pn5180_ndef_sector_id_callback_t)(int blockno, void *user_ctx);
  * @param proto Pointer to protocol interface (card must be selected)
  * @param start_block Starting block number for NDEF data
  * @param block_size Size of each block in bytes
- * @param max_blocks Maximum blocks to read (0 = no limit, uses default 256)
+ * @param max_blocks Maximum blocks to read (0 or less = the default of 256 blocks)
  * @param auth_cb Optional authentication callback (can be NULL)
  * @param sector_cb Optional sector ID callback for auth throttling (can be NULL)
  * @param auth_ctx User context pointer passed to auth/sector callbacks (can be NULL)
