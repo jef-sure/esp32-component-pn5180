@@ -63,6 +63,11 @@ static bool pn5180_15693_setup_rf(pn5180_t *pn5180, uint8_t rf_config)
     pn5180_write_register_and_mask(pn5180, PN5180_SYSTEM_CONFIG, PN5180_SYSTEM_CONFIG_CLEAR_CRYPTO_MASK);
     pn5180_set_transceiver_idle(pn5180);
     if (pn5180->is_rf_on) {
+        // The tags keep their Quiet and Selected state when the right configuration is loaded;
+        // cycling the field costs about 10 ms of dead time and resets every tag in the field.
+        if (pn5180->rf_config_loaded && pn5180->tx_config == rf_config) {
+            return true;
+        }
         pn5180_set_rf_off(pn5180);
         // Tags drop their Quiet and Selected state only after the field was off long enough.
         pn5180_delay_us(PN5180_RF_OFF_TIME_US);
@@ -346,13 +351,13 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
                 // PN5180_LOGD(TAG, "scan %d: data received", scan_count);
                 if (1) { // Accept any valid frame structure
                     uint8_t *uid_ptr = &rx_buf[2];
-                    ESP_LOGI(TAG, "Tag Found! UID: %02x%02x%02x%02x%02x%02x%02x%02x", uid_ptr[0], uid_ptr[1], uid_ptr[2], uid_ptr[3], uid_ptr[4], uid_ptr[5],
-                             uid_ptr[6], uid_ptr[7]);
+                    PN5180_LOGD(TAG, "Tag Found! UID: %02x%02x%02x%02x%02x%02x%02x%02x", uid_ptr[0], uid_ptr[1], uid_ptr[2], uid_ptr[3], uid_ptr[4], uid_ptr[5],
+                                uid_ptr[6], uid_ptr[7]);
 
                     uint32_t agc_reg = 0;
                     pn5180_read_register(pn5180, PN5180_RF_STATUS, &agc_reg);
                     uint16_t current_agc = (uint16_t)(agc_reg & PN5180_RF_STATUS_AGC_MASK);
-                    ESP_LOGI(TAG, "AGC Value: %u", (unsigned)current_agc);
+                    PN5180_LOGD(TAG, "AGC Value: %u", (unsigned)current_agc);
 
                     bool is_new = pn5180_iso15693_collect_uid(uids, uid_ptr, 8, current_agc);
                     if (is_new) {

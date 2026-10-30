@@ -54,6 +54,9 @@ static bool stream_reserve(ndef_stream_t *stream, size_t extra)
 
 static bool stream_append(ndef_stream_t *stream, const uint8_t *bytes, size_t count)
 {
+    if (count == 0) {
+        return true; // memcpy with a NULL destination is undefined even for zero bytes
+    }
     if (!stream_reserve(stream, count)) {
         return false;
     }
@@ -117,10 +120,12 @@ static bool ndef_reselect(pn5180_proto_t *proto, pn5180_uid_t *uid)
  *   - writing puts the message into the NDEF TLV the tag already has, so TLVs in front of it
  *     (lock control, memory control, proprietary) and the bytes sharing its first block are kept;
  *     the TLV length is set to 0 first, then the message is written, then the real length; a
- *     Terminator TLV follows the message if the data area has room for it.
+ *     Terminator TLV follows the message if the data area has room for it;
+ *   - lock and reserved bytes that control TLVs place inside the data area are not part of the
+ *     TLV stream: a read goes around them, a write that would touch them is refused.
  */
 
-#define NDEF_AREA_MAX_RESERVED 4
+#define NDEF_AREA_MAX_RESERVED 6 // the NXP reader library keeps three control TLVs of each kind
 
 typedef struct
 {
@@ -167,26 +172,87 @@ static pn5180_ndef_result_t area_need(pn5180_proto_t *proto, const ndef_area_t *
     return PN5180_NDEF_OK;
 }
 
+// First tag address at or behind addr that belongs to the TLV stream. Bytes are skipped one by one,
+// like in the PN532 component; the NXP library skips whole blocks, which makes a difference only
+// for an area that does not fill its blocks.
+static size_t area_skip_reserved(const ndef_area_t *ctx, size_t addr)
+{
+    bool moved;
+    do {
+        moved = false;
+        for (size_t i = 0; i < ctx->reserved_count; i++) {
+            size_t end = ctx->reserved[i].addr + ctx->reserved[i].size;
+            if (addr >= ctx->reserved[i].addr && addr < end) {
+                addr  = end;
+                moved = true;
+            }
+        }
+    } while (moved);
+    return addr;
+}
+
+// Tag address behind the next count bytes of the TLV stream.
+static size_t area_stream_advance(const ndef_area_t *ctx, size_t addr, size_t count)
+{
+    for (; count > 0; count--) {
+        addr = area_skip_reserved(ctx, addr) + 1;
+    }
+    return addr;
+}
+
+// Reads the next count bytes of the TLV stream and moves *addr behind them.
+static pn5180_ndef_result_t area_read_stream(pn5180_proto_t *proto, const ndef_area_t *ctx, ndef_stream_t *stream, size_t *addr, uint8_t *out, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        size_t               next   = area_skip_reserved(ctx, *addr);
+        size_t               pos    = next - ctx->stream_base;
+        pn5180_ndef_result_t result = area_need(proto, ctx, stream, pos + 1);
+        if (result != PN5180_NDEF_OK) {
+            return result;
+        }
+        out[i] = stream->data[pos];
+        *addr  = next + 1;
+    }
+    return PN5180_NDEF_OK;
+}
+
+// Reads the length field of a TLV: one byte, or FFh and two bytes.
+static pn5180_ndef_result_t area_read_tlv_length(pn5180_proto_t *proto, const ndef_area_t *ctx, ndef_stream_t *stream, size_t *addr, size_t *length)
+{
+    uint8_t              field[2] = {0, 0};
+    pn5180_ndef_result_t result   = area_read_stream(proto, ctx, stream, addr, field, 1);
+    if (result != PN5180_NDEF_OK) {
+        return result;
+    }
+    *length = field[0];
+    if (*length == 0xFF) {
+        result  = area_read_stream(proto, ctx, stream, addr, field, 2);
+        *length = ((size_t)field[0] << 8) | field[1];
+    }
+    return result;
+}
+
 // Walks the TLVs of the data area up to the NDEF TLV and returns the tag address of its T byte,
 // as phalTop_Sw_Int_T2T_DetectTlvBlocks() / ..._T5T_DetectTlvBlocks() of the NXP reader library do.
 // A data area without NDEF TLV is PN5180_NDEF_ERR_NO_NDEF: the tag is not set up for NDEF.
 static pn5180_ndef_result_t area_find_ndef_tlv(pn5180_proto_t *proto, ndef_area_t *ctx, ndef_stream_t *stream, size_t *header_addr)
 {
-    size_t pos        = ctx->area_start - ctx->stream_base;
+    size_t addr       = ctx->area_start;
     int    null_count = 0;
     for (;;) {
-        pn5180_ndef_result_t result = area_need(proto, ctx, stream, pos + 1);
+        addr                        = area_skip_reserved(ctx, addr);
+        size_t               t_addr = addr;
+        uint8_t              type   = 0;
+        pn5180_ndef_result_t result = area_read_stream(proto, ctx, stream, &addr, &type, 1);
         if (result != PN5180_NDEF_OK) {
             return result;
         }
-        uint8_t type = stream->data[pos];
         // NULL TLV: a single byte, known to Type 2 only (on Type 5, 00h is a reserved TLV with a
         // length like any other). A Type 2 tag must not carry more than three of them in a row.
         if (ctx->type2 && type == 0x00) {
             if (++null_count > 3) {
                 return PN5180_NDEF_ERR_NO_NDEF;
             }
-            pos++;
             continue;
         }
         null_count = 0;
@@ -194,43 +260,37 @@ static pn5180_ndef_result_t area_find_ndef_tlv(pn5180_proto_t *proto, ndef_area_
             return PN5180_NDEF_ERR_NO_NDEF;
         }
         if (type == TLV_NDEF) {
-            *header_addr = ctx->stream_base + pos;
+            *header_addr = t_addr;
             return PN5180_NDEF_OK;
         }
 
         // Any other TLV is skipped by its length.
-        if ((result = area_need(proto, ctx, stream, pos + 2)) != PN5180_NDEF_OK) {
+        size_t length = 0;
+        if ((result = area_read_tlv_length(proto, ctx, stream, &addr, &length)) != PN5180_NDEF_OK) {
             return result;
-        }
-        size_t length      = stream->data[pos + 1];
-        size_t length_size = 1;
-        if (length == 0xFF) {
-            if ((result = area_need(proto, ctx, stream, pos + 4)) != PN5180_NDEF_OK) {
-                return result;
-            }
-            length      = ((size_t)stream->data[pos + 2] << 8) | stream->data[pos + 3];
-            length_size = 3;
         }
         // Lock Control (01h) and Memory Control (02h) TLV of a Type 2 tag: position byte (page
         // address, byte offset), size (bits for lock bytes, bytes for reserved ones), page control
         // (low nibble: bytes per page as a power of two).
         if (ctx->type2 && (type == 0x01 || type == 0x02) && length == 3) {
-            if ((result = area_need(proto, ctx, stream, pos + 1 + length_size + 3)) != PN5180_NDEF_OK) {
+            uint8_t value[3] = {0, 0, 0};
+            if ((result = area_read_stream(proto, ctx, stream, &addr, value, sizeof(value))) != PN5180_NDEF_OK) {
                 return result;
             }
             if (ctx->reserved_count >= NDEF_AREA_MAX_RESERVED) {
                 return PN5180_NDEF_ERR_UNSUPPORTED;
             }
-            const uint8_t *value                    = &stream->data[pos + 1 + length_size];
-            size_t         bytes_per_page           = (size_t)1 << (value[2] & 0x0F);
+            size_t bytes_per_page                   = (size_t)1 << (value[2] & 0x0F);
             ctx->reserved[ctx->reserved_count].addr = (size_t)(value[0] >> 4) * bytes_per_page + (value[0] & 0x0F);
-            // A size of 00h stands for 256 (bits or bytes). The NXP library takes it as 0; reading it
-            // as 256 is the careful side: at worst a tag is refused as unsupported.
+            // A size of 00h stands for 256 (bits or bytes), also in the PN532 component. The NXP
+            // library takes it as 0; if that is what a tag means, a write is refused and a read
+            // skips message bytes, which the length check or the message parser then refuses.
             size_t size                             = (value[1] != 0) ? value[1] : 256u;
             ctx->reserved[ctx->reserved_count].size = (type == 0x01) ? (size + 7u) / 8u : size;
             ctx->reserved_count++;
+            continue;
         }
-        pos += 1 + length_size + length;
+        addr = area_stream_advance(ctx, addr, length);
     }
 }
 
@@ -251,47 +311,39 @@ static pn5180_ndef_result_t ndef_read_from_area(pn5180_proto_t *proto, ndef_area
 {
     ndef_stream_t        stream      = *seeded;
     size_t               header_addr = 0;
+    uint8_t             *value       = NULL;
     pn5180_ndef_result_t result      = area_find_ndef_tlv(proto, ctx, &stream, &header_addr);
     if (result != PN5180_NDEF_OK) {
         goto done;
     }
 
-    size_t pos = header_addr - ctx->stream_base;
-    if ((result = area_need(proto, ctx, &stream, pos + 2)) != PN5180_NDEF_OK) {
+    size_t addr   = header_addr + 1;
+    size_t length = 0;
+    if ((result = area_read_tlv_length(proto, ctx, &stream, &addr, &length)) != PN5180_NDEF_OK) {
         goto done;
-    }
-    size_t length      = stream.data[pos + 1];
-    size_t length_size = 1;
-    if (length == 0xFF) {
-        if ((result = area_need(proto, ctx, &stream, pos + 4)) != PN5180_NDEF_OK) {
-            goto done;
-        }
-        length      = ((size_t)stream.data[pos + 2] << 8) | stream.data[pos + 3];
-        length_size = 3;
     }
     if (length == 0) {
         // Formatted tag without a message
         result = PN5180_NDEF_ERR_NO_NDEF;
         goto done;
     }
-    size_t value_addr = header_addr + 1 + length_size;
-    if (value_addr > ctx->area_end || length > ctx->area_end - value_addr) {
+    if (area_stream_advance(ctx, addr, length) > ctx->area_end) {
         // The message does not fit the data area the capability container describes.
         result = PN5180_NDEF_ERR_PARSE_FAILED;
         goto done;
     }
-    // The NXP library leaves lock and reserved bytes out of the message; this driver does not
-    // read around them.
-    if (area_has_reserved_bytes(ctx, value_addr, value_addr + length)) {
-        result = PN5180_NDEF_ERR_UNSUPPORTED;
+    value = malloc(length);
+    if (value == NULL) {
+        result = PN5180_NDEF_ERR_NO_MEMORY;
         goto done;
     }
-    if ((result = area_need(proto, ctx, &stream, pos + 1 + length_size + length)) != PN5180_NDEF_OK) {
+    if ((result = area_read_stream(proto, ctx, &stream, &addr, value, length)) != PN5180_NDEF_OK) {
         goto done;
     }
-    result = pn5180_ndef_parse_message(stream.data + pos + 1 + length_size, length, out_msg);
+    result = pn5180_ndef_parse_message(value, length, out_msg);
 
 done:
+    free(value);
     free(stream.data);
     return result;
 }
@@ -328,12 +380,6 @@ static pn5180_ndef_result_t ndef_write_into_area(pn5180_proto_t *proto, ndef_are
         result = PN5180_NDEF_ERR_CARD_FULL;
         goto done;
     }
-    // Lock or reserved bytes inside the part of the data area that would be written: the message
-    // would have to go around them, which this driver does not do.
-    if (area_has_reserved_bytes(ctx, header_addr, ctx->area_end)) {
-        result = PN5180_NDEF_ERR_UNSUPPORTED;
-        goto done;
-    }
     bool terminator = tlv_len < room;
 
     // Image of the blocks to write, starting with the block of the NDEF TLV.
@@ -341,7 +387,15 @@ static pn5180_ndef_result_t ndef_write_into_area(pn5180_proto_t *proto, ndef_are
     size_t prefix     = header_addr - image_addr;
     size_t used       = prefix + tlv_len + (terminator ? 1u : 0u);
     size_t blocks     = (used + block_size - 1) / block_size;
-    image             = calloc(blocks + 1, block_size); // one spare block for the zero-length step
+    // Lock or reserved bytes inside the blocks to write: the message would have to go around them,
+    // which this driver does not do. What lies in front of the NDEF TLV or behind the data area
+    // keeps its content.
+    size_t image_end = image_addr + blocks * block_size;
+    if (area_has_reserved_bytes(ctx, header_addr, (image_end < ctx->area_end) ? image_end : ctx->area_end)) {
+        result = PN5180_NDEF_ERR_UNSUPPORTED;
+        goto done;
+    }
+    image = calloc(blocks + 1, block_size); // one spare block for the zero-length step
     if (image == NULL) {
         result = PN5180_NDEF_ERR_NO_MEMORY;
         goto done;
@@ -463,7 +517,7 @@ static pn5180_ndef_result_t type2_open_area(pn5180_proto_t *proto, const pn5180_
         return PN5180_NDEF_ERR_UNSUPPORTED;
     }
     if (for_write && first[3] == 0x0F) {
-        return PN5180_NDEF_ERR_ACCESS_DENIED;
+        return PN5180_NDEF_ERR_READ_ONLY;
     }
 
     // The size excludes pages 0..3 and the lock and configuration pages at the end, so it bounds
@@ -545,7 +599,7 @@ static pn5180_ndef_result_t type5_open_area(pn5180_proto_t *proto, const pn5180_
         return PN5180_NDEF_ERR_UNSUPPORTED;
     }
     if (for_write && access == 0x03) {
-        return PN5180_NDEF_ERR_ACCESS_DENIED;
+        return PN5180_NDEF_ERR_READ_ONLY;
     }
     size_t cc_len = 4;
     size_t mlen   = cc[2];

@@ -24,3 +24,12 @@ void fake_set_card(fake_card_fn card, fake_auth_fn auth, void *ctx);
 
 /** Number of RF frames transmitted since the last fake_pn5180_create(). */
 int fake_frame_count(void);
+
+/** How many times the RF field was switched on since the last fake_pn5180_create(). */
+int fake_rf_on_count(void);
+
+/** True while the fake models the transmit CRC bit of CRC_TX_CONFIG (set by pn5180_enable_tx_crc). */
+bool fake_tx_crc_enabled(void);
+
+/** True while the fake models the receive CRC bit of CRC_RX_CONFIG (set by pn5180_enable_rx_crc). */
+bool fake_rx_crc_enabled(void);

@@ -3,6 +3,27 @@
 
 /* ---- Helpers ---- */
 
+// CRC over a frame as ISO 14443 and ISO 15693 define it: polynomial 0x8408 reflected, preset 0xFFFF.
+// The simulated cards append it to the frames they answer with when the reader sent a CRC frame;
+// the fake transceiver checks it against the CRC_RX_CONFIG bit.
+void sim_append_crc(uint8_t *frame, size_t len, size_t *len_with_crc)
+{
+    uint16_t reg = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        reg ^= frame[i];
+        for (int bit = 0; bit < 8; bit++) {
+            bool lsb = (reg & 1) != 0;
+            reg >>= 1;
+            if (lsb) {
+                reg ^= 0x8408;
+            }
+        }
+    }
+    frame[len]      = (uint8_t)(reg & 0xFF);
+    frame[len + 1]  = (uint8_t)(reg >> 8);
+    *len_with_crc   = len + 2;
+}
+
 static pn5180_rf_result_t answer(uint8_t *rx, size_t rx_size, size_t *rx_len, const uint8_t *data, size_t count)
 {
     if (count > rx_size) {
@@ -443,7 +464,7 @@ pn5180_rf_result_t sim_a_card(void *ctx, const uint8_t *tx, size_t tx_len, uint8
         }
         card->state        = SIM_A_READY;
         card->cascade_done = 0;
-        return answer(rx, rx_size, rx_len, card->atqa, 2);
+        return answer(rx, rx_size, rx_len, card->atqa, 2); // short frame in, ATQA without CRC
     }
 
     switch (card->state) {
@@ -455,19 +476,46 @@ pn5180_rf_result_t sim_a_card(void *ctx, const uint8_t *tx, size_t tx_len, uint8
         int     level = card->cascade_done + 1;
         uint8_t cl[5];
         sim_a_cascade_bytes(card, level, cl);
-        if (tx_len >= 2 && tx[0] == 0x93 + 2 * (level - 1)) {
-            if (tx_len == 2 && tx[1] == 0x20) { // anticollision: whole UID part requested
-                return answer(rx, rx_size, rx_len, cl, sizeof(cl));
+        if (tx_len >= 2 && tx[0] == 0x93 + 2 * (level - 1) && (tx[1] >> 4) >= 2 && tx[1] != 0x70) {
+            // Anticollision with any NVB below 0x70: the card answers with the part of its UID
+            // that lies after the bits the reader already knows. The prefix the reader sent must
+            // match this card's UID; in a field with several cards the one that matches answers.
+            uint8_t nvb          = tx[1];
+            size_t  known_bytes  = (nvb >> 4) - 2;
+            size_t  known_extra  = nvb & 0x0F;
+            if (known_bytes > 5 || (known_bytes == 5 && known_extra > 0)) {
+                sim_a_leave_selected_state(card, false);
+                return PN5180_RF_TIMEOUT;
             }
-            if (tx_len == 7 && tx[1] == 0x70 && memcmp(&tx[2], cl, 5) == 0) { // SELECT
-                uint8_t sak = 0x04;                                           // UID not complete
-                card->cascade_done++;
-                if (card->cascade_done == sim_a_cascade_levels(card)) {
-                    card->state = SIM_A_ACTIVE;
-                    sak         = card->sak;
+            for (size_t i = 0; i < known_bytes; i++) {
+                if (tx[2 + i] != cl[i]) {
+                    return PN5180_RF_TIMEOUT; // not this card's UID prefix
                 }
-                return answer(rx, rx_size, rx_len, &sak, 1);
             }
+            if (known_extra > 0 && known_bytes < 5) {
+                uint8_t mask = (uint8_t)((1u << known_extra) - 1u);
+                if ((tx[2 + known_bytes] & mask) != (cl[known_bytes] & mask)) {
+                    return PN5180_RF_TIMEOUT;
+                }
+            }
+            // The card re-transmits from the first unknown bit on. With a split byte the card
+            // repeats the whole byte; the driver keeps its known low bits and takes the rest.
+            size_t tail_len = 5 - known_bytes;
+            uint8_t tail[5];
+            for (size_t i = 0; i < tail_len; i++) {
+                tail[i] = cl[known_bytes + i];
+            }
+            (void)known_extra; // the split-byte merge happens in the driver
+            return answer(rx, rx_size, rx_len, tail, tail_len); // no CRC in the anticollision answer
+        }
+        if (tx_len == 7 && tx[1] == 0x70 && memcmp(&tx[2], cl, 5) == 0) { // SELECT
+            uint8_t sak = 0x04;                                           // UID not complete
+            card->cascade_done++;
+            if (card->cascade_done == sim_a_cascade_levels(card)) {
+                card->state = SIM_A_ACTIVE;
+                sak         = card->sak;
+            }
+            return answer(rx, rx_size, rx_len, &sak, 1);
         }
         sim_a_leave_selected_state(card, false);
         return PN5180_RF_TIMEOUT;
@@ -558,6 +606,123 @@ void sim_a_init_classic_1k(sim_a_card_t *card)
         memcpy(&card->memory[(sector * 4 + 3) * 16 + 6], access, sizeof(access));
         memset(&card->memory[(sector * 4 + 3) * 16 + 10], 0xFF, 6);
     }
+}
+
+/* ---- A field with two ISO14443A cards ---- */
+
+pn5180_rf_result_t sim_a_field(void *ctx, const uint8_t *tx, size_t tx_len, uint8_t tx_last_bits, uint8_t *rx, size_t rx_size, size_t *rx_len,
+                               uint32_t timeout_us, uint32_t *rx_status);
+
+// Answers every card gives to an anticollision request, as bit rows over the same UID length.
+// The bits are transmitted LSB first within each byte, as on the air.
+static void sim_a_uid_bits(const sim_a_card_t *card, int level, bool bits[40], int *bit_count)
+{
+    uint8_t cl[5];
+    sim_a_cascade_bytes(card, level, cl);
+    *bit_count = 40;
+    for (int i = 0; i < 5; i++) {
+        for (int b = 0; b < 8; b++) {
+            bits[i * 8 + b] = ((cl[i] >> b) & 1) != 0;
+        }
+    }
+}
+
+// Two cards answer the anticollision at once. Where their UID bits differ the reader reports a
+// collision at that bit position; the answer frame carries both cards' bytes, which is exactly
+// what the PN5180 samples up to the collision point.
+pn5180_rf_result_t sim_a_field(void *ctx, const uint8_t *tx, size_t tx_len, uint8_t tx_last_bits, uint8_t *rx, size_t rx_size, size_t *rx_len,
+                               uint32_t timeout_us, uint32_t *rx_status)
+{
+    sim_a_field_t *field = ctx;
+    (void)tx_last_bits;
+    (void)timeout_us;
+
+    // Only the anticollision of the first cascade level collides here; everything else is
+    // answered by one card at a time (both halt after their SELECT).
+    int       answering[2];
+    int       answered = 0;
+    uint8_t   answers[2][40];
+    size_t    lens[2] = {0, 0};
+    pn5180_rf_result_t results[2];
+
+    for (int i = 0; i < 2; i++) {
+        results[i] = sim_a_card(&field->cards[i], tx, tx_len, tx_last_bits, answers[i], sizeof(answers[i]), &lens[i], timeout_us, NULL);
+        if (results[i] != PN5180_RF_TIMEOUT) {
+            answering[answered++] = i;
+        }
+    }
+    if (answered == 0) {
+        return PN5180_RF_TIMEOUT;
+    }
+    if (answered == 1 || (tx_len < 2) || (tx[1] == 0x70)) {
+        // One card answers on its own; a SELECT with the right UID part reaches one card only.
+        int i = answering[0];
+        if (rx != NULL && lens[i] > 0) {
+            memcpy(rx, answers[i], (lens[i] < rx_size) ? lens[i] : rx_size);
+        }
+        if (rx_len != NULL) {
+            *rx_len = (lens[i] < rx_size) ? lens[i] : rx_size;
+        }
+        return results[i];
+    }
+
+    // Both cards answer the anticollision: their frames collide bit by bit.
+    bool bits_a[40], bits_b[40];
+    int  count_a = 0, count_b = 0;
+    sim_a_uid_bits(&field->cards[0], field->cards[0].cascade_done + 1, bits_a, &count_a);
+    sim_a_uid_bits(&field->cards[1], field->cards[1].cascade_done + 1, bits_b, &count_b);
+
+    // The reader knows the bits its request named (NVB); a collision is only reported where
+    // both cards transmit different values.
+    uint8_t nvb          = tx[1];
+    size_t  known_bytes  = (nvb >> 4) - 2;
+    size_t  known_extra  = nvb & 0x0F;
+    size_t  known_bits   = known_bytes * 8 + known_extra;
+    int     coll_bit     = -1;
+    for (size_t b = known_bits; b < 40; b++) {
+        if (bits_a[b] != bits_b[b]) {
+            coll_bit = (int)b;
+            break;
+        }
+    }
+    if (coll_bit < 0) {
+        // Same UID part in both cards: undistinguishable, answer like one card.
+        int i = answering[0];
+        if (rx != NULL && lens[i] > 0) {
+            memcpy(rx, answers[i], (lens[i] < rx_size) ? lens[i] : rx_size);
+        }
+        if (rx_len != NULL) {
+            *rx_len = (lens[i] < rx_size) ? lens[i] : rx_size;
+        }
+        return results[i];
+    }
+
+    // The receiver samples the bits both cards agree on up to the collision point. The sampled
+    // frame starts at UID bit known_bits, which RX_BIT_ALIGN places at bit known_extra of the
+    // first FIFO byte; the bytes after it follow as transmitted.
+    size_t sample_len = known_bytes + 1 + (known_extra + (size_t)(coll_bit - (int)known_bits)) / 8;
+    if (sample_len > 5) {
+        sample_len = 5;
+    }
+    if (rx != NULL && sample_len > 0) {
+        memset(rx, 0, (sample_len < rx_size) ? sample_len : rx_size);
+        for (size_t b = known_bits; b < (size_t)coll_bit; b++) {
+            // Both cards transmit the same value there; the sampled value is valid.
+            size_t fifo_bit = known_extra + (b - known_bits);
+            if (bits_a[b]) {
+                rx[fifo_bit / 8] |= (uint8_t)(1u << (fifo_bit % 8));
+            }
+        }
+    }
+    if (rx_len != NULL) {
+        *rx_len = (sample_len < rx_size) ? sample_len : rx_size;
+    }
+    if (rx_status != NULL) {
+        // RX_COLL_POS is relative to the first FIFO byte, RX_BIT_ALIGN offset included.
+        uint32_t coll_pos = (uint32_t)(known_extra + (size_t)coll_bit - known_bits);
+        *rx_status = ((uint32_t)sample_len & PN5180_RX_BYTES_RECEIVED_MASK) | PN5180_RX_COLLISION_DETECTED | (coll_pos << PN5180_RX_COLL_POS_START);
+    }
+    return PN5180_RF_COLLISION;
 }
 
 uint8_t sim_mad_crc(const uint8_t *data, size_t len)

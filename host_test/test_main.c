@@ -575,11 +575,98 @@ static void test_type2_read_checks_the_capability_container_like_nxp(void)
     s_card_a.memory[23] = 0xFD; // not in a row any more: 00 00 FD 00 = two NULL TLVs and an empty proprietary TLV
     TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
     pn5180_ndef_free_parsed_message(parsed);
+}
+
+// Stores the bytes on a Type 2 tag from address addr on, around the area [gap, gap + gap_len).
+static size_t store_around_gap(size_t addr, const uint8_t *bytes, size_t len, size_t gap, size_t gap_len)
+{
+    for (size_t i = 0; i < len; i++, addr++) {
+        if (addr == gap) {
+            addr += gap_len;
+        }
+        s_card_a.memory[addr] = bytes[i];
+    }
+    return addr;
+}
+
+static void test_type2_read_goes_around_reserved_bytes(void)
+{
+    const char *uri = "https://www.example.com/reserved/bytes/are/left/out";
+    uint8_t     ndef[96];
+    size_t      ndef_len = make_uri_message(uri, ndef, sizeof(ndef));
+
+    // Memory Control TLV: 6 bytes at page 8, byte offset 1, in the middle of the message
+    sim_a_init_ntag213(&s_card_a);
+    const uint8_t memory_control[5] = {0x02, 0x03, 0x21, 0x06, 0x04};
+    memcpy(&s_card_a.memory[16], memory_control, sizeof(memory_control));
+    s_card_a.memory[21] = 0x03;
+    s_card_a.memory[22] = (uint8_t)ndef_len;
+    store_around_gap(23, ndef, ndef_len, 33, 6);
+    memset(&s_card_a.memory[33], 0xAA, 6);
+    pn5180_uid_t                  uid    = activate_card_a();
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, uri);
+    pn5180_ndef_free_parsed_message(parsed);
     parsed = NULL;
 
-    // Reserved bytes inside the message (Memory Control TLV: 4 bytes at page 8) are not handled
-    const uint8_t memory_control[5] = {0x02, 0x03, 0x20, 0x04, 0x04};
-    memcpy(&s_card_a.memory[16], memory_control, sizeof(memory_control));
+    // The length fits the 137 bytes behind the T and L bytes, but not the 131 that are left of them
+    s_card_a.memory[22] = 133;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_PARSE_FAILED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+
+    // The area between the T and the L byte
+    sim_a_init_ntag213(&s_card_a);
+    const uint8_t between_t_and_l[5] = {0x02, 0x03, 0x16, 0x02, 0x04};
+    memcpy(&s_card_a.memory[16], between_t_and_l, sizeof(between_t_and_l));
+    s_card_a.memory[21] = 0x03;
+    memset(&s_card_a.memory[22], 0xAA, 2);
+    s_card_a.memory[24] = (uint8_t)ndef_len;
+    memcpy(&s_card_a.memory[25], ndef, ndef_len);
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, uri);
+    pn5180_ndef_free_parsed_message(parsed);
+    parsed = NULL;
+
+    // The area inside a proprietary TLV in front of the NDEF TLV: its length does not count them
+    sim_a_init_ntag213(&s_card_a);
+    const uint8_t in_other_tlv[7] = {0x02, 0x03, 0x1E, 0x04, 0x04, 0xFD, 0x10};
+    memcpy(&s_card_a.memory[16], in_other_tlv, sizeof(in_other_tlv));
+    memset(&s_card_a.memory[30], 0x03, 4); // would read as an NDEF TLV
+    s_card_a.memory[43] = 0x03;
+    s_card_a.memory[44] = (uint8_t)ndef_len;
+    memcpy(&s_card_a.memory[45], ndef, ndef_len);
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, uri);
+    pn5180_ndef_free_parsed_message(parsed);
+    parsed = NULL;
+
+    // Two areas that touch, the later one named first
+    sim_a_init_ntag213(&s_card_a);
+    const uint8_t two_areas[10] = {0x02, 0x03, 0x26, 0x02, 0x04, 0x02, 0x03, 0x24, 0x02, 0x04};
+    memcpy(&s_card_a.memory[16], two_areas, sizeof(two_areas));
+    s_card_a.memory[26] = 0x03;
+    s_card_a.memory[27] = (uint8_t)ndef_len;
+    store_around_gap(28, ndef, ndef_len, 36, 4);
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, uri);
+    pn5180_ndef_free_parsed_message(parsed);
+    parsed = NULL;
+
+    // Six control TLVs are followed, as many as the NXP reader library keeps; a seventh is not
+    sim_a_init_ntag213(&s_card_a);
+    const uint8_t lock_control[5] = {0x01, 0x03, 0xA0, 0x0C, 0x34};
+    for (int i = 0; i < 6; i++) {
+        memcpy(&s_card_a.memory[16 + i * 5], lock_control, sizeof(lock_control));
+    }
+    s_card_a.memory[46] = 0x03;
+    s_card_a.memory[47] = (uint8_t)ndef_len;
+    memcpy(&s_card_a.memory[48], ndef, ndef_len);
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, uri);
+    pn5180_ndef_free_parsed_message(parsed);
+    parsed = NULL;
+    memmove(&s_card_a.memory[51], &s_card_a.memory[46], ndef_len + 2);
+    memcpy(&s_card_a.memory[46], lock_control, sizeof(lock_control));
     TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_UNSUPPORTED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
 }
 
@@ -665,7 +752,7 @@ static void test_type2_write_follows_the_capability_container(void)
 
     // Access byte 0Fh: read-only tag; any other value than 00h is proprietary
     cc[3] = 0x0F;
-    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_ACCESS_DENIED, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_READ_ONLY, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
     cc[3] = 0x08;
     TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_UNSUPPORTED, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
     cc[3] = 0x00;
@@ -742,12 +829,28 @@ static void test_type2_write_keeps_the_tlvs_in_front_of_the_message(void)
     TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&records[0], uri, true, payload, sizeof(payload)));
     TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_CARD_FULL, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
 
-    // Reserved bytes inside the data area (Memory Control TLV: 8 bytes at page 20) are not handled
-    const uint8_t with_reserved[8] = {0x02, 0x03, 0x50, 0x08, 0x04, 0x03, 0x00, 0xFE};
+    // Memory Control TLV: 2 bytes at page 20, byte offset 2. T at 21, L at 22, so a message of
+    // 56 bytes and its Terminator TLV end with page 19 and leave them alone
+    const uint8_t with_reserved[8] = {0x02, 0x03, 0x52, 0x02, 0x04, 0x03, 0x00, 0xFE};
     memcpy(&s_card_a.memory[16], with_reserved, sizeof(with_reserved));
-    uri[24 + 10] = '\0';
+    memset(&s_card_a.memory[80], 0xAA, 4);
+    uri[24 + 39] = '\0';
+    TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&records[0], uri, true, payload, sizeof(payload)));
+    TEST_ASSERT_EQUAL(56, pn5180_ndef_encode_message(&message, NULL, 0));
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
+    TEST_ASSERT_EQUAL_HEX8(0xFE, s_card_a.memory[79]);
+    TEST_ASSERT_EQUAL_HEX8(0xAA, s_card_a.memory[80]);
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, uri);
+    pn5180_ndef_free_parsed_message(parsed);
+
+    // One byte more puts the Terminator TLV into page 20, and that page would be written whole
+    uri[24 + 39] = 'x';
+    uri[24 + 40] = '\0';
     TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&records[0], uri, true, payload, sizeof(payload)));
     TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_UNSUPPORTED, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
+    TEST_ASSERT_EQUAL_HEX8(0xAA, s_card_a.memory[80]);
+    TEST_ASSERT_EQUAL_HEX8(56, s_card_a.memory[22]);
 }
 
 static void test_type2_write_stays_inside_the_user_memory(void)
@@ -794,10 +897,18 @@ static void test_type2_control_tlv_size_zero_means_256(void)
     pn5180_ndef_record_t  record;
     pn5180_ndef_record_t  records[1];
     pn5180_ndef_message_t message;
-    uint8_t               payload[64];
+    uint8_t               payload[100];
     TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&record, "https://www.example.com/", true, payload, sizeof(payload)));
     pn5180_ndef_message_init(&message, records, 1);
     TEST_ASSERT_TRUE(pn5180_ndef_message_add(&message, &record));
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message)); // ends before page 20
+
+    // A message that reaches page 20 would write over the reserved bytes
+    char uri[100];
+    strcpy(uri, "https://www.example.com/");
+    memset(uri + 24, 'x', 60);
+    uri[24 + 60] = '\0';
+    TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&records[0], uri, true, payload, sizeof(payload)));
     TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_UNSUPPORTED, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
 }
 
@@ -867,6 +978,33 @@ static void test_classic_without_mad_has_no_ndef(void)
 
     pn5180_ndef_message_parsed_t *parsed = NULL;
     TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_NO_NDEF, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+}
+
+static void test_authenticate_refuses_what_the_protocol_does_not_know(void)
+{
+    static const uint8_t key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    sim_a_init_classic_1k(&s_card_a);
+    pn5180_uid_t uid = activate_card_a();
+
+    // 256 used to be cut to block 0, which the same key opens
+    TEST_ASSERT_FALSE(s_proto_a->authenticate(s_proto_a, key, PN5180_MIFARE_CLASSIC_KEYA, &uid, 256));
+    TEST_ASSERT_FALSE(s_proto_a->authenticate(s_proto_a, key, PN5180_MIFARE_CLASSIC_KEYA, &uid, -1));
+
+    pn5180_uid_t short_uid = uid;
+    short_uid.uid_length   = 3;
+    TEST_ASSERT_FALSE(s_proto_a->authenticate(s_proto_a, key, PN5180_MIFARE_CLASSIC_KEYA, &short_uid, 4));
+
+    TEST_ASSERT_TRUE(s_proto_a->authenticate(s_proto_a, key, PN5180_MIFARE_CLASSIC_KEYA, &uid, 4));
+}
+
+static void test_record_builders_refuse_missing_data(void)
+{
+    pn5180_ndef_record_t record;
+    uint8_t              type_buf[32];
+    TEST_ASSERT_FALSE(pn5180_ndef_make_mime_record(&record, "text/plain", NULL, 1, type_buf, sizeof(type_buf)));
+    TEST_ASSERT_FALSE(pn5180_ndef_make_external_record(&record, "example.com:t", NULL, 1, type_buf, sizeof(type_buf)));
+    TEST_ASSERT_TRUE(pn5180_ndef_make_mime_record(&record, "text/plain", NULL, 0, type_buf, sizeof(type_buf)));
+    TEST_ASSERT_TRUE(pn5180_ndef_make_external_record(&record, "example.com:t", NULL, 0, type_buf, sizeof(type_buf)));
 }
 
 static void test_classic_block_write_and_value_operations(void)
@@ -1200,6 +1338,90 @@ static void test_classic_emulation_card_stays_on_layer_3_unless_asked(void)
     TEST_ASSERT_TRUE(s_pn5180->iso14443_layer4_active);
 }
 
+/* ---- Anticollision with two cards and the CRC registers ---- */
+
+static sim_a_field_t s_field_a;
+
+// Two cards in the field: the anticollision resolves the collision bit by bit and both cards
+// are found with their own UID. The cards differ in the first UID byte, so the collision is in
+// the first byte of the first cascade level.
+static void test_anticollision_resolves_a_collision_between_two_cards(void)
+{
+    sim_a_init_ultralight(&s_field_a.cards[0], false);
+    sim_a_init_ultralight(&s_field_a.cards[1], false);
+    // Same UID length, differing bits spread over the whole UID
+    s_field_a.cards[1].uid[0] ^= 0x01; // differs in bit 0 of the first byte
+    s_field_a.cards[1].uid[3] ^= 0x80; // and in the last bit of the cascade level
+    fake_set_card(sim_a_field, sim_a_auth, &s_field_a);
+    TEST_ASSERT_TRUE(s_proto_a->setup_rf(s_proto_a));
+
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_14443_get_all_uids_ex(s_proto_a, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(2, uids->uids_count);
+    bool found[2] = {false, false};
+    for (int i = 0; i < uids->uids_count; i++) {
+        for (int c = 0; c < 2; c++) {
+            if (uids->uids[i].uid_length == 7 && memcmp(uids->uids[i].uid, s_field_a.cards[c].uid, 7) == 0) {
+                found[c] = true;
+            }
+        }
+    }
+    free(uids);
+    TEST_ASSERT_TRUE(found[0]);
+    TEST_ASSERT_TRUE(found[1]);
+
+    // The second card is found although its first cascade level differs from the first card's
+    // only in bits that were resolved by the collision path.
+    fake_set_card(sim_a_card, sim_a_auth, &s_field_a.cards[1]);
+    pn5180_uid_t uid = {.uid_length = 7, .subtype = PN5180_MIFARE_ULTRALIGHT};
+    memcpy(uid.uid, s_field_a.cards[1].uid, 7);
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+}
+
+// The frames of the anticollision and the answers are watched by the fake's CRC model: every
+// answer the driver accepts was checked against the CRC_RX_CONFIG bit, and the driver had the
+// TX CRC bit set wherever it expects a CRC answer. A driver that mixes the order fails its
+// exchanges here (the suite would not pass).
+static void test_type4_read_runs_over_frames_with_correct_crc_registers(void)
+{
+    sim_a_init_iso_dep(&s_card_a, 0x20, 8);
+    uint8_t ndef[64];
+    size_t  ndef_len = make_uri_message("https://example.org/crc", ndef, sizeof(ndef));
+    sim_a_iso_dep_store_ndef(&s_card_a, ndef, ndef_len);
+    pn5180_uid_t uid = activate_card_a();
+
+    int frames = fake_frame_count();
+    // Both CRC register bits are read by the fake on every frame; the exchange only succeeds
+    // when the driver sets them as the card expects.
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_TRUE(fake_frame_count() > frames);
+    assert_uri_message(parsed, "https://example.org/crc");
+    pn5180_ndef_free_parsed_message(parsed);
+}
+
+// The ISO15693 poll does not cycle the field when the right RF configuration is loaded.
+static void test_iso15693_poll_does_not_cycle_the_field_twice(void)
+{
+    sim_v_init(&s_card_v);
+    fake_set_card(sim_v_card, NULL, &s_card_v);
+    TEST_ASSERT_TRUE(s_proto_v->setup_rf(s_proto_v)); // loads ASK 100 (0x0D)
+
+    int ons = fake_rf_on_count();
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_15693_get_all_uids_ex(s_proto_v, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    free(uids);
+
+    // The poll loads ASK 10 (0x0E), its preferred configuration: one switch of the field.
+    // Without the early exit the setup would cycle twice (off and on) although the second
+    // configuration was never loaded.
+    TEST_ASSERT_TRUE(fake_rf_on_count() <= ons + 2);
+}
+
 /* ---- ISO15693 ---- */
 
 static void test_iso15693_poll_select_detect_and_ndef(void)
@@ -1279,7 +1501,7 @@ static void test_iso15693_ndef_write_then_read(void)
 
     // A read-only tag is left alone
     s_card_v.memory[1] = 0x43;
-    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_ACCESS_DENIED, pn5180_ndef_write_card_auto(s_proto_v, &uid, &message));
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_READ_ONLY, pn5180_ndef_write_card_auto(s_proto_v, &uid, &message));
     s_card_v.memory[1] = 0x40;
     pn5180_ndef_message_parsed_t *parsed = NULL;
     TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_v, &uid, &parsed));
@@ -1498,6 +1720,7 @@ int main(void)
     RUN_TEST(test_type2_without_capability_container_has_no_ndef);
     RUN_TEST(test_type2_read_stays_inside_the_data_area);
     RUN_TEST(test_type2_read_checks_the_capability_container_like_nxp);
+    RUN_TEST(test_type2_read_goes_around_reserved_bytes);
     RUN_TEST(test_ultralight_c_is_told_apart_from_ultralight);
     RUN_TEST(test_classic_ndef_is_read_through_the_mad);
     RUN_TEST(test_ndef_write_is_refused_for_classic_and_type4);
@@ -1508,6 +1731,8 @@ int main(void)
     RUN_TEST(test_classic_ndef_sector_trailer_is_checked);
     RUN_TEST(test_classic_mad_crc_is_checked);
     RUN_TEST(test_classic_without_mad_has_no_ndef);
+    RUN_TEST(test_authenticate_refuses_what_the_protocol_does_not_know);
+    RUN_TEST(test_record_builders_refuse_missing_data);
     RUN_TEST(test_classic_block_write_and_value_operations);
     RUN_TEST(test_iso_dep_card_is_activated_on_select);
     RUN_TEST(test_iso_dep_chaining_in_both_directions);
@@ -1521,6 +1746,9 @@ int main(void)
     RUN_TEST(test_type4_select_falls_back_for_mapping_version_1);
     RUN_TEST(test_iso_dep_reserved_frame_size_is_accepted);
     RUN_TEST(test_classic_emulation_card_stays_on_layer_3_unless_asked);
+    RUN_TEST(test_anticollision_resolves_a_collision_between_two_cards);
+    RUN_TEST(test_type4_read_runs_over_frames_with_correct_crc_registers);
+    RUN_TEST(test_iso15693_poll_does_not_cycle_the_field_twice);
     RUN_TEST(test_iso15693_poll_select_detect_and_ndef);
     RUN_TEST(test_iso15693_ndef_write_then_read);
     RUN_TEST(test_iso15693_block_write_and_read);

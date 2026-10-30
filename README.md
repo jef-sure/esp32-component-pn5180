@@ -17,7 +17,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn5180^0.5.2"
+idf.py add-dependency "jef-sure/pn5180^0.6.0"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.x or 6.0 is required.
@@ -187,7 +187,7 @@ pn5180_ndef_message_add(&message, &record);
 pn5180_ndef_result_t result = pn5180_ndef_write_card_auto(proto, card, &message);
 ```
 
-`pn5180_ndef_write_card_auto()` is the counterpart of `pn5180_ndef_read_card_auto()`: it writes Ultralight / NTAG and ISO15693 tags and returns `PN5180_NDEF_ERR_UNSUPPORTED` for MIFARE Classic and ISO14443-4 cards. It follows the procedure of the NXP reader library. The tag must already be NDEF formatted, with a capability container and an NDEF TLV (an empty one on a new tag): the message replaces the content of that TLV, and what stands in front of it, such as the Lock Control TLV of an NTAG, is kept. `PN5180_NDEF_ERR_NO_NDEF` means that the tag is not formatted, `PN5180_NDEF_ERR_ACCESS_DENIED` that it is read-only, `PN5180_NDEF_ERR_CARD_FULL` that the message does not fit. The length is set to 0 first and to its real value last, so an interrupted write leaves an empty message instead of a damaged one. Text, MIME and external records are built with `pn5180_ndef_make_text_record()`, `pn5180_ndef_make_mime_record()` and `pn5180_ndef_make_external_record()`.
+`pn5180_ndef_write_card_auto()` is the counterpart of `pn5180_ndef_read_card_auto()`: it writes Ultralight / NTAG and ISO15693 tags and returns `PN5180_NDEF_ERR_UNSUPPORTED` for MIFARE Classic and ISO14443-4 cards. It follows the procedure of the NXP reader library. The tag must already be NDEF formatted, with a capability container and an NDEF TLV (an empty one on a new tag): the message replaces the content of that TLV, and what stands in front of it, such as the Lock Control TLV of an NTAG, is kept. `PN5180_NDEF_ERR_NO_NDEF` means that the tag is not formatted, `PN5180_NDEF_ERR_READ_ONLY` that it does not grant write access, `PN5180_NDEF_ERR_CARD_FULL` that the message does not fit. The length is set to 0 first and to its real value last, so an interrupted write leaves an empty message instead of a damaged one. Text, MIME and external records are built with `pn5180_ndef_make_text_record()`, `pn5180_ndef_make_mime_record()` and `pn5180_ndef_make_external_record()`.
 
 ### Poll, select, and inspect cards
 
@@ -326,7 +326,7 @@ A PN5180 command is two SPI transfers, each framed by NSS. The driver holds the 
 - **Reads fail after one refused command** — Ultralight and NTAG cards leave the selected state after any NAK (for example a read beyond the last page), MIFARE Classic after a refused authentication. Select the card again.
 - **`PN5180_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, the MAD has a wrong CRC, the card uses non-default keys, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
 - **`pn5180_ndef_write_card_auto()` returns `PN5180_NDEF_ERR_NO_NDEF`** — the tag is not NDEF formatted: it has no capability container, or its data area holds no NDEF TLV for the message to go into. NTAG and ICODE tags usually leave the factory formatted with an empty NDEF TLV; formatting a blank tag is not implemented.
-- **`PN5180_NDEF_ERR_UNSUPPORTED` on an NTAG, Ultralight or ISO15693 tag** — the capability container declares another major mapping version than 1 or access conditions other than the standard ones (read/write, read-only), or a Type 2 tag keeps lock or reserved bytes inside its data area. Read or write the blocks yourself with `block_read` / `block_write`.
+- **`PN5180_NDEF_ERR_UNSUPPORTED` on an NTAG, Ultralight or ISO15693 tag** — the capability container declares another major mapping version than 1 or access conditions other than the standard ones (read/write, read-only), or a write would touch lock or reserved bytes that a Type 2 tag keeps inside its data area. A read goes around such bytes, a write does not. Read or write the blocks yourself with `block_read` / `block_write`.
 - **A card shows a different UID starting with `08` on every scan** — a random UID, typically a phone. See [Targets with a random UID](#targets-with-a-random-uid).
 - **ISO15693 `halt()` returns false** — the tag does not implement Reset to Ready, which is an optional command. The tag stays selected until the field is switched off.
 - **Everything times out after an update to 0.3.0 or later** — the receive timeout runs on a PN5180 timer; `pn5180_set_hw_rx_timeout(pn5180, false)` switches to a host-side timeout to tell a timer problem from an RF problem.

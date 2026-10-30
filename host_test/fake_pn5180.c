@@ -10,15 +10,16 @@ static fake_card_fn s_card;
 static fake_auth_fn s_auth;
 static void        *s_card_ctx;
 static int          s_frame_count;
+static int          s_rf_on_count;
 static int64_t      s_time_us;
 static uint32_t     s_registers[64];
-
 pn5180_t *fake_pn5180_create(void)
 {
     pn5180_t *pn5180      = calloc(1, sizeof(pn5180_t));
     pn5180->timeout_ms    = 500;
     pn5180->hw_rx_timeout = true;
     s_frame_count         = 0;
+    s_rf_on_count         = 0;
     s_card                = NULL;
     s_auth                = NULL;
     s_card_ctx            = NULL;
@@ -43,7 +44,50 @@ int fake_frame_count(void)
     return s_frame_count;
 }
 
+int fake_rf_on_count(void)
+{
+    return s_rf_on_count;
+}
+
+bool fake_tx_crc_enabled(void)
+{
+    return (s_registers[PN5180_CRC_TX_CONFIG] & 0x01) != 0;
+}
+
+bool fake_rx_crc_enabled(void)
+{
+    return (s_registers[PN5180_CRC_RX_CONFIG] & 0x01) != 0;
+}
+
 /* ---- The part of src/pn5180.c that the protocol code uses ---- */
+
+/* The CRC the PN5180 transceiver would append to or check in a frame: CRC-16/A per ISO 14443,
+ * polynomial 0x8408 reflected, preset 0xFFFF, no final inversion. */
+static uint16_t fake_crc16(const uint8_t *data, size_t len, uint16_t init)
+{
+    for (size_t i = 0; i < len; i++) {
+        uint16_t reg = init ^ data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            bool lsb = (reg & 1) != 0;
+            reg >>= 1;
+            if (lsb) {
+                reg ^= 0x8408;
+            }
+        }
+        init = reg;
+    }
+    return init;
+}
+
+// True when the frame ends with its own correct CRC.
+static bool fake_crc_ok(const uint8_t *frame, size_t len)
+{
+    if (len < 2) {
+        return false;
+    }
+    uint16_t check = fake_crc16(frame, len - 2, 0xFFFF);
+    return (uint8_t)(check & 0xFF) == frame[len - 2] && (uint8_t)(check >> 8) == frame[len - 1];
+}
 
 pn5180_rf_result_t pn5180_rf_transceive(pn5180_t *pn5180, const uint8_t *tx, size_t tx_len, uint8_t tx_last_bits, uint8_t *rx, size_t rx_size, size_t *rx_len,
                                         uint32_t timeout_us, uint32_t *rx_status)
@@ -62,6 +106,39 @@ pn5180_rf_result_t pn5180_rf_transceive(pn5180_t *pn5180, const uint8_t *tx, siz
         // Transmit only: the reader does not listen.
         result    = PN5180_RF_OK;
         local_len = 0;
+    }
+
+    // The CRC bits of CRC_TX_CONFIG / CRC_RX_CONFIG decide what went on the air and what the
+    // receiver accepts, like in the real transceiver. The simulated card sees the frame the
+    // driver built and answers with logical bytes; the fake adds the CRC the card would append
+    // and checks the one the card would be judged by, so a wrong CRC ordering in the driver
+    // shows up as an RX error instead of going unnoticed.
+    const bool tx_crc = fake_tx_crc_enabled() && tx_last_bits == 0;
+    // The 4-bit ACK/NAK answers (reported by the cards as an RX error) never carry a CRC;
+    // every other answer to a CRC request does.
+    if (result != PN5180_RF_TIMEOUT && result != PN5180_RF_COLLISION && result != PN5180_RF_RX_ERROR && local_len > 0 && timeout_us != 0) {
+        if (tx_crc) {
+            // The card received a CRC frame and answers with its own CRC appended.
+            if (local_len + 2 > sizeof(local_rx)) {
+                result    = PN5180_RF_OVERFLOW;
+                local_len = 0;
+            } else {
+                uint16_t crc     = fake_crc16(local_rx, local_len, 0xFFFF);
+                local_rx[local_len]     = (uint8_t)(crc & 0xFF);
+                local_rx[local_len + 1] = (uint8_t)(crc >> 8);
+                local_len += 2;
+            }
+        }
+        if (result == PN5180_RF_OK && fake_rx_crc_enabled()) {
+            // The transceiver checks the CRC of the answer and strips it. The 4-bit ACK/NAK
+            // (reported by the card as an RX error) never reaches this branch.
+            if (!fake_crc_ok(local_rx, local_len)) {
+                local_status |= PN5180_RX_DATA_INTEGRITY_ERROR;
+                result = PN5180_RF_RX_ERROR;
+            } else {
+                local_len -= 2;
+            }
+        }
     }
     // Same buffer rules as the real function.
     if (local_len > rx_size && result == PN5180_RF_COLLISION) {
@@ -116,14 +193,17 @@ bool pn5180_clear_irq_status(pn5180_t *pn5180, uint32_t irq_mask)
 
 bool pn5180_load_rf_config(pn5180_t *pn5180, uint8_t tx_conf)
 {
-    pn5180->tx_config        = tx_conf;
-    pn5180->rf_config_loaded = true;
+    if (tx_conf != 0xFF) {
+        pn5180->tx_config        = tx_conf;
+        pn5180->rf_config_loaded = true;
+    }
     return true;
 }
 
 bool pn5180_set_rf_on(pn5180_t *pn5180)
 {
     pn5180->is_rf_on = true;
+    s_rf_on_count++;
     return true;
 }
 

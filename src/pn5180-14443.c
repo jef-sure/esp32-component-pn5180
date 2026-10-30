@@ -209,12 +209,18 @@ static bool _pn5180_14443_authenticate( //
     }
 
     // MIFARE Classic/Plus authentication with Crypto1
+    // The block number is a single byte on the air.
+    if (blockno < 0 || blockno > 0xFF) {
+        ESP_LOGE(TAG, "Invalid block number %d for MIFARE authentication", blockno);
+        return false;
+    }
+
     // Extract last 4 bytes of UID for authentication
     // - 4-byte UIDs: use all 4 bytes
     // - 7-byte UIDs: use bytes [3:6] (last 4 bytes)
     // - 10-byte UIDs: use bytes [6:9] (last 4 bytes)
     const uint8_t *uid_for_auth;
-    if (uid->uid_length <= 4) {
+    if (uid->uid_length == 4) {
         uid_for_auth = uid->uid;
     } else if (uid->uid_length == 7) {
         uid_for_auth = &uid->uid[3]; // Last 4 bytes of 7-byte UID
@@ -225,8 +231,8 @@ static bool _pn5180_14443_authenticate( //
         return false;
     }
 
-    PN5180_LOGD(TAG, "Authenticating: KeyType=0x%02X Block=%d Key=[%02X %02X %02X %02X %02X %02X] UID_Auth=[%02X %02X %02X %02X]", key_type, blockno, key[0],
-                key[1], key[2], key[3], key[4], key[5], uid_for_auth[0], uid_for_auth[1], uid_for_auth[2], uid_for_auth[3]);
+    // Key bytes are never logged: they are secret material.
+    PN5180_LOGD(TAG, "Authenticating: KeyType=0x%02X Block=%d", key_type, blockno);
 
     // Send AUTH command immediately - DO NOT manipulate registers between SELECT and AUTH
     // The working reference implementation sends AUTH with no register touches
@@ -645,7 +651,7 @@ static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, pn5180_poll_stat
             break;
         }
         card_count++;
-        ESP_LOGI(TAG, "Found Card %d: UID Len %d", card_count, full_uid_len);
+        PN5180_LOGD(TAG, "Found Card %d: UID Len %d", card_count, full_uid_len);
         uint32_t agc_reg     = 0;
         uint16_t current_agc = 0;
         if (pn5180_read_register(pn5180, PN5180_RF_STATUS, &agc_reg)) {
@@ -823,20 +829,18 @@ static bool pn5180_14443_send_rats(pn5180_t *pn5180)
     return true;
 }
 
-// Activates ISO14443-4 on the selected card: RATS, with retries.
+// Activates ISO14443-4 on the selected card. ISO 14443-4 allows one RATS per activation:
+// a card that received the first one ignores any repetition, so retries only add delay.
 static bool pn5180_14443_4_activate(pn5180_t *pn5180)
 {
     if (pn5180->iso14443_layer4_active) {
         return true;
     }
-    for (int attempt = 0; attempt < 3; attempt++) {
-        if (pn5180_14443_send_rats(pn5180)) {
-            pn5180->iso14443_layer4_active = true;
-            return true;
-        }
-        pn5180_delay_ms(5);
+    if (pn5180_14443_send_rats(pn5180)) {
+        pn5180->iso14443_layer4_active = true;
+        return true;
     }
-    ESP_LOGE(TAG, "RATS failed after retries");
+    ESP_LOGE(TAG, "RATS failed");
     return false;
 }
 
@@ -1097,19 +1101,25 @@ bool pn5180_14443_4_transceive(pn5180_t *pn5180, const uint8_t *apdu, size_t apd
 
 static bool pn5180_14443_4_select(pn5180_t *pn5180, uint8_t p1, uint8_t p2, const uint8_t *file_id, size_t file_id_len, bool *card_refused)
 {
-    uint8_t apdu[5 + 16];
-    apdu[0] = 0x00;                 // CLA
-    apdu[1] = 0xA4;                 // INS = SELECT
-    apdu[2] = p1;                   // P1
-    apdu[3] = p2;                   // P2
-    apdu[4] = (uint8_t)file_id_len; // Lc
+    uint8_t apdu[5 + 16 + 1];
+    size_t  apdu_len = 5u + file_id_len;
+    apdu[0]          = 0x00;                 // CLA
+    apdu[1]          = 0xA4;                 // INS = SELECT
+    apdu[2]          = p1;                   // P1
+    apdu[3]          = p2;                   // P2
+    apdu[4]          = (uint8_t)file_id_len; // Lc
     memcpy(&apdu[5], file_id, file_id_len);
+    if (p1 == 0x04) {
+        // NFC Forum Type 4 Tag: the NDEF Tag Application Select carries Le = 00h (a case 4 APDU,
+        // the FCI may follow). A select by file identifier has no Le.
+        apdu[apdu_len++] = 0x00;
+    }
 
     *card_refused = false;
 
     uint8_t rx[260];
     size_t  rx_len = sizeof(rx);
-    if (!pn5180_14443_4_transceive(pn5180, apdu, 5u + file_id_len, rx, &rx_len)) {
+    if (!pn5180_14443_4_transceive(pn5180, apdu, apdu_len, rx, &rx_len)) {
         return false;
     }
 
@@ -1338,7 +1348,7 @@ static bool pn5180_14443_select_by_uid( //
 
         // 3. Check if UID is complete
         if (!(sak & 0x04)) {
-            ESP_LOGI(TAG, "Card successfully selected via direct path!");
+            PN5180_LOGD(TAG, "Card successfully selected via direct path!");
             // Determine card type and capacity from SAK
             if (uid->sak != sak) {
                 uid->sak = sak;

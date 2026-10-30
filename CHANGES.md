@@ -1,5 +1,66 @@
 # Changelog
 
+## v 0.6.0 - 2026-10-30
+
+### Brought over from the PN532 component (0.7.4, 0.7.5)
+
+Behaviour changes to be aware of:
+
+- **New result `PN5180_NDEF_ERR_READ_ONLY` (-11), as in the PN532 component.** `pn5180_ndef_write_card_auto()` returns it for a tag without write access (Type 2 access byte 0Fh, Type 5 access 3h); it was `PN5180_NDEF_ERR_ACCESS_DENIED`, which now stands for read protection only. Code that checks the result of a write has to follow.
+- **Type 2 NDEF read goes around lock and reserved bytes.** Bytes that Lock Control and Memory Control TLVs place inside the data area are not part of the TLV stream: the TLV walk and the message continue behind them, as in NxpNfcRdLib phalTop. Such a message returned `PN5180_NDEF_ERR_UNSUPPORTED`. The bytes are skipped one by one, as in the PN532 component; NxpNfcRdLib skips whole blocks, which makes a difference only for an area that does not fill its blocks. A length that fits the data area only with those bytes counted is `PN5180_NDEF_ERR_PARSE_FAILED`. Factory NTAG21x and Ultralight C tags are not affected: their lock bytes lie behind the data area.
+- **Type 2 NDEF write is refused only if it would touch lock or reserved bytes.** The check covered everything from the NDEF TLV to the end of the data area, so a short message in front of such bytes returned `PN5180_NDEF_ERR_UNSUPPORTED` for no reason. It now covers the blocks to write, whole: bytes that only share the last block with the Terminator TLV count as touched.
+- Up to six control TLVs are followed, as many as NxpNfcRdLib keeps (three of each kind); it was four.
+- `authenticate()` of a MIFARE Classic card returns false for a block number outside 0..255, which used to be cut to 8 bits (256 authenticated block 0), and for a UID shorter than 4 bytes.
+- `pn5180_ndef_make_mime_record()` and `pn5180_ndef_make_external_record()` return false for `data == NULL` with a non-zero length; the record was built and refused later by the encoder.
+
+Fixes:
+
+- An ISO14443-4 session counts as closed whenever the field is gone. `pn5180_reset()`, entering LPCD and `pn5180_set_rf_on()` finding the field off left it marked as open until the next select: `block_write` was refused, and an APDU waited for a card that could not answer. Only `pn5180_recover()` and `pn5180_set_rf_off()` closed it.
+- `pn5180_reset()` documents what a reset drops and that `pn5180_recover()` brings the RF configuration and the field back.
+
+Host tests: reading around lock and reserved bytes (inside the message, between the T and the L byte, inside a TLV in front of the NDEF TLV, two areas that touch, six and seven control TLVs); writing up to the block in front of reserved bytes; `authenticate()` and record builder arguments.
+
+### Fixes from a review of 0.5.2
+
+Behaviour changes to be aware of:
+
+- ISO14443-4 activation sends RATS once. ISO 14443-4 allows one RATS per activation: a card that received the first one ignores any repetition, so the three attempts only added about 50 ms before failing. Recovery stays with the callers, which select the card again (WUPA).
+- `pn5180_set_rf_on()` no longer trusts the cached field state: it reads TX_RF_STATUS also when it believes the field is on. A field that dropped for a reason the driver did not cause (RFCA, an external reset) now makes `setup_rf` fail instead of letting every poll return NO_TARGET.
+- `pn5180_load_rf_config()` with 0xFF ("no change") is no longer recorded as the configuration to restore: a later `pn5180_recover()` or LPCD wake-up would have reloaded 0xFF, which reloads nothing.
+- ISO15693 `setup_rf` does not switch the field off and on when the requested configuration is already loaded, like the ISO14443-A one always did. A poll with the preferred ASK 10 % configuration loaded saves about 10 ms of dead time and does not reset the tags in the field.
+- `pn5180_init()` rejects `GPIO_NUM_NC` (-1) for NSS, BUSY and RST. The shift `1ULL << pin` with pin -1 is undefined behaviour.
+
+NFC Forum Type 4:
+
+- The NDEF Tag Application Select carries Le = 00h (a case 4 APDU, the FCI may follow). It was sent without Le; most cards tolerate that, but a strict tag or an HCE app answers 6700. A select by file identifier stays without Le, as before. (The PN532 component already sent it this way.)
+
+MIFARE:
+
+- MIFARE keys are no longer printed with `PN5180_DEBUG` enabled.
+
+EEPROM:
+
+- `PN5180_EEPROM_MAX_ADDR` is 254 (0xFE). The datasheet says for READ_EEPROM and WRITE_EEPROM: "EEPROM Address must be in the range from 0 to 254, inclusive." The constant was 253 (0xFD), which refused the last byte; the 0.5.2 changelog wrongly claimed the datasheet said 253.
+
+Hardening:
+
+- `pn5180_reset()` makes the announced three boot attempts, not two.
+- `stream_append()` with a zero count no longer calls `memcpy` with a NULL destination on an empty stream (undefined behaviour; the host tests run UBSan with `-fno-sanitize-recover=undefined`).
+
+Logging:
+
+- Card found, direct-path select and ISO15693 tag found/AGC messages are debug level now, so a poll no longer writes the log. The internal reselects inside NDEF reads had been writing an INFO line each.
+
+Deprecation:
+
+- `pn5180_ndef_read_from_selected_card()` is deprecated in the header; use `pn5180_ndef_read_card_auto()`, which knows the block layout of every supported card type.
+
+Host tests:
+
+- The fake transceiver follows the CRC bits of `CRC_TX_CONFIG` / `CRC_RX_CONFIG`: the answer to a CRC request carries a CRC, which is checked and stripped, and the 4-bit ACK/NAK stays without one. A driver mistake in the CRC ordering shows up as an RX error now.
+- A two-card ISO14443A simulator (`sim_a_field`) collides the anticollision bit by bit, with the collision position relative to the first FIFO byte as the PN5180 reports it. The bit-level branch of `pn5180_14443_anticollision_level` (RX_BIT_ALIGN, collision position, split-byte merge) runs in the tests now.
+- The fake counts the RF-on switches, and a test checks that an ISO15693 poll with the preferred configuration loaded does not cycle the field.
+
 ## v 0.5.2 - 2026-10-12
 
 ### Fixes from a review of 0.5.1
@@ -26,7 +87,7 @@ Examples:
 
 Documentation:
 
-- `pn5180_read_eeprom()` / `pn5180_write_eeprom()`: the last EEPROM address is 253 (`PN5180_EEPROM_MAX_ADDR`), not 254.
+- `pn5180_read_eeprom()` / `pn5180_write_eeprom()`: the last EEPROM address is 254 (`PN5180_EEPROM_MAX_ADDR`), not 255. (Corrected again in 0.6.0: the datasheet says 254, and the constant is 0xFE now.)
 - `pn5180_ndef_read_from_selected_card()`: `max_blocks` of 0 means the default limit of 256 blocks, not "no limit".
 
 Component name in the ESP Component Registry (`jef-sure/pn5180`; `esp32-component-pn5180` is the name of the repository):

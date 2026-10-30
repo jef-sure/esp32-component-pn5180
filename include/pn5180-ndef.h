@@ -35,7 +35,8 @@ typedef enum
     PN5180_NDEF_ERR_BUFFER_TOO_SMALL = -7, /**< Reserved: not returned by the driver */
     PN5180_NDEF_ERR_CARD_FULL        = -8, /**< Card capacity exceeded */
     PN5180_NDEF_ERR_UNSUPPORTED      = -9, /**< Card type has no NDEF mapping in this driver */
-    PN5180_NDEF_ERR_ACCESS_DENIED    = -10, /**< The NDEF data is protected against the requested access */
+    PN5180_NDEF_ERR_ACCESS_DENIED    = -10, /**< The NDEF data is read protected */
+    PN5180_NDEF_ERR_READ_ONLY        = -11, /**< The capability container does not grant write access */
 } pn5180_ndef_result_t;
 
 /** @name NDEF Record flag bits (header byte)
@@ -272,6 +273,11 @@ typedef int (*pn5180_ndef_sector_id_callback_t)(int blockno, void *user_ctx);
  * for raw data and record structures, parses all records.
  *
  * @warning Card must be selected before calling this function
+ * @deprecated Use pn5180_ndef_read_card_auto() instead. The block layout is
+ *         card-specific: on a Type 2 tag this function must be given page 4 and
+ *         4-byte blocks, a 16-byte read there overruns into the following pages
+ *         and damages any message longer than the first read. pn5180_ndef_read_card_auto()
+ *         knows the layout of every supported card type.
  *
  * @param proto Pointer to protocol interface (card must be selected)
  * @param start_block Starting block number for NDEF data
@@ -293,7 +299,7 @@ pn5180_ndef_result_t pn5180_ndef_read_from_selected_card( //
     pn5180_ndef_sector_id_callback_t sector_cb,    //
     void                     *auth_ctx,     //
     pn5180_ndef_message_parsed_t   **out_msg       //
-);
+) __attribute__((deprecated("use pn5180_ndef_read_card_auto()")));
 
 /**
  * @brief Free memory allocated by pn5180_ndef_read_from_selected_card
@@ -321,7 +327,9 @@ pn5180_ndef_result_t pn5180_ndef_parse_message(const uint8_t *raw_data, size_t r
  *
  * Picks the NDEF mapping from uid->subtype, so detect_card_type_and_capacity() must have run,
  * and the card must be selected (select_by_uid()):
- * - Ultralight / NTAG (Type 2): capability container in page 3, TLVs from page 4
+ * - Ultralight / NTAG (Type 2): capability container in page 3, TLVs from page 4; lock and
+ *   reserved bytes that Lock Control and Memory Control TLVs place inside the data area are left
+ *   out, so a message continues behind them
  * - MIFARE Classic: sectors listed in the MIFARE Application Directory, with the public NDEF keys
  * - ISO14443-4 cards (Type 4): NDEF application, capability container file, NDEF file
  * - ISO15693 (Type 5): capability container in block 0, TLVs after it
@@ -340,8 +348,7 @@ pn5180_ndef_result_t pn5180_ndef_parse_message(const uint8_t *raw_data, size_t r
  * @return PN5180_NDEF_OK, or
  *         PN5180_NDEF_ERR_NO_NDEF if the card is not NDEF formatted or carries no message,
  *         PN5180_NDEF_ERR_UNSUPPORTED for a card type without NDEF mapping, an unknown mapping
- *         version, proprietary access conditions, or a Type 2 tag with lock or reserved bytes
- *         inside the message,
+ *         version, or proprietary access conditions,
  *         PN5180_NDEF_ERR_ACCESS_DENIED if the tag protects the message against reading,
  *         PN5180_NDEF_ERR_PARSE_FAILED if the tag or the message is inconsistent,
  *         or another error code
@@ -363,7 +370,8 @@ pn5180_ndef_result_t pn5180_ndef_read_card_auto(struct _pn5180_proto_t *proto, p
  * data area (an empty one on a new tag). The message replaces the content of that NDEF TLV;
  * TLVs in front of it, such as the Lock Control TLV of an NTAG, are kept. The TLV length is set
  * to 0 first and to the real length last, so an interrupted write leaves an empty message. A
- * Terminator TLV follows the message if the data area has room for it.
+ * Terminator TLV follows the message if the data area has room for it. Lock or reserved bytes
+ * that a Type 2 tag keeps inside the blocks to write are not skipped: such a write is refused.
  *
  * @param proto Protocol interface the card was found with; the card must be selected
  * @param uid Card to write, with subtype, block_size and blocks_count set by
@@ -372,10 +380,10 @@ pn5180_ndef_result_t pn5180_ndef_read_card_auto(struct _pn5180_proto_t *proto, p
  * @return PN5180_NDEF_OK, or
  *         PN5180_NDEF_ERR_UNSUPPORTED for a card type this function does not write, an unknown
  *         mapping version, proprietary access conditions, or a Type 2 tag with lock or reserved
- *         bytes inside its data area,
+ *         bytes inside the blocks to write,
  *         PN5180_NDEF_ERR_NO_NDEF if the tag has no capability container or no NDEF TLV (not
  *         NDEF formatted),
- *         PN5180_NDEF_ERR_ACCESS_DENIED if the tag is read-only,
+ *         PN5180_NDEF_ERR_READ_ONLY if the tag does not grant write access,
  *         PN5180_NDEF_ERR_CARD_FULL if the message does not fit the data area,
  *         PN5180_NDEF_ERR_READ_FAILED or PN5180_NDEF_ERR_WRITE_FAILED if the card refused a
  *         command; select the card again after these
@@ -445,7 +453,7 @@ bool pn5180_ndef_record_is_smartposter(const pn5180_ndef_record_t *rec);
  *
  * @param rec Pointer to record to initialize
  * @param mime_type MIME type string (e.g., "application/json")
- * @param data Payload data
+ * @param data Payload data; may be NULL only with data_len 0
  * @param data_len Length of payload data
  * @param type_buf Buffer to store MIME type (must remain valid)
  * @param type_buf_len Size of type buffer
@@ -460,7 +468,7 @@ bool pn5180_ndef_make_mime_record(pn5180_ndef_record_t *rec, const char *mime_ty
  *
  * @param rec Pointer to record to initialize
  * @param type_name External type string (e.g., "example.com:mytype")
- * @param data Payload data
+ * @param data Payload data; may be NULL only with data_len 0
  * @param data_len Length of payload data
  * @param type_buf Buffer to store type name (must remain valid)
  * @param type_buf_len Size of type buffer

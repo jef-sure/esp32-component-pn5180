@@ -755,7 +755,7 @@ bool pn5180_ndef_record_is_smartposter(const pn5180_ndef_record_t *rec)
 
 bool pn5180_ndef_make_mime_record(pn5180_ndef_record_t *rec, const char *mime_type, const uint8_t *data, size_t data_len, uint8_t *type_buf, size_t type_buf_len)
 {
-    if (!rec || !mime_type || !type_buf) return false;
+    if (!rec || !mime_type || !type_buf || (!data && data_len != 0)) return false;
 
     size_t type_len = strlen(mime_type);
     if (type_len == 0 || type_len > 255 || type_len > type_buf_len) return false;
@@ -774,7 +774,7 @@ bool pn5180_ndef_make_mime_record(pn5180_ndef_record_t *rec, const char *mime_ty
 
 bool pn5180_ndef_make_external_record(pn5180_ndef_record_t *rec, const char *type_name, const uint8_t *data, size_t data_len, uint8_t *type_buf, size_t type_buf_len)
 {
-    if (!rec || !type_name || !type_buf) return false;
+    if (!rec || !type_name || !type_buf || (!data && data_len != 0)) return false;
 
     size_t type_len = strlen(type_name);
     if (type_len == 0 || type_len > 255 || type_len > type_buf_len) return false;
@@ -828,7 +828,9 @@ const char *pn5180_ndef_result_to_string(pn5180_ndef_result_t result)
     case PN5180_NDEF_ERR_UNSUPPORTED:
         return "Card type not supported";
     case PN5180_NDEF_ERR_ACCESS_DENIED:
-        return "NDEF data is access protected";
+        return "NDEF data is read protected";
+    case PN5180_NDEF_ERR_READ_ONLY:
+        return "Tag is write protected";
     default:
         return "Unknown error";
     }

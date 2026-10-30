@@ -58,7 +58,7 @@ extern "C" {
 #define PN5180_IRQ_PIN_CONFIG_ACTIVE_HIGH        0x01u // Bit 0 - IRQ pin is active high
 #define PN5180_IRQ_PIN_CONFIG_AUTO_CLEAR_ON_READ 0x02u // Bit 1 - IRQ pin is cleared by reading IRQ_STATUS
 #define PN5180_EEPROM_MIN_ADDR      0x16u
-#define PN5180_EEPROM_MAX_ADDR      0xFDu
+#define PN5180_EEPROM_MAX_ADDR      0xFEu
 #define PN5180_MIN_FIRMWARE_VERSION 0x0304u
 #define PN5180_FIRMWARE_VERSION_3_A 0x030Au // First firmware with the LPCD reference modes of datasheet rev. 4.0
 #define PN5180_MAX_WAKEUP_COUNTER_MS 2690u
@@ -546,7 +546,7 @@ bool pn5180_read_register(pn5180_t *pn5180, uint8_t reg, uint32_t *value);
 /**
  * @brief Read data from PN5180 EEPROM
  * @param pn5180 Pointer to PN5180 device structure
- * @param addr EEPROM start address (0-253, PN5180_EEPROM_MAX_ADDR)
+ * @param addr EEPROM start address (0-254, PN5180_EEPROM_MAX_ADDR)
  * @param buffer Buffer to store read data
  * @param len Number of bytes to read; addr + len must not pass the last address
  * @return true on success, false on failure
@@ -556,7 +556,7 @@ bool pn5180_read_eeprom(pn5180_t *pn5180, uint8_t addr, uint8_t *buffer, int len
 /**
  * @brief Write data to PN5180 EEPROM
  * @param pn5180 Pointer to PN5180 device structure
- * @param addr EEPROM start address (22-253, PN5180_EEPROM_MIN_ADDR to PN5180_EEPROM_MAX_ADDR)
+ * @param addr EEPROM start address (22-254, PN5180_EEPROM_MIN_ADDR to PN5180_EEPROM_MAX_ADDR)
  * @param buffer Data to write
  * @param len Number of bytes to write; addr + len must not pass the last address
  * @return true on success, false on failure
@@ -672,6 +672,11 @@ uint32_t pn5180_rx_bytes_received(pn5180_t *pn5180);
 
 /**
  * @brief Hardware reset PN5180 device
+ *
+ * A reset returns the chip to its power-on state: the RF configuration and the field are gone,
+ * cards have to be selected again, and an ISO14443-4 session is marked as closed. To get the RF
+ * configuration and the field back, call pn5180_recover(), which runs this reset and restores them.
+ *
  * @param pn5180 Pointer to PN5180 device structure
  * @return true on success, false on failure
  */

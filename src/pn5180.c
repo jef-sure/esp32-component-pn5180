@@ -257,6 +257,13 @@ static void pn5180_poll_sleep(pn5180_t *pn5180, uint32_t us)
     esp_timer_stop(timer);
 }
 
+// Without field a card loses its ISO14443-4 session, whatever took the field away.
+static void pn5180_iso14443_4_session_lost(pn5180_t *pn5180)
+{
+    pn5180->iso14443_layer4_active = false;
+    pn5180->iso14443_block_number  = 0;
+}
+
 // Frees only what pn5180_init() allocated; the SPI structure stays with the caller.
 static void pn5180_free(pn5180_t *pn5180)
 {
@@ -278,6 +285,12 @@ static void pn5180_free(pn5180_t *pn5180)
 
 pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_num_t rst)
 {
+    // A shift by GPIO_NUM_NC (-1) is undefined behaviour; such pins are refused outright.
+    if (spi == NULL || nss < 0 || busy < 0 || rst < 0) {
+        ESP_LOGE(TAG, "pn5180_init: invalid arguments (SPI handle, NSS, BUSY and RST are required)");
+        return NULL;
+    }
+
     pn5180_t *ret = (pn5180_t *)calloc(1, sizeof(pn5180_t));
     if (ret == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for PN5180");
@@ -786,6 +799,7 @@ bool pn5180_lpcd_enter(pn5180_t *pn5180, uint16_t wakeup_counter_ms)
     }
     // The PN5180 switches its field on and off by itself from now on.
     pn5180->is_rf_on = false;
+    pn5180_iso14443_4_session_lost(pn5180);
     return true;
 }
 
@@ -857,11 +871,8 @@ int16_t pn5180_mifare_authenticate(pn5180_t *pn5180, uint8_t blockno, const uint
     cmd_buf[8] = blockno;  // block within sector to auth
     memcpy(&cmd_buf[9], uid, 4);
 
-    PN5180_LOGD(TAG,
-                "AUTH cmd: [Cmd=0x%02X][Key=%02X %02X %02X %02X %02X %02X][KeyType=0x%02X][Block=0x%02X][UID=%02X %02X "
-                "%02X %02X]",
-                cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3], cmd_buf[4], cmd_buf[5], cmd_buf[6], cmd_buf[7], cmd_buf[8], cmd_buf[9], cmd_buf[10],
-                cmd_buf[11], cmd_buf[12]);
+    // Key bytes are never logged: they are secret material.
+    PN5180_LOGD(TAG, "AUTH cmd: [Cmd=0x%02X][KeyType=0x%02X][Block=0x%02X]", cmd_buf[0], cmd_buf[7], cmd_buf[8]);
 
     bool rc = transceive_command(pn5180, cmd_buf, sizeof(cmd_buf), rcv_buffer, 1);
     if (!rc) {
@@ -998,7 +1009,9 @@ bool pn5180_load_rf_config(pn5180_t *pn5180, uint8_t tx_conf)
     bool ret   = transceive_command(pn5180, cmd_buf, sizeof(cmd_buf), NULL, 0);
     if (!ret) {
         ESP_LOGE(TAG, "Failed to load RF config");
-    } else {
+    } else if (tx_conf != 0xFF) {
+        // 0xFF means "no change": it is not a configuration a later recover or LPCD wake-up
+        // could reload, so it is not recorded as the one to restore.
         pn5180->tx_config        = tx_conf;
         pn5180->rf_config_loaded = true;
     }
@@ -1007,8 +1020,15 @@ bool pn5180_load_rf_config(pn5180_t *pn5180, uint8_t tx_conf)
 
 bool pn5180_set_rf_on(pn5180_t *pn5180)
 {
+    // The cached flag is not trusted: the field can drop for a reason the driver did not cause
+    // (RFCA, a reset, an SPI glitch). Reading TX_RF_STATUS costs one register read.
     if (pn5180->is_rf_on) {
-        return true; // already on
+        uint32_t current = 0;
+        if (pn5180_read_register(pn5180, PN5180_RF_STATUS, &current) && (current & PN5180_RF_STATUS_TX_RF_STATUS_MASK)) {
+            return true; // already on
+        }
+        pn5180->is_rf_on = false;
+        pn5180_iso14443_4_session_lost(pn5180);
     }
     // Parameter bit 0 = 1 disables RF collision avoidance; bit 1 (active mode) stays 0.
     uint8_t  cmd_buf[]  = {PN5180_RF_ON, pn5180->rfca_disabled ? 0x01 : 0x00};
@@ -1059,9 +1079,7 @@ bool pn5180_set_rf_on(pn5180_t *pn5180)
 
 bool pn5180_set_rf_off(pn5180_t *pn5180)
 {
-    // Without field a card loses its ISO14443-4 session.
-    pn5180->iso14443_layer4_active = false;
-    pn5180->iso14443_block_number  = 0;
+    pn5180_iso14443_4_session_lost(pn5180);
 
     uint32_t rf_status = 0;
     if (pn5180_read_register(pn5180, PN5180_RF_STATUS, &rf_status)) {
@@ -1115,9 +1133,10 @@ bool pn5180_reset(pn5180_t *pn5180)
     esp_rom_delay_us(50);
     gpio_set_level(pn5180->rst, 1);
     pn5180_delay_ms(100);
-    // A reset clears every register: nothing loaded before is valid any more.
+    // A reset clears every register and takes the field away: nothing loaded before is valid any more.
     pn5180->is_rf_on         = false;
     pn5180->rf_config_loaded = false;
+    pn5180_iso14443_4_session_lost(pn5180);
     int64_t saved_timeout    = pn5180->timeout_ms;
     pn5180->timeout_ms       = 5000; // increase timeout for boot process
     if (!wait_busy_level(pn5180, 0, "after reset")) {
@@ -1128,7 +1147,7 @@ bool pn5180_reset(pn5180_t *pn5180)
     pn5180->timeout_ms   = saved_timeout;
     int64_t deadline     = esp_timer_get_time() + (1000LL * pn5180->timeout_ms);
     int     attempts     = 1;
-    int     max_attempts = 3;
+    const int max_attempts = 3;
     // Some boards may miss the initial IDLE IRQ after reset; retry with longer pulses.
     while (0 == (PN5180_IDLE_IRQ_STAT & pn5180_get_irq_status(pn5180))) { // wait for system to start up (with timeout)
         if (esp_timer_get_time() > deadline) {
@@ -1140,7 +1159,8 @@ bool pn5180_reset(pn5180_t *pn5180)
                 break;
             }
             ESP_LOGE(TAG, "Failed to boot after reset (IDLE IRQ not set), attempts=%d", attempts);
-            if (++attempts >= max_attempts) {
+            // The first attempt is already spent; max_attempts counts boot attempts, not retries.
+            if (++attempts > max_attempts) {
                 return false;
             }
             gpio_set_level(pn5180->rst, 0);
@@ -1163,10 +1183,6 @@ bool pn5180_recover(pn5180_t *pn5180)
     bool    rf_was_on  = pn5180->is_rf_on;
     bool    was_loaded = pn5180->rf_config_loaded;
     uint8_t tx_config  = pn5180->tx_config;
-
-    // The reset takes the field away, so a card loses its ISO14443-4 session.
-    pn5180->iso14443_layer4_active = false;
-    pn5180->iso14443_block_number  = 0;
 
     if (!pn5180_reset(pn5180)) {
         ESP_LOGE(TAG, "recover: reset failed");
