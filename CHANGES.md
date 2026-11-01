@@ -1,5 +1,12 @@
 # Changelog
 
+## v 0.7.1 - 2026-11-01
+
+Documentation only, no code changes.
+
+- Multi-card polling is up front now: in the first lines of the README, first in its feature list, in the component description and tags, and with a section of its own, "Several cards in the field".
+- The feature list of the README still said "up to 14 cards per scan", which 0.7.0 left behind. It names `max_cards` and the limit of the ISO15693 inventory now.
+
 ## v 0.7.0 - 2026-11-01
 
 - **`pn5180_14443_init()` takes a new argument `max_cards`**, the most cards one poll enumerates. 0 keeps the limit of 14 cards, which was fixed so far although no standard or chip limit stands behind it; a negative value returns NULL. The limit only ends the poll for a card that ignores HLTA and shows a new UID every time.

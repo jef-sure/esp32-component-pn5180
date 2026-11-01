@@ -2,6 +2,8 @@
 
 ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO15693 cards, read NDEF (NTAG / Ultralight, MIFARE Classic, Type 4, ISO15693) and write it to NTAG / Ultralight and ISO15693 tags, access MIFARE Classic blocks, and exchange APDUs with ISO14443-4 cards in reader mode.
 
+**Multi-card:** one poll returns all the cards in the field, not just the first one, and each of them can then be selected and read by its UID. See [Several cards in the field](#several-cards-in-the-field).
+
 - [Quick Start](#quick-start)
 - [Choosing A Protocol](#choosing-a-protocol)
 - [Common Tasks](#common-tasks)
@@ -17,7 +19,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn5180^0.7.0"
+idf.py add-dependency "jef-sure/pn5180^0.7.1"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.x or 6.0 is required.
@@ -224,6 +226,8 @@ default:
 
 `get_all_uids()` is the same poll without the status. Cards are returned ordered as found, which for ISO14443A changes from poll to poll; ISO15693 tags are sorted by signal strength (`agc`).
 
+### Several cards in the field
+
 Neither protocol limits the number of cards, the driver does, so that a misbehaving card cannot keep a poll going. A poll that stops at its limit logs a warning and still returns `PN5180_POLL_FOUND` with the cards it has:
 
 - ISO14443A: `max_cards` of `pn5180_14443_init()`, 14 if it is 0. The warning appears only when one more card did answer.
@@ -377,7 +381,8 @@ In LPCD mode the PN5180 sleeps and briefly switches its field on at the given in
 
 ### Features and scope
 
-- ISO14443A: anticollision with cascaded UIDs, up to 14 cards per scan, typed poll status, selection by UID
+- [Multi-card](#several-cards-in-the-field): one poll enumerates all cards in the field, up to `max_cards` with ISO14443A (14 by default) and as many as 192 inventory frames allow with ISO15693 (about 50 tags with unrelated UIDs)
+- ISO14443A: anticollision with cascaded UIDs, typed poll status, selection by UID
 - ISO15693: inventory with collision resolution, select, block read and write (block numbers above 255 with the extended commands), system information
 - MIFARE Classic authentication and block access; Ultralight / NTAG page access; value-block operations
 - Card identification: MIFARE Classic Mini / 1K / 4K, MIFARE Plus 2K / 4K (security level 2), Ultralight, Ultralight C, Ultralight EV1, NTAG210 / 212 / 213 / 215 / 216, ISO14443-4
