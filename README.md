@@ -2,7 +2,7 @@
 
 ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO15693 cards, read NDEF (NTAG / Ultralight, MIFARE Classic, Type 4, ISO15693) and write it to NTAG / Ultralight and ISO15693 tags, access MIFARE Classic blocks, and exchange APDUs with ISO14443-4 cards in reader mode.
 
-**Multi-card:** one poll returns all the cards in the field, not just the first one, and each of them can then be selected and read by its UID. See [Several cards in the field](#several-cards-in-the-field).
+**Multi-card:** one poll returns all the cards in the field, not just the first one, and each of them can then be selected and read by its UID. Even a `max_cards` below the number of cards leaves none out for good: with the field left on the next polls go on with the cards not found yet, and after a field reset ISO14443A settles collisions at random, so over several polls every card turns up. See [Several cards in the field](#several-cards-in-the-field).
 
 - [Quick Start](#quick-start)
 - [Choosing A Protocol](#choosing-a-protocol)
