@@ -99,7 +99,7 @@ void app_main(void) {
     return;
   }
 
-  pn5180_proto_t *proto_14443 = pn5180_14443_init(pn5180);
+  pn5180_proto_t *proto_14443 = pn5180_14443_init(pn5180, 0); // 0: default limit of cards per poll
   if (proto_14443 == NULL) {
     ESP_LOGE(TAG, "Failed to initialize ISO14443 protocol");
     pn5180_deinit(pn5180, true);

@@ -335,6 +335,7 @@ typedef struct _pn5180_proto_t
     pn5180_func_detect_card_type_t *detect_card_type_and_capacity; /**< Detect card type and geometry */
     pn5180_func_halt_t             *halt;                          /**< Halt/deselect current card */
     uint8_t                         rf_config;                     /**< RF configuration loaded by setup_rf() */
+    int                             max_cards;                     /**< Most cards one poll enumerates (ISO14443A only) */
 } pn5180_proto_t;
 
 /**

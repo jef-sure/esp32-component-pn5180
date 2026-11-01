@@ -103,14 +103,17 @@ pn5180_rf_result_t sim_a_card(void *ctx, const uint8_t *tx, size_t tx_len, uint8
                               uint32_t timeout_us, uint32_t *rx_status);
 int16_t            sim_a_auth(void *ctx, uint8_t blockno, const uint8_t *key, uint8_t key_type, const uint8_t uid[4]);
 
-/** A field with two ISO14443A cards: both answer the anticollision of the level they are on,
+#define SIM_A_FIELD_MAX_CARDS 32
+
+/** A field with several ISO14443A cards: all answer the anticollision of the level they are on,
  *  which the reader reports as a bit collision. */
 typedef struct
 {
-    sim_a_card_t cards[2];
+    sim_a_card_t cards[SIM_A_FIELD_MAX_CARDS];
+    int          count; /**< cards in the field */
 } sim_a_field_t;
 
-/** Two ISO14443A cards in one field; see sim_a_field_t. */
+/** Several ISO14443A cards in one field; see sim_a_field_t. */
 pn5180_rf_result_t sim_a_field(void *ctx, const uint8_t *tx, size_t tx_len, uint8_t tx_last_bits, uint8_t *rx, size_t rx_size, size_t *rx_len,
                                uint32_t timeout_us, uint32_t *rx_status);
 

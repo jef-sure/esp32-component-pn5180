@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define TEST_MAX_CARDS 16
+
 static pn5180_t       *s_pn5180;
 static pn5180_proto_t *s_proto_a;
 static pn5180_proto_t *s_proto_v;
@@ -24,7 +26,7 @@ static sim_v_card_t    s_card_v;
 void setUp(void)
 {
     s_pn5180  = fake_pn5180_create();
-    s_proto_a = pn5180_14443_init(s_pn5180);
+    s_proto_a = pn5180_14443_init(s_pn5180, TEST_MAX_CARDS);
     s_proto_v = pn5180_15693_init(s_pn5180, PN5180_15693_26KASK100);
 }
 
@@ -1347,6 +1349,7 @@ static sim_a_field_t s_field_a;
 // the first byte of the first cascade level.
 static void test_anticollision_resolves_a_collision_between_two_cards(void)
 {
+    s_field_a.count = 2;
     sim_a_init_ultralight(&s_field_a.cards[0], false);
     sim_a_init_ultralight(&s_field_a.cards[1], false);
     // Same UID length, differing bits spread over the whole UID
@@ -1378,6 +1381,173 @@ static void test_anticollision_resolves_a_collision_between_two_cards(void)
     pn5180_uid_t uid = {.uid_length = 7, .subtype = PN5180_MIFARE_ULTRALIGHT};
     memcpy(uid.uid, s_field_a.cards[1].uid, 7);
     TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+}
+
+static void mark_found_cards(const pn5180_uids_array_t *uids, bool *found)
+{
+    for (int i = 0; i < uids->uids_count; i++) {
+        for (int c = 0; c < s_field_a.count; c++) {
+            if (memcmp(uids->uids[i].uid, s_field_a.cards[c].uid, 7) == 0) {
+                TEST_ASSERT_FALSE(found[c]);
+                found[c] = true;
+            }
+        }
+    }
+}
+
+static void put_cards_into_field_a(int count)
+{
+    s_field_a.count = count;
+    for (int c = 0; c < count; c++) {
+        sim_a_init_ultralight(&s_field_a.cards[c], false);
+        s_field_a.cards[c].uid[1] = (uint8_t)c;
+    }
+    fake_set_card(sim_a_field, sim_a_auth, &s_field_a);
+}
+
+static void test_init_refuses_a_negative_limit(void)
+{
+    TEST_ASSERT_NULL(pn5180_14443_init(s_pn5180, -1));
+}
+
+// A limit of 0 is the default: a poll takes 14 cards.
+static void test_poll_with_limit_zero_takes_the_default(void)
+{
+    pn5180_proto_t *proto = pn5180_14443_init(s_pn5180, 0);
+    TEST_ASSERT_NOT_NULL(proto);
+    put_cards_into_field_a(15);
+    TEST_ASSERT_TRUE(proto->setup_rf(proto));
+
+    pn5180_uids_array_t *uids = proto->get_all_uids(proto);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(14, uids->uids_count);
+    free(uids);
+    free(proto);
+}
+
+// As many cards as the limit: all are found and none is left for the next poll.
+static void test_poll_finds_as_many_cards_as_the_limit(void)
+{
+    put_cards_into_field_a(TEST_MAX_CARDS);
+    TEST_ASSERT_TRUE(s_proto_a->setup_rf(s_proto_a));
+
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_14443_get_all_uids_ex(s_proto_a, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(TEST_MAX_CARDS, uids->uids_count);
+    free(uids);
+
+    TEST_ASSERT_NULL(pn5180_14443_get_all_uids_ex(s_proto_a, &status));
+    TEST_ASSERT_EQUAL(PN5180_POLL_NO_TARGET, status);
+}
+
+// The limit belongs to the protocol object: with a limit of one, two cards take two polls.
+static void test_poll_limit_is_per_protocol_object(void)
+{
+    pn5180_proto_t *proto = pn5180_14443_init(s_pn5180, 1);
+    TEST_ASSERT_NOT_NULL(proto);
+    put_cards_into_field_a(2);
+    TEST_ASSERT_TRUE(proto->setup_rf(proto));
+
+    bool found[SIM_A_FIELD_MAX_CARDS] = {false};
+    for (int poll = 0; poll < 2; poll++) {
+        pn5180_uids_array_t *uids = proto->get_all_uids(proto);
+        TEST_ASSERT_NOT_NULL(uids);
+        TEST_ASSERT_EQUAL(1, uids->uids_count);
+        mark_found_cards(uids, found);
+        free(uids);
+    }
+    free(proto);
+    TEST_ASSERT_TRUE(found[0]);
+    TEST_ASSERT_TRUE(found[1]);
+}
+
+// With a limit below the number of cards and the field reset before every poll, each poll starts
+// from the same state. Only a collision bit taken at random lets all cards turn up.
+static void test_every_card_turns_up_over_polls_with_the_field_reset(void)
+{
+    pn5180_proto_t *proto = pn5180_14443_init(s_pn5180, 1);
+    TEST_ASSERT_NOT_NULL(proto);
+    put_cards_into_field_a(4);
+
+    bool found[4] = {false};
+    for (int poll = 0; poll < 100; poll++) {
+        for (int c = 0; c < 4; c++) {
+            s_field_a.cards[c].state = SIM_A_IDLE; // field off and on
+        }
+        TEST_ASSERT_TRUE(proto->setup_rf(proto));
+        pn5180_uids_array_t *uids = proto->get_all_uids(proto);
+        TEST_ASSERT_NOT_NULL(uids);
+        TEST_ASSERT_EQUAL(1, uids->uids_count);
+        for (int c = 0; c < 4; c++) {
+            if (memcmp(uids->uids[0].uid, s_field_a.cards[c].uid, 7) == 0) {
+                found[c] = true;
+            }
+        }
+        free(uids);
+    }
+    free(proto);
+    for (int c = 0; c < 4; c++) {
+        TEST_ASSERT_TRUE(found[c]);
+    }
+}
+
+// One card more than a poll takes: the poll stops at the limit. The cards it found are halted and
+// the one it left out is not, so with the field left on the next poll finds that one.
+static void test_poll_stops_at_the_limit_and_the_next_poll_finds_the_rest(void)
+{
+    put_cards_into_field_a(TEST_MAX_CARDS + 1);
+    TEST_ASSERT_TRUE(s_proto_a->setup_rf(s_proto_a));
+
+    bool found[SIM_A_FIELD_MAX_CARDS] = {false};
+
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_14443_get_all_uids_ex(s_proto_a, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(TEST_MAX_CARDS, uids->uids_count);
+    mark_found_cards(uids, found);
+    free(uids);
+
+    uids = pn5180_14443_get_all_uids_ex(s_proto_a, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(1, uids->uids_count);
+    mark_found_cards(uids, found);
+    free(uids);
+
+    for (int c = 0; c < s_field_a.count; c++) {
+        TEST_ASSERT_TRUE(found[c]);
+    }
+}
+
+// Goes back to IDLE after HLTA and has another UID for the next REQA.
+static pn5180_rf_result_t sim_a_new_uid_every_time(void *ctx, const uint8_t *tx, size_t tx_len, uint8_t tx_last_bits, uint8_t *rx, size_t rx_size,
+                                                   size_t *rx_len, uint32_t timeout_us, uint32_t *rx_status)
+{
+    sim_a_card_t *card = ctx;
+    if (tx_len == 1 && tx_last_bits == 7) {
+        card->uid[1]++;
+    }
+    return sim_a_card(ctx, tx, tx_len, tx_last_bits, rx, rx_size, rx_len, timeout_us, rx_status);
+}
+
+// This card is what the limit is for: it never stops answering and never answers with a UID the
+// poll has seen, so only the limit ends the poll.
+static void test_poll_ends_for_a_card_with_a_new_uid_every_time(void)
+{
+    sim_a_init_ultralight(&s_card_a, false);
+    s_card_a.ignores_hlta = true;
+    fake_set_card(sim_a_new_uid_every_time, sim_a_auth, &s_card_a);
+    TEST_ASSERT_TRUE(s_proto_a->setup_rf(s_proto_a));
+
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_14443_get_all_uids_ex(s_proto_a, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(TEST_MAX_CARDS, uids->uids_count);
+    free(uids);
 }
 
 // The frames of the anticollision and the answers are watched by the fake's CRC model: every
@@ -1563,10 +1733,14 @@ static void test_iso15693_block_write_and_read(void)
     TEST_ASSERT_FALSE(s_proto_v->halt(s_proto_v));
 }
 
-// Two tags in the field: both answering an inventory is a collision, as the reader reports it.
+#define SIM_V_FIELD_MAX_TAGS 64
+
+// Several tags in the field: more than one answering an inventory is a collision, as the reader
+// reports it.
 typedef struct
 {
-    sim_v_card_t tags[2];
+    sim_v_card_t tags[SIM_V_FIELD_MAX_TAGS];
+    int          count;            // tags in the field
     bool         damage_inventory; // inventory answers arrive with a CRC error
 } sim_v_field_t;
 
@@ -1574,12 +1748,12 @@ static pn5180_rf_result_t sim_v_field(void *ctx, const uint8_t *tx, size_t tx_le
                                       uint32_t timeout_us, uint32_t *rx_status)
 {
     sim_v_field_t     *field = ctx;
-    uint8_t            answers[2][64];
-    size_t             lens[2]  = {0, 0};
+    uint8_t            answers[SIM_V_FIELD_MAX_TAGS][64];
+    size_t             lens[SIM_V_FIELD_MAX_TAGS] = {0};
     int                answered = 0;
     int                last     = 0;
     pn5180_rf_result_t result   = PN5180_RF_TIMEOUT;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < field->count; i++) {
         pn5180_rf_result_t r = sim_v_card(&field->tags[i], tx, tx_len, tx_last_bits, answers[i], sizeof(answers[i]), &lens[i], timeout_us, NULL);
         if (r != PN5180_RF_TIMEOUT) {
             answered++;
@@ -1598,7 +1772,7 @@ static pn5180_rf_result_t sim_v_field(void *ctx, const uint8_t *tx, size_t tx_le
         *rx_len = count;
     }
     bool inventory = tx_len > 0 && (tx[0] & 0x04) != 0;
-    if (answered == 2) {
+    if (answered > 1) {
         if (rx_status != NULL) {
             *rx_status = (uint32_t)count | PN5180_RX_COLLISION_DETECTED;
         }
@@ -1621,6 +1795,7 @@ static sim_v_field_t s_field_v;
 // Tags whose UIDs differ only in the last transmitted bit need a mask of 63 bits.
 static void test_iso15693_inventory_resolves_long_common_prefix(void)
 {
+    s_field_v.count = 2;
     sim_v_init(&s_field_v.tags[0]);
     sim_v_init(&s_field_v.tags[1]);
     s_field_v.tags[1].uid[7] ^= 0x80;
@@ -1647,6 +1822,7 @@ static void test_iso15693_inventory_resolves_long_common_prefix(void)
 // An inventory answer with a CRC error is not a UID.
 static void test_iso15693_inventory_rejects_damaged_response(void)
 {
+    s_field_v.count = 2;
     sim_v_init(&s_field_v.tags[0]);
     sim_v_init(&s_field_v.tags[1]);
     s_field_v.tags[1].quiet    = true; // one tag in the field
@@ -1664,6 +1840,58 @@ static void test_iso15693_inventory_rejects_damaged_response(void)
     pn5180_uids_array_t *uids  = pn5180_15693_get_all_uids_ex(s_proto_v, &status);
     TEST_ASSERT_NOT_NULL(uids);
     TEST_ASSERT_EQUAL(1, uids->uids_count);
+    free(uids);
+}
+
+// 50 tags with unrelated UIDs fit into the frames of one inventory.
+static void test_iso15693_inventory_finds_many_tags(void)
+{
+    s_field_v.count            = 50;
+    s_field_v.damage_inventory = false;
+    uint32_t state             = 1;
+    for (int t = 0; t < s_field_v.count; t++) {
+        sim_v_init(&s_field_v.tags[t]);
+        for (int b = 0; b < 5; b++) {
+            state                    = state * 1103515245u + 12345u;
+            s_field_v.tags[t].uid[b] = (uint8_t)(state >> 16);
+        }
+    }
+    fake_set_card(sim_v_field, NULL, &s_field_v);
+    TEST_ASSERT_TRUE(s_proto_v->setup_rf(s_proto_v));
+
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_15693_get_all_uids_ex(s_proto_v, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(50, uids->uids_count);
+    free(uids);
+}
+
+// Tags that differ only in the last UID bits: the shared bits use up the frames of the inventory.
+// It stops at its limit, the tags it found stay quiet, and the next one finds the others.
+static void test_iso15693_inventory_stops_at_the_frame_limit_and_the_next_finds_the_rest(void)
+{
+    s_field_v.count            = SIM_V_FIELD_MAX_TAGS;
+    s_field_v.damage_inventory = false;
+    for (int t = 0; t < s_field_v.count; t++) {
+        sim_v_init(&s_field_v.tags[t]);
+        s_field_v.tags[t].uid[7] = (uint8_t)(t << 2);
+    }
+    fake_set_card(sim_v_field, NULL, &s_field_v);
+    TEST_ASSERT_TRUE(s_proto_v->setup_rf(s_proto_v));
+
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_15693_get_all_uids_ex(s_proto_v, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    int found = uids->uids_count;
+    free(uids);
+    TEST_ASSERT_TRUE(found < SIM_V_FIELD_MAX_TAGS);
+
+    uids = pn5180_15693_get_all_uids_ex(s_proto_v, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(SIM_V_FIELD_MAX_TAGS - found, uids->uids_count);
     free(uids);
 }
 
@@ -1747,6 +1975,13 @@ int main(void)
     RUN_TEST(test_iso_dep_reserved_frame_size_is_accepted);
     RUN_TEST(test_classic_emulation_card_stays_on_layer_3_unless_asked);
     RUN_TEST(test_anticollision_resolves_a_collision_between_two_cards);
+    RUN_TEST(test_init_refuses_a_negative_limit);
+    RUN_TEST(test_poll_with_limit_zero_takes_the_default);
+    RUN_TEST(test_poll_finds_as_many_cards_as_the_limit);
+    RUN_TEST(test_poll_limit_is_per_protocol_object);
+    RUN_TEST(test_every_card_turns_up_over_polls_with_the_field_reset);
+    RUN_TEST(test_poll_stops_at_the_limit_and_the_next_poll_finds_the_rest);
+    RUN_TEST(test_poll_ends_for_a_card_with_a_new_uid_every_time);
     RUN_TEST(test_type4_read_runs_over_frames_with_correct_crc_registers);
     RUN_TEST(test_iso15693_poll_does_not_cycle_the_field_twice);
     RUN_TEST(test_iso15693_poll_select_detect_and_ndef);
@@ -1754,6 +1989,8 @@ int main(void)
     RUN_TEST(test_iso15693_block_write_and_read);
     RUN_TEST(test_iso15693_inventory_resolves_long_common_prefix);
     RUN_TEST(test_iso15693_inventory_rejects_damaged_response);
+    RUN_TEST(test_iso15693_inventory_finds_many_tags);
+    RUN_TEST(test_iso15693_inventory_stops_at_the_frame_limit_and_the_next_finds_the_rest);
     RUN_TEST(test_iso15693_block_number_range);
     RUN_TEST(test_ndef_message_add_without_storage);
     return UNITY_END();

@@ -11,10 +11,17 @@ extern "C" {
 
 /**
  * @brief Initialize ISO14443A/MIFARE protocol wrapper
+ *
+ * ISO/IEC 14443-3 and the PN5180 do not limit the number of cards: a poll finds them one after
+ * the other. max_cards is there for a card that ignores HLTA and shows a new UID every time,
+ * which would otherwise keep the poll going until the heap is used up. Each card of a poll takes
+ * about 8 RF frames and a pn5180_uid_t of heap.
+ *
  * @param pn5180 Pointer to PN5180 device structure
- * @return Protocol interface for ISO14443A operations
+ * @param max_cards Most cards one poll enumerates, 0 for the default of 14
+ * @return Protocol interface for ISO14443A operations, NULL if max_cards is negative or memory ran out
  */
-pn5180_proto_t *pn5180_14443_init(pn5180_t *pn5180);
+pn5180_proto_t *pn5180_14443_init(pn5180_t *pn5180, int max_cards);
 
 /**
  * @brief Poll for ISO14443A cards and report why nothing was returned

@@ -17,7 +17,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn5180^0.6.0"
+idf.py add-dependency "jef-sure/pn5180^0.7.0"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.x or 6.0 is required.
@@ -62,7 +62,8 @@ void app_main(void)
         ESP_LOGE(TAG, "PN5180 not found");
         return;
     }
-    pn5180_proto_t *nfc = pn5180_14443_init(pn5180);
+    /* Most cards one poll enumerates, 0 for the default of 14 */
+    pn5180_proto_t *nfc = pn5180_14443_init(pn5180, 0);
 
     while (true) {
         /* Restart the field so that cards halted by the previous scan answer again. */
@@ -115,7 +116,7 @@ Each RF protocol is a `pn5180_proto_t` object with the same set of callbacks; on
 
 | | ISO14443A | ISO15693 |
 |---|---|---|
-| Create | `pn5180_14443_init(pn5180)` | `pn5180_15693_init(pn5180, PN5180_15693_26KASK100)` |
+| Create | `pn5180_14443_init(pn5180, max_cards)` | `pn5180_15693_init(pn5180, PN5180_15693_26KASK100)` |
 | Cards | MIFARE Classic, Ultralight, NTAG21x, DESFire and other ISO14443-4 cards | ICODE SLIX and other vicinity tags |
 | Range | a few centimetres | longer |
 | Authentication | MIFARE Classic keys (`authenticate`) | none |
@@ -221,7 +222,14 @@ default:
 }
 ```
 
-Up to 14 cards are enumerated. `get_all_uids()` is the same poll without the status. Cards are returned ordered as found; ISO15693 tags are sorted by signal strength (`agc`).
+`get_all_uids()` is the same poll without the status. Cards are returned ordered as found, which for ISO14443A changes from poll to poll; ISO15693 tags are sorted by signal strength (`agc`).
+
+Neither protocol limits the number of cards, the driver does, so that a misbehaving card cannot keep a poll going. A poll that stops at its limit logs a warning and still returns `PN5180_POLL_FOUND` with the cards it has:
+
+- ISO14443A: `max_cards` of `pn5180_14443_init()`, 14 if it is 0. The warning appears only when one more card did answer.
+- ISO15693: 192 inventory frames, which is enough for about 50 tags with unrelated UIDs. Tags that differ only in the last UID bits take more frames each.
+
+With the field left on, the next poll finds the cards that were left out. After a field reset all cards answer again: ISO14443A settles collisions at random, so over several polls every card turns up, though not equally often, and ISO15693 finds the same tags again.
 
 ### Read MIFARE Classic blocks
 

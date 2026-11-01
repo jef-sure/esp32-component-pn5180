@@ -370,6 +370,10 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
         }
     }
 
+    if (stack_ptr > 0 && scan_count >= max_total_scans) {
+        ESP_LOGW(TAG, "Inventory stopped after %d scans, more tags may be in the field", scan_count);
+    }
+
     PN5180_LOGD(TAG, "inventory: total found %d tags", total_found);
     return total_found > 0;
 }
@@ -674,7 +678,7 @@ static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180, bool *fa
     }
 
     if (uids != NULL && uids->uids_count > 1) {
-        // Simple Bubble Sort for small array (theoretical max ~14 tags)
+        // Simple Bubble Sort: the scan limit of the inventory keeps the array small
         for (int i = 0; i < uids->uids_count - 1; i++) {
             for (int j = 0; j < uids->uids_count - i - 1; j++) {
                 if (uids->uids[j].agc > uids->uids[j + 1].agc) {

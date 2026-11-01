@@ -1,5 +1,6 @@
 #include "pn5180-14443.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "pn5180-internal.h"
@@ -22,7 +23,9 @@ typedef enum
     RX_RESULT_FATAL,
 } rx_result_t;
 
-static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, pn5180_poll_status_t *status);
+static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, int max_cards, pn5180_poll_status_t *status);
+
+#define ISO14443A_DEFAULT_MAX_CARDS 14 // max_cards = 0: the limit a poll had before it could be chosen
 
 static bool pn5180_mifare_halt(pn5180_t *pn5180);
 
@@ -147,7 +150,7 @@ static bool _pn5180_14443_setup_rf(pn5180_proto_t *proto)
 static pn5180_uids_array_t *_pn5180_14443_get_all_uids(pn5180_proto_t *proto)
 {
     pn5180_poll_status_t status;
-    return pn5180_14443_poll(proto->pn5180, &status);
+    return pn5180_14443_poll(proto->pn5180, proto->max_cards, &status);
 }
 
 static bool _pn5180_14443_select_by_uid(pn5180_proto_t *proto, pn5180_uid_t *uid)
@@ -262,14 +265,19 @@ static bool _pn5180_14443_authenticate( //
     return true;
 }
 
-pn5180_proto_t *pn5180_14443_init(pn5180_t *pn5180)
+pn5180_proto_t *pn5180_14443_init(pn5180_t *pn5180, int max_cards)
 {
+    if (max_cards < 0) {
+        ESP_LOGE(TAG, "max_cards must not be negative, got %d", max_cards);
+        return NULL;
+    }
     pn5180_proto_t *proto = (pn5180_proto_t *)calloc(1, sizeof(pn5180_proto_t));
     if (proto == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for PN5180 14443 protocol");
         return NULL;
     }
     proto->rf_config                     = PN5180_14443A_RF_CONFIG;
+    proto->max_cards                     = (max_cards == 0) ? ISO14443A_DEFAULT_MAX_CARDS : max_cards;
     proto->pn5180                        = pn5180;
     proto->setup_rf                      = _pn5180_14443_setup_rf;
     proto->get_all_uids                  = _pn5180_14443_get_all_uids;
@@ -516,9 +524,16 @@ static bool pn5180_14443_anticollision_level(pn5180_t *pn5180, uint8_t cascade_l
             // Advance known_bits to the collision point
             known_bits = known_bytes * 8 + coll_pos;
 
-            // Force the collision bit to 1 (choose higher UID branch) and advance
+            // Take the collision bit at random and advance. With a fixed choice a poll after a field
+            // reset starts with the same card every time, and a limit below the number of cards
+            // hides the others. Both values are written: the received bit may hold either.
             if (known_bits / 8 < 5) {
-                uid_cl[known_bits / 8] |= (uint8_t)(1u << (known_bits % 8));
+                uint8_t mask = (uint8_t)(1u << (known_bits % 8));
+                if (esp_random() & 1u) {
+                    uid_cl[known_bits / 8] |= mask;
+                } else {
+                    uid_cl[known_bits / 8] &= (uint8_t)~mask;
+                }
             }
             known_bits++;
             collision_count++;
@@ -606,17 +621,17 @@ static bool pn5180_14443_resolve_full_uid_cascade(pn5180_t *pn5180, uint8_t *ful
     return false;
 }
 
-static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, pn5180_poll_status_t *status)
+static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, int max_cards, pn5180_poll_status_t *status)
 {
     pn5180_uids_array_t *uids       = NULL;
-    uint8_t              card_count = 0;
+    int                  card_count = 0;
 
     *status = PN5180_POLL_NO_TARGET;
     if (!prepare_14443A_activation(pn5180)) {
         *status = PN5180_POLL_TRANSPORT_ERROR;
         return NULL;
     }
-    while (card_count < 14) {
+    while (true) {
         uint8_t atqa[2] = {0, 0};
         bool    fatal   = false;
         if (!pn5180_14443_send_reqa(pn5180, atqa, &fatal)) {
@@ -624,6 +639,12 @@ static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, pn5180_poll_stat
                 *status = PN5180_POLL_TRANSPORT_ERROR;
             }
             PN5180_LOGD(TAG, "No more cards found.");
+            break;
+        }
+        if (card_count == max_cards) {
+            ESP_LOGW(TAG, "Scan stopped at %d cards, more are in the field", card_count);
+            // Back to IDLE for the next poll: a card that answered REQA would not answer the next one.
+            pn5180_mifare_halt(pn5180);
             break;
         }
 
@@ -695,7 +716,7 @@ pn5180_uids_array_t *pn5180_14443_get_all_uids_ex(pn5180_proto_t *proto, pn5180_
     pn5180_poll_status_t local_status = PN5180_POLL_INVALID_ARGUMENT;
     pn5180_uids_array_t *uids         = NULL;
     if (proto != NULL && proto->pn5180 != NULL) {
-        uids = pn5180_14443_poll(proto->pn5180, &local_status);
+        uids = pn5180_14443_poll(proto->pn5180, proto->max_cards, &local_status);
     }
     if (status != NULL) {
         *status = local_status;

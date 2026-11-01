@@ -13,6 +13,7 @@ static int          s_frame_count;
 static int          s_rf_on_count;
 static int64_t      s_time_us;
 static uint32_t     s_registers[64];
+static uint32_t     s_random_state;
 pn5180_t *fake_pn5180_create(void)
 {
     pn5180_t *pn5180      = calloc(1, sizeof(pn5180_t));
@@ -23,6 +24,7 @@ pn5180_t *fake_pn5180_create(void)
     s_card                = NULL;
     s_auth                = NULL;
     s_card_ctx            = NULL;
+    s_random_state        = 1;
     memset(s_registers, 0, sizeof(s_registers));
     return pn5180;
 }
@@ -241,7 +243,11 @@ int64_t esp_timer_get_time(void)
 
 uint32_t esp_random(void)
 {
-    return 4; // any fixed value keeps the tests repeatable
+    // xorshift32 from a fixed start: every bit varies and the tests stay repeatable
+    s_random_state ^= s_random_state << 13;
+    s_random_state ^= s_random_state >> 17;
+    s_random_state ^= s_random_state << 5;
+    return s_random_state;
 }
 
 void esp_rom_delay_us(uint32_t us)

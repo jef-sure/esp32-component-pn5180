@@ -1,5 +1,12 @@
 # Changelog
 
+## v 0.7.0 - 2026-11-01
+
+- **`pn5180_14443_init()` takes a new argument `max_cards`**, the most cards one poll enumerates. 0 keeps the limit of 14 cards, which was fixed so far although no standard or chip limit stands behind it; a negative value returns NULL. The limit only ends the poll for a card that ignores HLTA and shows a new UID every time.
+- **The ISO14443A anticollision takes the collision bit at random.** It always took 1, so the same card won every time: with a limit below the number of cards and the field reset before every poll, the same cards were found and the others never showed up. Now every card turns up over several polls, though not equally often. The order of the cards in the result changes from poll to poll.
+- A poll that leaves cards out logs a warning: ISO14443A when one more card answered at the limit, ISO15693 when the inventory ran out of its 192 frames. Both stopped silently.
+- The README said that at most 14 cards are enumerated. That never was true for ISO15693, which has no limit on cards, only on inventory frames.
+
 ## v 0.6.0 - 2026-10-30
 
 ### Brought over from the PN532 component (0.7.4, 0.7.5)
