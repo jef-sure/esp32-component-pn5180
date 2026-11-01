@@ -1,5 +1,12 @@
 # Changelog
 
+## v 0.7.2 - 2026-11-01
+
+Packaging only, no code changes. 0.7.0 and 0.7.1 were removed from the ESP Component Registry, so this is the first version there with the changes listed under them, among them the new `max_cards` argument of `pn5180_14443_init()`.
+
+- The component archive holds the files of the repository and nothing else. It also took local notes, a local installer configuration and generated files from the build directories of the examples.
+- The README says that a `max_cards` below the number of cards leaves no card out for good.
+
 ## v 0.7.1 - 2026-11-01
 
 Documentation only, no code changes.

@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn5180^0.7.1"
+idf.py add-dependency "jef-sure/pn5180^0.7.2"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.x or 6.0 is required.

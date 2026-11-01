@@ -1,5 +1,5 @@
 ## IDF Component Manager Manifest File
-version: "0.7.1"
+version: "0.7.2"
 description: "ESP-IDF component for NXP PN5180 NFC/RFID reader with multi-card polling, ISO14443A, ISO15693, MIFARE, and NDEF support"
 url: https://github.com/jef-sure/esp32-component-pn5180
 repository: https://github.com/jef-sure/esp32-component-pn5180.git
@@ -31,18 +31,23 @@ files:
     - "src/**/*.c"
     - "include/**/*.h"
     - "CMakeLists.txt"
-    - "examples/**/*.c"
-    - "examples/**/*.h"
-    - "examples/**/CMakeLists.txt"
-    - "examples/**/idf_component.yml"
+    - "examples/*/main/*.c"
+    - "examples/*/main/*.h"
+    - "examples/*/CMakeLists.txt"
+    - "examples/*/main/CMakeLists.txt"
+    - "examples/*/main/idf_component.yml"
     - "idf_component.yml"
     - "README.md"
     - "CHANGES.md"
     - "LICENSE"
   exclude:
     - "build/**"
+    - "examples/*/build/**"
     - "dist/**"
     - ".git/**"
     - ".vscode/**"
+    - ".clangd"
     - "**/*.old"
+    - "PLAN*"
+    - "eim_config.toml"
 
