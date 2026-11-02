@@ -227,6 +227,10 @@ static pn5180_rf_result_t sim_a_classic(sim_a_card_t *card, const uint8_t *tx, s
     int block = tx[1];
     switch (tx[0]) {
     case 0x30: { // READ
+        if (card->nak_read_count > 0 && block == card->nak_read_block) {
+            card->nak_read_count--;
+            return sim_a_nak(card, rx, rx_len);
+        }
         uint8_t data[16];
         memcpy(data, &card->memory[block * 16], 16);
         if (sim_a_classic_is_trailer(block)) {

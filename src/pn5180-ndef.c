@@ -647,7 +647,8 @@ void pn5180_ndef_free_parsed_message(pn5180_ndef_message_parsed_t *msg)
     free(msg);
 }
 
-bool pn5180_ndef_extract_text(const pn5180_ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out, char *lang_buf, bool *is_utf16)
+bool pn5180_ndef_extract_text(const pn5180_ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out, char *lang_buf, size_t lang_buf_len,
+                              bool *is_utf16)
 {
     if (!rec || !text_out || !text_len_out) return false;
 
@@ -662,11 +663,14 @@ bool pn5180_ndef_extract_text(const pn5180_ndef_record_t *rec, const uint8_t **t
 
     if (1 + lang_len > rec->payload_len) return false;
 
-    if (lang_buf) {
-        if (lang_len > 0) {
-            memcpy(lang_buf, rec->payload + 1, lang_len);
+    if (lang_buf && lang_buf_len > 0) {
+        // The card sets the length of the code, up to 63 bytes: a longer code than the buffer holds
+        // is truncated.
+        size_t copy_lang = (lang_len < lang_buf_len - 1) ? lang_len : lang_buf_len - 1;
+        if (copy_lang > 0) {
+            memcpy(lang_buf, rec->payload + 1, copy_lang);
         }
-        lang_buf[lang_len] = '\0';
+        lang_buf[copy_lang] = '\0';
     }
 
     if (is_utf16) *is_utf16 = utf16;

@@ -14,7 +14,7 @@ extern "C" {
 #define PN5180_MIFARE_CLASSIC_KEYB 0x61 // Mifare Classic key B
 
 // PN5180 IRQ_STATUS
-#define PN5180_RX_IRQ_STAT              (1 << 0)  // End of RF receiption IRQ
+#define PN5180_RX_IRQ_STAT              (1 << 0)  // End of RF reception IRQ
 #define PN5180_TX_IRQ_STAT              (1 << 1)  // End of RF transmission IRQ
 #define PN5180_IDLE_IRQ_STAT            (1 << 2)  // IDLE IRQ
 #define PN5180_MODE_DETECTED_IRQ_STAT   (1 << 3)  // Mode detected IRQ
@@ -147,7 +147,7 @@ typedef struct _pn5180_t
     uint32_t      rf_guard_time_us; /**< Delay after the field has been switched on */
 
     // ISO14443-4 State
-    uint8_t iso14443_current_card_type; // Maps to pn5180_card_type_t, but using uint8_t to avoid circular dependency if valid
+    uint8_t iso14443_current_card_type; // pn5180_card_type_t of the selected card; the enum is declared below
     uint8_t iso14443_block_number;      // PCB toggle
     uint16_t iso14443_frame_size;       // Max ISO14443-4 frame size excluding CRC bytes
     int64_t  iso14443_fwt_ms;           // Frame waiting time derived from ATS
@@ -252,7 +252,7 @@ typedef bool pn5180_func_select_by_uid_t(        //
  * @brief Callback: Authenticate for block access (MIFARE Classic)
  * @param pn5180_proto Protocol interface
  * @param key 6-byte authentication key
- * @param key_type Key type: MIFARE_CLASSIC_KEYA (0x60) or MIFARE_CLASSIC_KEYB (0x61)
+ * @param key_type Key type: PN5180_MIFARE_CLASSIC_KEYA (0x60) or PN5180_MIFARE_CLASSIC_KEYB (0x61)
  * @param uid Card UID for authentication
  * @param blockno Block number to authenticate for (determines sector)
  * @return true if authentication successful, false on failure
@@ -374,7 +374,8 @@ pn5180_spi_t *pn5180_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_nu
  * @brief Attach the PN5180 to an SPI bus that the application has already initialized
  *
  * Only adds the PN5180 as a device on the bus. The bus is shared with other devices and is
- * never freed by pn5180_deinit(), whatever its free_spi_bus argument says.
+ * never freed by pn5180_deinit(), whatever its free_spi_bus argument says. It may be called
+ * right after spi_bus_initialize(), with no other device on the host yet.
  *
  * The bus has to carry a whole PN5180 transfer in one transaction: max_transfer_sz of at least
  * PN5180_MAX_BUF_SIZE and a DMA channel (a bus without DMA is limited to 64 bytes).
@@ -382,7 +383,8 @@ pn5180_spi_t *pn5180_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_nu
  * @param host_id SPI host device ID of the initialized bus
  * @param clock_speed_hz SPI clock speed in Hz; a value above PN5180_SPI_MAX_CLOCK_HZ is lowered to it
  * @return Pointer to initialized SPI structure; NULL if the host is not initialized, carries
- *         less than PN5180_MAX_BUF_SIZE bytes per transaction, or the device cannot be added
+ *         less than PN5180_MAX_BUF_SIZE bytes per transaction, or the device cannot be added.
+ *         After NULL no PN5180 device is left on the host.
  */
 pn5180_spi_t *pn5180_spi_attach(spi_host_device_t host_id, int clock_speed_hz);
 
@@ -504,7 +506,8 @@ bool pn5180_recover(pn5180_t *pn5180);
 /**
  * @brief Deinitialize and free PN5180 device resources
  * @param pn5180 Pointer to PN5180 device structure
- * @param free_spi_bus If true, also free the SPI bus resources
+ * @param free_spi_bus If true, also free the SPI bus when pn5180_spi_init() initialized it; a bus
+ *                     the PN5180 was attached to is never freed
  */
 void pn5180_deinit(pn5180_t *pn5180, bool free_spi_bus);
 
@@ -593,7 +596,7 @@ bool pn5180_lpcd_prepare(pn5180_t *pn5180);
 /**
  * @brief Switch PN5180 to Low Power Card Detection (LPCD) mode
  * @param pn5180 Pointer to PN5180 device structure
- * @param wakeup_counter_ms Wakeup interval in milliseconds
+ * @param wakeup_counter_ms Wakeup interval in milliseconds, 1 to PN5180_MAX_WAKEUP_COUNTER_MS (2690)
  * @return true on success, false on failure
  */
 bool pn5180_lpcd_enter(pn5180_t *pn5180, uint16_t wakeup_counter_ms);
@@ -622,7 +625,7 @@ bool pn5180_lpcd_wait(pn5180_t *pn5180, int timeout_ms, uint32_t *irq_status);
  * @param pn5180 Pointer to PN5180 device structure
  * @param blockno Block number to authenticate
  * @param key 6-byte authentication key
- * @param key_type Key type (MIFARE_CLASSIC_KEYA or MIFARE_CLASSIC_KEYB)
+ * @param key_type Key type (PN5180_MIFARE_CLASSIC_KEYA or PN5180_MIFARE_CLASSIC_KEYB)
  * @param uid 4-byte card UID
  * @return 0x00 on success, error code otherwise
  */

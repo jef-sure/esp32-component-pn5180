@@ -117,7 +117,7 @@ static void test_ndef_encode_parse_roundtrip(void)
     size_t         text_len = 0;
     char           lang[64];
     bool           utf16 = true;
-    TEST_ASSERT_TRUE(pn5180_ndef_extract_text(&parsed->records[0], &text_out, &text_len, lang, &utf16));
+    TEST_ASSERT_TRUE(pn5180_ndef_extract_text(&parsed->records[0], &text_out, &text_len, lang, sizeof(lang), &utf16));
     TEST_ASSERT_EQUAL(5, text_len);
     TEST_ASSERT_EQUAL_MEMORY("hello", text_out, 5);
     TEST_ASSERT_EQUAL_STRING("en", lang);
@@ -129,6 +129,52 @@ static void test_ndef_encode_parse_roundtrip(void)
     // The longest prefix was used: "https://www." is code 0x02
     TEST_ASSERT_EQUAL_HEX8(0x02, parsed->records[1].payload[0]);
     pn5180_ndef_free_parsed_message(parsed);
+}
+
+static void test_ndef_text_language_code_fits_the_buffer(void)
+{
+    // The card sets the length of the language code, up to 63 bytes.
+    char lang_code[64];
+    memset(lang_code, 'a', 63);
+    lang_code[63] = '\0';
+    pn5180_ndef_record_t text;
+    uint8_t              payload[80];
+    TEST_ASSERT_TRUE(pn5180_ndef_make_text_record(&text, lang_code, (const uint8_t *)"hi", 2, false, payload, sizeof(payload)));
+
+    const uint8_t *text_out = NULL;
+    size_t         text_len = 0;
+    char           area[80];
+
+    // A short buffer receives a truncated code; nothing behind it is written.
+    memset(area, 'X', sizeof(area));
+    TEST_ASSERT_TRUE(pn5180_ndef_extract_text(&text, &text_out, &text_len, area, 8, NULL));
+    TEST_ASSERT_EQUAL_STRING("aaaaaaa", area);
+    TEST_ASSERT_EQUAL_CHAR('X', area[8]);
+    TEST_ASSERT_EQUAL(2, text_len);
+    TEST_ASSERT_EQUAL_MEMORY("hi", text_out, 2);
+
+    // 64 bytes hold any code.
+    memset(area, 'X', sizeof(area));
+    TEST_ASSERT_TRUE(pn5180_ndef_extract_text(&text, &text_out, &text_len, area, 64, NULL));
+    TEST_ASSERT_EQUAL_STRING(lang_code, area);
+    TEST_ASSERT_EQUAL_CHAR('X', area[64]);
+
+    // A size of 0 or no buffer: only the text.
+    memset(area, 'X', sizeof(area));
+    TEST_ASSERT_TRUE(pn5180_ndef_extract_text(&text, &text_out, &text_len, area, 0, NULL));
+    TEST_ASSERT_EQUAL_CHAR('X', area[0]);
+    TEST_ASSERT_TRUE(pn5180_ndef_extract_text(&text, &text_out, &text_len, NULL, 64, NULL));
+    TEST_ASSERT_EQUAL(2, text_len);
+
+    // Another record type leaves the buffers as they were.
+    pn5180_ndef_record_t uri;
+    uint8_t              uri_payload[32];
+    TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&uri, "https://example.com", true, uri_payload, sizeof(uri_payload)));
+    memset(area, 'X', sizeof(area));
+    TEST_ASSERT_FALSE(pn5180_ndef_extract_text(&uri, &text_out, &text_len, area, sizeof(area), NULL));
+    TEST_ASSERT_EQUAL_CHAR('X', area[0]);
+    TEST_ASSERT_EQUAL(0, pn5180_ndef_extract_uri(&text, area, sizeof(area)));
+    TEST_ASSERT_EQUAL_CHAR('X', area[0]);
 }
 
 static void test_ndef_uri_prefix_codes_follow_the_standard(void)
@@ -980,6 +1026,39 @@ static void test_classic_without_mad_has_no_ndef(void)
 
     pn5180_ndef_message_parsed_t *parsed = NULL;
     TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_NO_NDEF, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+}
+
+static void test_classic_directory_read_error_is_retried(void)
+{
+    sim_a_init_classic_1k(&s_card_a);
+    uint8_t ndef[64];
+    size_t  ndef_len = make_uri_message("https://example.com/mad", ndef, sizeof(ndef));
+    sim_a_classic_store_ndef(&s_card_a, ndef, ndef_len);
+    pn5180_uid_t uid = activate_card_a();
+    s_proto_a->halt(s_proto_a);
+
+    // After the MAD key was accepted, a lost READ of the directory means that the card fell back to
+    // IDLE, not that it has no NDEF: the read is repeated after a new select. Blocks 3 (trailer with
+    // the general purpose byte), 1 and 2 (MAD1).
+    const int blocks[] = {3, 1, 2};
+    for (size_t i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
+        s_card_a.nak_read_block = blocks[i];
+        s_card_a.nak_read_count = 1;
+        TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+        pn5180_ndef_message_parsed_t *parsed = NULL;
+        TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+        assert_uri_message(parsed, "https://example.com/mad");
+        pn5180_ndef_free_parsed_message(parsed);
+        s_proto_a->halt(s_proto_a);
+
+        // A card that keeps failing is a read error.
+        s_card_a.nak_read_count = 2;
+        TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+        parsed = NULL;
+        TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_READ_FAILED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+        TEST_ASSERT_NULL(parsed);
+        s_proto_a->halt(s_proto_a);
+    }
 }
 
 static void test_authenticate_refuses_what_the_protocol_does_not_know(void)
@@ -1930,6 +2009,7 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_ndef_encode_parse_roundtrip);
+    RUN_TEST(test_ndef_text_language_code_fits_the_buffer);
     RUN_TEST(test_ndef_uri_prefix_codes_follow_the_standard);
     RUN_TEST(test_ndef_chunks_are_assembled);
     RUN_TEST(test_ndef_rejects_malformed_messages);
@@ -1959,6 +2039,7 @@ int main(void)
     RUN_TEST(test_classic_ndef_sector_trailer_is_checked);
     RUN_TEST(test_classic_mad_crc_is_checked);
     RUN_TEST(test_classic_without_mad_has_no_ndef);
+    RUN_TEST(test_classic_directory_read_error_is_retried);
     RUN_TEST(test_authenticate_refuses_what_the_protocol_does_not_know);
     RUN_TEST(test_record_builders_refuse_missing_data);
     RUN_TEST(test_classic_block_write_and_value_operations);

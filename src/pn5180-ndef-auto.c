@@ -864,21 +864,22 @@ static pn5180_ndef_result_t classic_read_ndef(pn5180_proto_t *proto, pn5180_uid_
         return PN5180_NDEF_ERR_UNSUPPORTED;
     }
 
-    // Sector 0 holds MAD1. A card without readable MAD is not NDEF formatted.
+    // Sector 0 holds MAD1. A card whose MAD sector no key opens is not NDEF formatted. A READ that
+    // fails after the key was accepted means that the card left the field or fell back to IDLE, as in
+    // the NXP reader library: a read error, which pn5180_ndef_read_card_auto() repeats after a new
+    // select.
     if (!classic_auth(proto, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK, classic_key_mad, classic_key_default)) {
         return PN5180_NDEF_ERR_NO_NDEF;
     }
-    int mad_version = 1;
-    if (proto->block_read(proto, CLASSIC_MAD1_TRAILER_BLOCK, trailer, sizeof(trailer))) {
-        mad_version = classic_mad_version_from_gpb(trailer[9]);
-        if (mad_version == 0) {
-            return PN5180_NDEF_ERR_NO_NDEF;
-        }
-    } else {
-        PN5180_LOGD(TAG, "Classic: MAD1 trailer unreadable, assuming MAD version 1");
+    if (!proto->block_read(proto, CLASSIC_MAD1_TRAILER_BLOCK, trailer, sizeof(trailer))) {
+        return PN5180_NDEF_ERR_READ_FAILED;
+    }
+    int mad_version = classic_mad_version_from_gpb(trailer[9]);
+    if (mad_version == 0) {
+        return PN5180_NDEF_ERR_NO_NDEF;
     }
     if (!proto->block_read(proto, CLASSIC_MAD1_FIRST_DATA_BLOCK, mad1, 16) || !proto->block_read(proto, CLASSIC_MAD1_SECOND_DATA_BLOCK, mad1 + 16, 16)) {
-        return PN5180_NDEF_ERR_NO_NDEF;
+        return PN5180_NDEF_ERR_READ_FAILED;
     }
 
     if (!classic_mad_crc_ok(mad1, sizeof(mad1))) {
@@ -900,7 +901,7 @@ static pn5180_ndef_result_t classic_read_ndef(pn5180_proto_t *proto, pn5180_uid_
         }
         for (int i = 0; i < 3; i++) {
             if (!proto->block_read(proto, CLASSIC_MAD2_FIRST_DATA_BLOCK + i, mad2 + (size_t)i * 16u, 16)) {
-                return PN5180_NDEF_ERR_NO_NDEF;
+                return PN5180_NDEF_ERR_READ_FAILED;
             }
         }
         if (!classic_mad_crc_ok(mad2, sizeof(mad2))) {

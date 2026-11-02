@@ -9,8 +9,6 @@
 #include "pn5180-ndef.h"
 #include "pn5180.h"
 #include <inttypes.h>
-#include <stdlib.h>
-#include <string.h>
 
 static const char *TAG = "PN5180_NDEF_READ";
 
@@ -46,76 +44,20 @@ void example_read_ndef_from_card(pn5180_proto_t *proto, pn5180_uid_t *uid)
             ESP_LOG_BUFFER_HEX_LEVEL(TAG, rec->type, rec->type_len, ESP_LOG_INFO);
         }
 
-        // Check for Text RTD
-        if (rec->tnf == PN5180_NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'T') {
-
-            ESP_LOGI(TAG, "  Type: Text RTD");
-
-            if (rec->payload_len > 1) {
-                uint8_t status   = rec->payload[0];
-                uint8_t lang_len = status & 0x3F;
-                bool    is_utf16 = (status & 0x80) != 0;
-
-                if (lang_len + 1 <= rec->payload_len) {
-                    char lang[64] = {0};
-                    memcpy(lang, rec->payload + 1, lang_len);
-                    ESP_LOGI(TAG, "  Language: %s", lang);
-                    ESP_LOGI(TAG, "  Encoding: %s", is_utf16 ? "UTF-16" : "UTF-8");
-
-                    size_t text_len = rec->payload_len - lang_len - 1;
-                    if (text_len > 0 && !is_utf16) {
-                        char *text = malloc(text_len + 1);
-                        if (text) {
-                            memcpy(text, rec->payload + lang_len + 1, text_len);
-                            text[text_len] = '\0';
-                            ESP_LOGI(TAG, "  Text: %s", text);
-                            free(text);
-                        }
-                    }
-                }
-            }
-        }
-        // Check for URI RTD
-        else if (rec->tnf == PN5180_NDEF_TNF_WELL_KNOWN && rec->type_len == 1 && rec->type[0] == 'U') {
-
-            ESP_LOGI(TAG, "  Type: URI RTD");
-
-            if (rec->payload_len > 0) {
-                uint8_t     id_code = rec->payload[0];
-                const char *prefix  = "";
-
-                switch (id_code) {
-                case 0x00:
-                    prefix = "";
-                    break;
-                case 0x01:
-                    prefix = "http://www.";
-                    break;
-                case 0x02:
-                    prefix = "https://www.";
-                    break;
-                case 0x03:
-                    prefix = "http://";
-                    break;
-                case 0x04:
-                    prefix = "https://";
-                    break;
-                default:
-                    prefix = "[unknown prefix]";
-                    break;
-                }
-
-                size_t uri_len = rec->payload_len - 1;
-                if (uri_len > 0) {
-                    char *uri = malloc(strlen(prefix) + uri_len + 1);
-                    if (uri) {
-                        strcpy(uri, prefix);
-                        memcpy(uri + strlen(prefix), rec->payload + 1, uri_len);
-                        uri[strlen(prefix) + uri_len] = '\0';
-                        ESP_LOGI(TAG, "  URI: %s", uri);
-                        free(uri);
-                    }
-                }
+        const uint8_t *text     = NULL;
+        size_t         text_len = 0;
+        char           lang[64]; // the card sets the length of the code, up to 63 bytes
+        bool           is_utf16 = false;
+        char           uri[256];
+        size_t         uri_len = pn5180_ndef_extract_uri(rec, uri, sizeof(uri));
+        if (uri_len > 0) {
+            // The URI prefix code is expanded; a result of sizeof(uri) or more means it was truncated.
+            ESP_LOGI(TAG, "  URI: %s%s", uri, uri_len >= sizeof(uri) ? "..." : "");
+        } else if (pn5180_ndef_extract_text(rec, &text, &text_len, lang, sizeof(lang), &is_utf16)) {
+            ESP_LOGI(TAG, "  Language: %s", lang);
+            ESP_LOGI(TAG, "  Encoding: %s", is_utf16 ? "UTF-16" : "UTF-8");
+            if (!is_utf16) {
+                ESP_LOGI(TAG, "  Text: %.*s", (int)text_len, (const char *)text);
             }
         }
     }

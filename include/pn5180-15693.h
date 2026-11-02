@@ -17,7 +17,7 @@ typedef enum
  * @brief Initialize ISO15693 protocol wrapper
  * @param pn5180 Pointer to PN5180 device structure
  * @param rf_config RF configuration for ISO15693 modulation
- * @return Protocol interface for ISO15693 operations
+ * @return Protocol interface for ISO15693 operations, NULL if memory ran out
  */
 pn5180_proto_t *pn5180_15693_init(pn5180_t *pn5180, pn5180_15693_rf_config_t rf_config);
 

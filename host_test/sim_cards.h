@@ -57,6 +57,8 @@ typedef struct
     uint8_t pending_cmd; /**< two-part command waiting for its second frame, 0 if none */
     uint8_t pending_block;
     uint8_t transfer_buffer[16];
+    int     nak_read_block; /**< READ of this block fails ... */
+    int     nak_read_count; /**< ... this many more times: the frame is lost, the card falls back to IDLE */
 
     /* ISO14443-4 */
     uint8_t ats_fsci;     /**< frame size the card announces */

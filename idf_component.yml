@@ -1,5 +1,5 @@
 ## IDF Component Manager Manifest File
-version: "0.7.2"
+version: "0.8.0"
 description: "ESP-IDF component for NXP PN5180 NFC/RFID reader with multi-card polling, ISO14443A, ISO15693, MIFARE, and NDEF support"
 url: https://github.com/jef-sure/esp32-component-pn5180
 repository: https://github.com/jef-sure/esp32-component-pn5180.git
@@ -8,7 +8,7 @@ issues: https://github.com/jef-sure/esp32-component-pn5180/issues
 
 dependencies:
   idf:
-    version: ">=5.0.0"
+    version: ">=5.0.4"
 
 tags:
   - nfc
@@ -27,6 +27,10 @@ maintainers:
 license: MIT
 
 files:
+  # Only what is listed under include goes into the archive: include is applied after exclude,
+  # and without an exclude of everything it would limit nothing.
+  exclude:
+    - "**/*"
   include:
     - "src/**/*.c"
     - "include/**/*.h"
@@ -40,14 +44,3 @@ files:
     - "README.md"
     - "CHANGES.md"
     - "LICENSE"
-  exclude:
-    - "build/**"
-    - "examples/*/build/**"
-    - "dist/**"
-    - ".git/**"
-    - ".vscode/**"
-    - ".clangd"
-    - "**/*.old"
-    - "PLAN*"
-    - "eim_config.toml"
-

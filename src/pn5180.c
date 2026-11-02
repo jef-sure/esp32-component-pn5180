@@ -119,8 +119,9 @@ static bool pn5180_spi_add_device(pn5180_spi_t *spi, spi_host_device_t host_id, 
         .queue_size     = 2,              //
         .flags          = 0               //
     };
-    if (spi_bus_add_device(host_id, &dev_config, &spi->spi_handle) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to add SPI device");
+    esp_err_t err = spi_bus_add_device(host_id, &dev_config, &spi->spi_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_add_device on SPI host %d failed (%s); is the host initialized?", (int)host_id, esp_err_to_name(err));
         return false;
     }
     spi->host_id        = host_id;
@@ -130,15 +131,8 @@ static bool pn5180_spi_add_device(pn5180_spi_t *spi, spi_host_device_t host_id, 
 
 pn5180_spi_t *pn5180_spi_attach(spi_host_device_t host_id, int clock_speed_hz)
 {
-    size_t max_transaction_len = 0;
-    if ((unsigned)host_id >= SPI_HOST_MAX || spi_bus_get_max_transaction_len(host_id, &max_transaction_len) != ESP_OK) {
-        ESP_LOGE(TAG, "pn5180_spi_attach: SPI host %d is not initialized", (int)host_id);
-        return NULL;
-    }
-    // A command and its answer are each one transaction of up to PN5180_MAX_BUF_SIZE bytes.
-    if (max_transaction_len < PN5180_MAX_BUF_SIZE) {
-        ESP_LOGE(TAG, "pn5180_spi_attach: SPI host %d carries %u bytes per transaction, the PN5180 needs %d", (int)host_id, (unsigned)max_transaction_len,
-                 PN5180_MAX_BUF_SIZE);
+    if ((unsigned)host_id >= SPI_HOST_MAX) {
+        ESP_LOGE(TAG, "pn5180_spi_attach: invalid SPI host %d", (int)host_id);
         return NULL;
     }
     pn5180_spi_t *spi = (pn5180_spi_t *)calloc(1, sizeof(pn5180_spi_t));
@@ -146,6 +140,17 @@ pn5180_spi_t *pn5180_spi_attach(spi_host_device_t host_id, int clock_speed_hz)
         return NULL;
     }
     if (!pn5180_spi_add_device(spi, host_id, clock_speed_hz)) {
+        free(spi);
+        return NULL;
+    }
+    // ESP-IDF answers spi_bus_get_max_transaction_len() only once a device is on the host, so a host
+    // the application has just initialized is checked here and not before.
+    // A command and its answer are each one transaction of up to PN5180_MAX_BUF_SIZE bytes.
+    size_t max_transaction_len = 0;
+    if (spi_bus_get_max_transaction_len(host_id, &max_transaction_len) != ESP_OK || max_transaction_len < PN5180_MAX_BUF_SIZE) {
+        ESP_LOGE(TAG, "pn5180_spi_attach: SPI host %d carries %u bytes per transaction, the PN5180 needs %d", (int)host_id, (unsigned)max_transaction_len,
+                 PN5180_MAX_BUF_SIZE);
+        spi_bus_remove_device(spi->spi_handle);
         free(spi);
         return NULL;
     }

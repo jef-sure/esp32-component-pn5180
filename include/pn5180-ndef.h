@@ -30,11 +30,11 @@ typedef enum
     PN5180_NDEF_ERR_NO_MEMORY        = -2, /**< Memory allocation failed */
     PN5180_NDEF_ERR_READ_FAILED      = -3, /**< Card read operation failed */
     PN5180_NDEF_ERR_WRITE_FAILED     = -4, /**< Card write operation failed */
-    PN5180_NDEF_ERR_NO_NDEF          = -5, /**< No NDEF TLV found on card */
+    PN5180_NDEF_ERR_NO_NDEF          = -5, /**< The card is not NDEF formatted or carries no message */
     PN5180_NDEF_ERR_PARSE_FAILED     = -6, /**< NDEF message parsing failed */
     PN5180_NDEF_ERR_BUFFER_TOO_SMALL = -7, /**< Reserved: not returned by the driver */
     PN5180_NDEF_ERR_CARD_FULL        = -8, /**< Card capacity exceeded */
-    PN5180_NDEF_ERR_UNSUPPORTED      = -9, /**< Card type has no NDEF mapping in this driver */
+    PN5180_NDEF_ERR_UNSUPPORTED      = -9, /**< Card type, mapping version or access conditions this driver does not handle */
     PN5180_NDEF_ERR_ACCESS_DENIED    = -10, /**< The NDEF data is read protected */
     PN5180_NDEF_ERR_READ_ONLY        = -11, /**< The capability container does not grant write access */
 } pn5180_ndef_result_t;
@@ -302,7 +302,8 @@ pn5180_ndef_result_t pn5180_ndef_read_from_selected_card( //
 ) __attribute__((deprecated("use pn5180_ndef_read_card_auto()")));
 
 /**
- * @brief Free memory allocated by pn5180_ndef_read_from_selected_card
+ * @brief Free a message returned by pn5180_ndef_read_card_auto(), pn5180_ndef_parse_message() or
+ *        pn5180_ndef_read_from_selected_card()
  * @param msg Pointer to parsed message to free (can be NULL)
  */
 void pn5180_ndef_free_parsed_message(pn5180_ndef_message_parsed_t *msg);
@@ -331,7 +332,9 @@ pn5180_ndef_result_t pn5180_ndef_parse_message(const uint8_t *raw_data, size_t r
  *   reserved bytes that Lock Control and Memory Control TLVs place inside the data area are left
  *   out, so a message continues behind them
  * - MIFARE Classic: sectors listed in the MIFARE Application Directory, with the public NDEF keys
- * - ISO14443-4 cards (Type 4): NDEF application, capability container file, NDEF file
+ * - ISO14443-4 cards (Type 4): NDEF application of mapping 2.0 and later (AID D2 76 00 00 85 01
+ *   01, as in the NXP reader library), capability container file, NDEF file; a mapping 1.0 tag
+ *   has another AID and is PN5180_NDEF_ERR_NO_NDEF
  * - ISO15693 (Type 5): capability container in block 0, TLVs after it
  *
  * The checks follow the NXP reader library: a Type 2 or Type 5 capability container must show
@@ -340,7 +343,8 @@ pn5180_ndef_result_t pn5180_ndef_parse_message(const uint8_t *raw_data, size_t r
  * consistent.
  *
  * A failed read is retried once after selecting the card again, because several card families
- * leave the selected state after an error.
+ * leave the selected state after an error. On a MIFARE Classic card that includes a READ of the
+ * directory that fails after the MAD key was accepted; a MAD sector no key opens is no NDEF.
  *
  * @param proto Protocol interface the card was found with
  * @param uid Card to read; its subtype, block_size and blocks_count are used
@@ -396,14 +400,21 @@ pn5180_ndef_result_t pn5180_ndef_write_card_auto(struct _pn5180_proto_t *proto, 
  * Extracts the text portion from an NDEF Text record (TNF=Well-known, Type="T").
  * The returned pointer points directly into the record payload (no allocation).
  *
+ * The card sets the length of the language code, up to 63 bytes, so a buffer of 64 bytes holds
+ * any code; a longer code than lang_buf holds is truncated. The text pointer and length do not
+ * depend on it.
+ *
  * @param rec Pointer to record to extract text from
  * @param text_out Pointer to receive text data pointer
  * @param text_len_out Pointer to receive text length
- * @param lang_buf Buffer for language code (at least 64 bytes), or NULL to skip
+ * @param lang_buf Buffer for the language code, or NULL to skip; on success it receives a
+ *                 NUL-terminated string when lang_buf_len > 0, on failure it is left as it was
+ * @param lang_buf_len Size of lang_buf, including the terminating NUL
  * @param is_utf16 Optional pointer to receive encoding flag (true=UTF-16, false=UTF-8)
  * @return true if record is valid Text record, false otherwise
  */
-bool pn5180_ndef_extract_text(const pn5180_ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out, char *lang_buf, bool *is_utf16);
+bool pn5180_ndef_extract_text(const pn5180_ndef_record_t *rec, const uint8_t **text_out, size_t *text_len_out, char *lang_buf, size_t lang_buf_len,
+                              bool *is_utf16);
 
 /**
  * @brief Extract URI from a Well-known URI record
@@ -415,8 +426,9 @@ bool pn5180_ndef_extract_text(const pn5180_ndef_record_t *rec, const uint8_t **t
  * @param uri_buf Buffer to store expanded URI (can be NULL to query the length)
  * @param uri_buf_len Size of uri_buf, including the terminating NUL
  * @return Length of the complete URI without the terminating NUL, 0 if rec is not a URI record.
- *         A result of uri_buf_len or more means that the string in uri_buf was truncated; it is
- *         NUL-terminated in every case.
+ *         For a URI record uri_buf receives a NUL-terminated string when uri_buf_len > 0; a
+ *         result of uri_buf_len or more means that it was truncated. When rec is not a URI
+ *         record, uri_buf is left as it was.
  */
 size_t pn5180_ndef_extract_uri(const pn5180_ndef_record_t *rec, char *uri_buf, size_t uri_buf_len);
 

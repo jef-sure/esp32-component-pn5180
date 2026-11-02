@@ -1,5 +1,34 @@
 # Changelog
 
+## v 0.8.0 - 2026-11-02
+
+Brought over from the PN532 component (0.8.0, 0.8.1).
+
+Breaking change:
+
+- **`pn5180_ndef_extract_text()` takes the size of `lang_buf`**: the new argument `lang_buf_len` follows `lang_buf`. The card sets the length of the language code, up to 63 bytes, and the function copied it into a buffer of unknown size; the header asked for 64 bytes, and a smaller buffer overflowed. The code is now truncated to fit and always NUL-terminated, as in `pn5180_ndef_extract_uri()`; the text pointer and length do not depend on it. A call in the old form no longer compiles: add `sizeof(lang)` after the buffer, or `0` after `NULL`.
+
+Fixes:
+
+- **`pn5180_spi_attach()` works on a host the application has just initialized.** ESP-IDF answers `spi_bus_get_max_transaction_len()` only after the first `spi_bus_add_device()` on a host, so `spi_bus_initialize()` followed by `pn5180_spi_attach()`, the setup the README shows, returned NULL since `pn5180_spi_attach()` appeared in 0.3.0, unless another device was on the host already. The transaction size is now checked once the PN5180 is on the host; a host that cannot carry a transfer is refused as before and keeps no device.
+- **MIFARE Classic: a failed READ of the directory is a read error** (`pn5180_ndef_read_card_auto()`), as in NxpNfcRdLib phalTop. After the MAD key was accepted it means that the card left the field or fell back to IDLE, so the read is now repeated after a new select instead of reporting `PN5180_NDEF_ERR_NO_NDEF`. The fallback that assumed MAD version 1 when the trailer of the MAD sector could not be read is gone: it went on reading from a card in IDLE and could not succeed. A MAD sector no key opens is still no NDEF.
+
+Packaging:
+
+- **The manifest asks for ESP-IDF 5.0.4 or later.** It said 5.0.0 and the README "5.x", but 5.0.0 to 5.0.3 lack `spi_bus_get_max_transaction_len()`, which the driver calls since 0.3.0, so the component did not build there.
+- The `files` section of the manifest is an explicit list: the component archive holds the sources, the headers, the examples, the README, the change log and the license. `host_test/`, `.clang-format` and `.gitignore` stay in the repository.
+
+Documentation:
+
+- `pn5180_ndef_extract_text()` and `pn5180_ndef_extract_uri()` leave the buffer as it was when the record is not of their type.
+- Type 4: `pn5180_ndef_read_card_auto()` selects the NDEF application of mapping 2.0 and later (AID `D2 76 00 00 85 01 01`), as NxpNfcRdLib does; a mapping 1.0 tag, which has another AID, reads as `PN5180_NDEF_ERR_NO_NDEF`. The README suggested otherwise.
+- Two readers may run in separate tasks; readers with close antennas take turns with the field.
+- `pn5180_spi_attach()` may be called right after `spi_bus_initialize()`.
+- From a check of the whole documentation: `pn5180_t.timeout_ms` bounds the waits for the PN5180 itself, not only SPI and BUSY; `examples/app_logic` needs `idf.py set-target esp32s3`, its GPIOs 6 to 8 belong to the flash of a classic ESP32; the headers named the key constants without their `PN5180_` prefix; `pn5180_deinit()` frees only a bus that `pn5180_spi_init()` initialized; the LPCD wake-up interval is 1 to 2690 ms; the descriptions of `PN5180_NDEF_ERR_NO_NDEF` and `PN5180_NDEF_ERR_UNSUPPORTED` cover all their causes.
+- `examples/ndef` uses `pn5180_ndef_extract_uri()` and `pn5180_ndef_extract_text()` instead of its own decoding, which knew 5 of the 36 URI prefixes.
+
+Host tests: a 63-byte language code against a short buffer, a 64-byte buffer, a size of 0 and no buffer; buffers of another record type left untouched; a lost READ of the MAD sector trailer and of each MAD1 block, once (read again) and twice (read error).
+
 ## v 0.7.2 - 2026-11-01
 
 Packaging only, no code changes. 0.7.0 and 0.7.1 were removed from the ESP Component Registry, so this is the first version there with the changes listed under them, among them the new `max_cards` argument of `pn5180_14443_init()`.

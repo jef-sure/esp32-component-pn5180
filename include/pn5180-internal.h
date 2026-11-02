@@ -7,7 +7,7 @@
  * change without notice.
  *
  * @note Application code should use pn5180.h, pn5180-14443.h, pn5180-15693.h,
- *       or pn5180-ndef.h instead.
+ *       pn5180-mifare.h or pn5180-ndef.h instead.
  */
 
 #pragma once
@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-/** @brief Enable debug logging for PN5180 component (comment out to disable) */
+/** @brief Enable debug logging for PN5180 component (uncomment to enable) */
 // #define PN5180_DEBUG
 
 #ifdef PN5180_DEBUG
