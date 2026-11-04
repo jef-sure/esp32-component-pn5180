@@ -1,4 +1,6 @@
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "pn5180-14443.h"
 #include "pn5180-15693.h"
 #include "pn5180.h"
@@ -120,6 +122,7 @@ void app_main(void) {
     scan_protocol(proto_14443, "ISO14443A");
     scan_protocol(proto_15693, "ISO15693");
 
-    pn5180_delay_ms(2000);
+    // A pause that need not be precise: vTaskDelay() releases the CPU for all of it.
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }

@@ -123,6 +123,9 @@ typedef enum
     AUTH_RESULT_NO_CARD,
 } auth_result_t;
 
+// One authentication per key. A refused key leaves the card out of the active state: it is selected
+// again before the next key is tried, not asked the same key a second time. A card that did not
+// answer has left the field, and the next key would not reach it either.
 static auth_result_t authenticate_sector_with_key(pn5180_proto_t *proto, pn5180_uid_t *uid, int sector_block, const uint8_t *key, uint8_t key_type)
 {
     if (!proto || !proto->authenticate) return AUTH_RESULT_FAIL;
@@ -130,18 +133,15 @@ static auth_result_t authenticate_sector_with_key(pn5180_proto_t *proto, pn5180_
     // Feed WDT before potentially long operations
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Try AUTH first; only reselect and retry on failure.
     if (proto->authenticate(proto, key, key_type, uid, sector_block)) {
         return AUTH_RESULT_OK;
     }
-
-    if (proto->select_by_uid) {
-        if (!proto->select_by_uid(proto, uid)) {
-            return AUTH_RESULT_NO_CARD;
-        }
-        return proto->authenticate(proto, key, key_type, uid, sector_block) ? AUTH_RESULT_OK : AUTH_RESULT_FAIL;
+    if (proto->pn5180->iso14443_last_auth_status != PN5180_MIFARE_AUTH_REFUSED) {
+        return AUTH_RESULT_NO_CARD;
     }
-
+    if (proto->select_by_uid == NULL || !proto->select_by_uid(proto, uid)) {
+        return AUTH_RESULT_NO_CARD;
+    }
     return AUTH_RESULT_FAIL;
 }
 
@@ -454,7 +454,8 @@ void app_run(void)
         scan_protocol(proto_14443, "ISO14443A");
         scan_protocol(proto_15693, "ISO15693");
 
-        pn5180_delay_ms(2000);
+        // A pause that need not be precise: vTaskDelay() releases the CPU for all of it.
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
 

@@ -171,8 +171,17 @@ int16_t sim_a_auth(void *ctx, uint8_t blockno, const uint8_t *key, uint8_t key_t
 {
     sim_a_card_t *card = ctx;
     (void)uid;
+    card->auth_count++;
     if (card->kind != SIM_A_CLASSIC || card->state != SIM_A_ACTIVE) {
         return 0x02; // no answer
+    }
+    if (card->auth_no_answer_count > 0 && card->auth_no_answer_skip > 0) {
+        card->auth_no_answer_skip--;
+    } else if (card->auth_no_answer_count > 0) {
+        // The card misses the request and falls back to IDLE, as after any frame it cannot take.
+        card->auth_no_answer_count--;
+        sim_a_leave_selected_state(card, false);
+        return 0x02;
     }
     int sector = sim_a_classic_sector(blockno);
     if (key_type == 0x60 && memcmp(key, card->sector_key_a[sector], 6) == 0) {
@@ -287,8 +296,16 @@ static void sim_a_process_apdu(sim_a_card_t *card)
             return;
         }
         const uint8_t *id = &apdu[5];
+        if (card->short_select_answers > 0) {
+            // A damaged answer: one byte where the status word belongs
+            card->short_select_answers--;
+            card->response[0]     = 0x90;
+            card->response_len    = 1;
+            card->response_offset = 0;
+            return;
+        }
         if (p1 == 0x04) {
-            card->app_selected  = (lc == sizeof(ndef_aid) && memcmp(id, ndef_aid, lc) == 0);
+            card->app_selected  = !card->refuse_ndef_app && lc == sizeof(ndef_aid) && memcmp(id, ndef_aid, lc) == 0;
             card->selected_file = 0;
             sim_a_set_status(card, 0, card->app_selected ? 0x9000 : 0x6A82);
             return;

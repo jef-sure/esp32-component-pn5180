@@ -181,9 +181,10 @@ pn5180_spi_t *pn5180_spi_init(       //
     int               clock_speed_hz //
 )
 {
-
-    pn5180_spi_t *spi = (pn5180_spi_t *)calloc(1, sizeof(pn5180_spi_t));
-    if (spi == NULL) {
+    // The PN5180 needs all three lines. MISO goes into the 64-bit gpio_config() mask, where
+    // GPIO_NUM_NC would be a shift by -1; SCK and MOSI are driven by the SPI master.
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(sck) || !GPIO_IS_VALID_GPIO(miso) || !GPIO_IS_VALID_OUTPUT_GPIO(mosi)) {
+        ESP_LOGE(TAG, "pn5180_spi_init: SCK %d and MOSI %d must be output GPIOs, MISO %d a GPIO", (int)sck, (int)mosi, (int)miso);
         return NULL;
     }
     gpio_config_t miso_cfg = {
@@ -193,7 +194,14 @@ pn5180_spi_t *pn5180_spi_init(       //
         .pull_down_en = GPIO_PULLDOWN_DISABLE, //
         .intr_type    = GPIO_INTR_DISABLE      //
     };
-    gpio_config(&miso_cfg);
+    if (gpio_config(&miso_cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "pn5180_spi_init: MISO %d cannot be configured", (int)miso);
+        return NULL;
+    }
+    pn5180_spi_t *spi = (pn5180_spi_t *)calloc(1, sizeof(pn5180_spi_t));
+    if (spi == NULL) {
+        return NULL;
+    }
     spi_bus_config_t bus_config = {
         .mosi_io_num     = mosi,
         .miso_io_num     = miso,
@@ -242,24 +250,50 @@ static void pn5180_poll_timer_cb(void *arg)
     xSemaphoreGive((SemaphoreHandle_t)arg);
 }
 
-// Sleeps for about us microseconds with the CPU released. vTaskDelay() cannot do this: it sleeps
-// whole ticks, typically 10 ms.
-static void pn5180_poll_sleep(pn5180_t *pn5180, uint32_t us)
+// Blocks the calling task until the poll timer of the device has run for us microseconds. The
+// timer has microsecond resolution and wakes the task from the esp_timer task, a few tens of
+// microseconds after it expires; vTaskDelay() could only sleep whole ticks, typically 10 ms.
+// False when the device has no timer or it could not be started: nothing was slept.
+static bool pn5180_timer_sleep(pn5180_t *pn5180, uint32_t us)
 {
-    // A tick that is no longer than the wanted sleep makes vTaskDelay() precise enough.
-    if (pn5180->poll_timer == NULL || (uint32_t)portTICK_PERIOD_MS * 1000u <= us) {
-        vTaskDelay(1);
-        return;
+    if (pn5180->poll_timer == NULL) {
+        return false;
     }
     esp_timer_handle_t timer = (esp_timer_handle_t)pn5180->poll_timer;
-    xSemaphoreTake((SemaphoreHandle_t)pn5180->poll_sem, 0);
+    xSemaphoreTake((SemaphoreHandle_t)pn5180->poll_sem, 0); // a give left over from an earlier wait
     if (esp_timer_start_once(timer, us) != ESP_OK) {
-        vTaskDelay(1);
-        return;
+        return false;
     }
     // The tick timeout is only a backstop in case the timer does not fire.
     xSemaphoreTake((SemaphoreHandle_t)pn5180->poll_sem, pdMS_TO_TICKS(us / 1000 + 20) + 1);
     esp_timer_stop(timer);
+    return true;
+}
+
+// Sleeps for about us microseconds between two polls of IRQ_STATUS, with the CPU released.
+static void pn5180_poll_sleep(pn5180_t *pn5180, uint32_t us)
+{
+    // A tick that is no longer than the wanted sleep makes vTaskDelay() precise enough.
+    if ((uint32_t)portTICK_PERIOD_MS * 1000u <= us || !pn5180_timer_sleep(pn5180, us)) {
+        vTaskDelay(1);
+    }
+}
+
+// Below this a wake-up through the timer costs about as much as it saves: the wait is a busy wait.
+#define PN5180_SLEEP_MIN_US 200
+
+void pn5180_sleep_us(pn5180_t *pn5180, uint32_t us)
+{
+    int64_t end = esp_timer_get_time() + us;
+    if (pn5180 != NULL && us >= PN5180_SLEEP_MIN_US) {
+        pn5180_timer_sleep(pn5180, us);
+    }
+    // What is left: all of it without the timer, nothing after a normal wake-up, the rest after an
+    // early one (a give the timer of an earlier wait sent too late). The wait never ends early.
+    int64_t remaining = end - esp_timer_get_time();
+    if (remaining > 0) {
+        pn5180_delay_us((uint32_t)remaining);
+    }
 }
 
 // Without field a card loses its ISO14443-4 session, whatever took the field away.
@@ -290,9 +324,14 @@ static void pn5180_free(pn5180_t *pn5180)
 
 pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_num_t rst)
 {
-    // A shift by GPIO_NUM_NC (-1) is undefined behaviour; such pins are refused outright.
-    if (spi == NULL || nss < 0 || busy < 0 || rst < 0) {
-        ESP_LOGE(TAG, "pn5180_init: invalid arguments (SPI handle, NSS, BUSY and RST are required)");
+    if (spi == NULL) {
+        ESP_LOGE(TAG, "pn5180_init: the SPI handle is required");
+        return NULL;
+    }
+    // The pins go into the 64-bit gpio_config() mask, where GPIO_NUM_NC would be a shift by -1 and
+    // a number beyond the chip's GPIOs is refused; NSS and RST are driven, so they need an output.
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(nss) || !GPIO_IS_VALID_GPIO(busy) || !GPIO_IS_VALID_OUTPUT_GPIO(rst)) {
+        ESP_LOGE(TAG, "pn5180_init: NSS %d and RST %d must be output GPIOs, BUSY %d a GPIO", (int)nss, (int)rst, (int)busy);
         return NULL;
     }
 
@@ -325,6 +364,8 @@ pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_n
     ret->tx_config        = 0;
     ret->hw_rx_timeout    = true;
     ret->rf_guard_time_us = 5100;
+    // No MIFARE authentication was sent yet.
+    ret->iso14443_last_auth_status = PN5180_MIFARE_AUTH_NONE;
     // Timer for sleeping between IRQ_STATUS polls with sub-tick precision. Without it the driver
     // still works, with tick-length sleeps.
     ret->poll_sem = xSemaphoreCreateBinary();
@@ -358,11 +399,14 @@ pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_n
         .pull_down_en = GPIO_PULLDOWN_DISABLE, //
         .intr_type    = GPIO_INTR_DISABLE      //
     };
-    gpio_config(&out_cfg);
-    gpio_config(&busy_cfg);
+    if (gpio_config(&out_cfg) != ESP_OK || gpio_config(&busy_cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "pn5180_init: NSS %d, BUSY %d or RST %d cannot be configured", (int)nss, (int)busy, (int)rst);
+        pn5180_free(ret);
+        return NULL;
+    }
     gpio_set_level(nss, 1);
     gpio_set_level(rst, 1);
-    pn5180_delay_ms(100);
+    pn5180_sleep_us(ret, 100000);
     if (!pn5180_reset(ret)) {
         ESP_LOGE(TAG, "Failed to reset PN5180 during init");
         pn5180_free(ret);
@@ -860,11 +904,14 @@ uint32_t pn5180_rx_bytes_received(pn5180_t *pn5180)
     return len;
 }
 
-int16_t pn5180_mifare_authenticate(pn5180_t *pn5180, uint8_t blockno, const uint8_t *key, uint8_t key_type, const uint8_t uid[4])
+static int16_t pn5180_mifare_authenticate_status(pn5180_t *pn5180, uint8_t blockno, const uint8_t *key, uint8_t key_type, const uint8_t uid[4])
 {
+    if (key == NULL || uid == NULL) {
+        return PN5180_MIFARE_AUTH_NONE;
+    }
     if (key_type != 0x60 && key_type != 0x61) {
         ESP_LOGE(TAG, "Invalid key type 0x%02X for MIFARE authentication", key_type);
-        return -1;
+        return PN5180_MIFARE_AUTH_NONE;
     }
     uint8_t cmd_buf[13];
     uint8_t rcv_buffer[1];
@@ -954,6 +1001,16 @@ int16_t pn5180_mifare_authenticate(pn5180_t *pn5180, uint8_t blockno, const uint
     }
 
     return 0x00;
+}
+
+int16_t pn5180_mifare_authenticate(pn5180_t *pn5180, uint8_t blockno, const uint8_t *key, uint8_t key_type, const uint8_t uid[4])
+{
+    if (pn5180 == NULL) {
+        return PN5180_MIFARE_AUTH_NONE;
+    }
+    int16_t status                    = pn5180_mifare_authenticate_status(pn5180, blockno, key, key_type, uid);
+    pn5180->iso14443_last_auth_status = status;
+    return status;
 }
 
 /**
@@ -1047,7 +1104,7 @@ bool pn5180_set_rf_on(pn5180_t *pn5180)
 
         if (!transceive_command(pn5180, cmd_buf, sizeof(cmd_buf), NULL, 0)) {
             ESP_LOGE(TAG, "RF_ON SPI command failed");
-            pn5180_delay_ms(10);
+            pn5180_sleep_us(pn5180, 10000);
             continue;
         }
 
@@ -1055,7 +1112,7 @@ bool pn5180_set_rf_on(pn5180_t *pn5180)
         // Just read RF_STATUS once to check the outcome.
         if (!pn5180_read_register(pn5180, PN5180_RF_STATUS, &rf_status)) {
             ESP_LOGE(TAG, "Failed to read RF_STATUS after RF_ON");
-            pn5180_delay_ms(10);
+            pn5180_sleep_us(pn5180, 10000);
             continue;
         }
 
@@ -1063,7 +1120,7 @@ bool pn5180_set_rf_on(pn5180_t *pn5180)
             pn5180->is_rf_on = true;
             // Guard time: cards need the unmodulated field before the first command.
             if (pn5180->rf_guard_time_us > 0) {
-                pn5180_delay_us(pn5180->rf_guard_time_us);
+                pn5180_sleep_us(pn5180, pn5180->rf_guard_time_us);
             }
             return true;
         }
@@ -1075,7 +1132,7 @@ bool pn5180_set_rf_on(pn5180_t *pn5180)
         } else {
             ESP_LOGW(TAG, "RF_ON failed, RF_STATUS=0x%08" PRIx32 " IRQ=0x%08" PRIx32, rf_status, irq_status);
         }
-        pn5180_delay_ms(10);
+        pn5180_sleep_us(pn5180, 10000);
     }
 
     ESP_LOGE(TAG, "RF field is NOT on! RF_STATUS=0x%08" PRIx32 " IRQ_STATUS=0x%08" PRIx32, rf_status, irq_status);
@@ -1137,7 +1194,7 @@ bool pn5180_reset(pn5180_t *pn5180)
     gpio_set_level(pn5180->rst, 0);
     esp_rom_delay_us(50);
     gpio_set_level(pn5180->rst, 1);
-    pn5180_delay_ms(100);
+    pn5180_sleep_us(pn5180, 100000);
     // A reset clears every register and takes the field away: nothing loaded before is valid any more.
     pn5180->is_rf_on         = false;
     pn5180->rf_config_loaded = false;
@@ -1169,9 +1226,9 @@ bool pn5180_reset(pn5180_t *pn5180)
                 return false;
             }
             gpio_set_level(pn5180->rst, 0);
-            pn5180_delay_ms(50 + attempts * 10);
+            pn5180_sleep_us(pn5180, (uint32_t)(50 + attempts * 10) * 1000u);
             gpio_set_level(pn5180->rst, 1);
-            pn5180_delay_ms(100 + attempts * 20);
+            pn5180_sleep_us(pn5180, (uint32_t)(100 + attempts * 20) * 1000u);
             deadline = esp_timer_get_time() + (1000LL * pn5180->timeout_ms);
         }
         vTaskDelay(1);
@@ -1230,6 +1287,14 @@ static void IRAM_ATTR pn5180_irq_isr(void *arg)
 
 bool pn5180_irq_attach(pn5180_t *pn5180, gpio_num_t irq)
 {
+    if (pn5180 == NULL) {
+        return false;
+    }
+    // The pin goes into the 64-bit gpio_config() mask, where GPIO_NUM_NC would be a shift by -1.
+    if (!GPIO_IS_VALID_GPIO(irq)) {
+        ESP_LOGE(TAG, "IRQ %d is not a GPIO", (int)irq);
+        return false;
+    }
     if (pn5180->irq_sem != NULL) {
         ESP_LOGE(TAG, "IRQ pin is already attached");
         return false;

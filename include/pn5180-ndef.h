@@ -338,13 +338,19 @@ pn5180_ndef_result_t pn5180_ndef_parse_message(const uint8_t *raw_data, size_t r
  * - ISO15693 (Type 5): capability container in block 0, TLVs after it
  *
  * The checks follow the NXP reader library: a Type 2 or Type 5 capability container must show
- * a supported major version and standard access conditions; a MIFARE Classic NDEF sector must
- * grant read access in its general purpose byte; a Type 4 capability container must be
+ * a supported major version and standard access conditions; the first MIFARE Classic NDEF
+ * sector must grant read access in its general purpose byte when the NFC key D3 F7 D3 F7 D3 F7
+ * opened it (a sector that only the default key opens keeps the factory byte 69h, which says
+ * nothing about NDEF, and is read without the check); a Type 4 capability container must be
  * consistent.
  *
  * A failed read is retried once after selecting the card again, because several card families
- * leave the selected state after an error. On a MIFARE Classic card that includes a READ of the
- * directory that fails after the MAD key was accepted; a MAD sector no key opens is no NDEF.
+ * leave the selected state after an error. On a MIFARE Classic card that includes a card that
+ * did not answer the authentication of a directory or NDEF sector, and a READ of the directory
+ * that fails after the MAD key was accepted; a MAD sector that turns down both the MAD key and
+ * the default key is no NDEF, an NDEF sector that turns down both the NFC key and the default
+ * key is read protected, and neither is read again. On a Type 4 card it includes a SELECT whose
+ * answer carries no status word; a SELECT the card refuses with a status word is no NDEF.
  *
  * @param proto Protocol interface the card was found with
  * @param uid Card to read; its subtype, block_size and blocks_count are used
@@ -355,6 +361,7 @@ pn5180_ndef_result_t pn5180_ndef_parse_message(const uint8_t *raw_data, size_t r
  *         version, or proprietary access conditions,
  *         PN5180_NDEF_ERR_ACCESS_DENIED if the tag protects the message against reading,
  *         PN5180_NDEF_ERR_PARSE_FAILED if the tag or the message is inconsistent,
+ *         PN5180_NDEF_ERR_READ_FAILED if the second attempt failed too,
  *         or another error code
  */
 pn5180_ndef_result_t pn5180_ndef_read_card_auto(struct _pn5180_proto_t *proto, pn5180_uid_t *uid, pn5180_ndef_message_parsed_t **out_msg);

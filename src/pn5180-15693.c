@@ -70,7 +70,7 @@ static bool pn5180_15693_setup_rf(pn5180_t *pn5180, uint8_t rf_config)
         }
         pn5180_set_rf_off(pn5180);
         // Tags drop their Quiet and Selected state only after the field was off long enough.
-        pn5180_delay_us(PN5180_RF_OFF_TIME_US);
+        pn5180_sleep_us(pn5180, PN5180_RF_OFF_TIME_US);
     }
     bool ret = pn5180_load_rf_config(pn5180, rf_config);
     if (!ret) {
@@ -290,7 +290,7 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
 
                 // Add a small jitter to desynchronize potentially colliding cards
                 int jitter = (esp_random() % 10) + 5;
-                pn5180_delay_ms(jitter);
+                pn5180_sleep_us(pn5180, (uint32_t)jitter * 1000u);
                 continue;
             }
 

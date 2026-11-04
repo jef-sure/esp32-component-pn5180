@@ -199,6 +199,9 @@ static bool _pn5180_14443_authenticate( //
     // subtype indicates card type (Classic 1K/4K, Plus, etc.)
     // key_type: 0x60 for Key A, 0x61 for Key B
 
+    // Until an authentication is sent there is no status; pn5180_mifare_authenticate() sets it.
+    proto->pn5180->iso14443_last_auth_status = PN5180_MIFARE_AUTH_NONE;
+
     if (uid->subtype == PN5180_MIFARE_ULTRALIGHT || uid->subtype == PN5180_MIFARE_ULTRALIGHT_C || uid->subtype == PN5180_MIFARE_ULTRALIGHT_EV1 ||
         uid->subtype == PN5180_MIFARE_NTAG210 || uid->subtype == PN5180_MIFARE_NTAG212 || uid->subtype == PN5180_MIFARE_NTAG213 ||
         uid->subtype == PN5180_MIFARE_NTAG215 || uid->subtype == PN5180_MIFARE_NTAG216) {
@@ -298,7 +301,7 @@ static bool pn5180_14443_setup_rf(pn5180_t *pn5180)
         }
         pn5180_set_rf_off(pn5180);
         // Cards return to their idle state only after the field was off long enough.
-        pn5180_delay_us(PN5180_RF_OFF_TIME_US);
+        pn5180_sleep_us(pn5180, PN5180_RF_OFF_TIME_US);
     }
     bool ret = pn5180_load_rf_config(pn5180, PN5180_14443A_RF_CONFIG);
     if (!ret) {
@@ -844,7 +847,7 @@ static bool pn5180_14443_send_rats(pn5180_t *pn5180)
     if (sfgi > 0) {
         // Start-up frame guard time: the card needs (256 * 16 / fc) * 2^SFGI, about 302 us * 2^SFGI,
         // after its ATS before it can take the first block.
-        pn5180_delay_us((uint32_t)302 << sfgi);
+        pn5180_sleep_us(pn5180, (uint32_t)302 << sfgi);
     }
     pn5180->iso14443_block_number = 0;
     return true;
@@ -1156,24 +1159,33 @@ static bool pn5180_14443_4_select(pn5180_t *pn5180, uint8_t p1, uint8_t p2, cons
     return false;
 }
 
-bool pn5180_14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len)
+bool pn5180_14443_4_select_file_ex(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len, bool *card_refused)
 {
+    bool refused = false;
+    if (card_refused == NULL) {
+        card_refused = &refused;
+    }
+    *card_refused = false;
     if (pn5180 == NULL || file_id == NULL || file_id_len == 0 || file_id_len > 16) {
         return false;
     }
 
-    bool card_refused = false;
     if (file_id_len > 2) {
         // By AID: first or only occurrence, FCI optional.
-        return pn5180_14443_4_select(pn5180, 0x04, 0x00, file_id, file_id_len, &card_refused);
+        return pn5180_14443_4_select(pn5180, 0x04, 0x00, file_id, file_id_len, card_refused);
     }
 
     // By file identifier. NFC Forum Type 4 Tag mapping 2.0 mandates P2=0x0C (no response data);
     // mapping 1.0 cards expect P2=0x00, so that is tried once when the card itself refuses the first form.
-    if (pn5180_14443_4_select(pn5180, 0x00, 0x0C, file_id, file_id_len, &card_refused)) {
+    if (pn5180_14443_4_select(pn5180, 0x00, 0x0C, file_id, file_id_len, card_refused)) {
         return true;
     }
-    return card_refused && pn5180_14443_4_select(pn5180, 0x00, 0x00, file_id, file_id_len, &card_refused);
+    return *card_refused && pn5180_14443_4_select(pn5180, 0x00, 0x00, file_id, file_id_len, card_refused);
+}
+
+bool pn5180_14443_4_select_file(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len)
+{
+    return pn5180_14443_4_select_file_ex(pn5180, file_id, file_id_len, NULL);
 }
 
 bool pn5180_14443_4_read_binary(pn5180_t *pn5180, uint16_t offset, uint8_t le, uint8_t *buffer, size_t *got)

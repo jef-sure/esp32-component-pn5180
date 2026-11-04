@@ -3,6 +3,7 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
+#include "pn5180-internal.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,6 +27,8 @@ pn5180_t *fake_pn5180_create(void)
     s_card_ctx            = NULL;
     s_random_state        = 1;
     memset(s_registers, 0, sizeof(s_registers));
+    // As the driver: no MIFARE authentication was sent yet.
+    pn5180->iso14443_last_auth_status = PN5180_MIFARE_AUTH_NONE;
     return pn5180;
 }
 
@@ -217,16 +220,24 @@ bool pn5180_set_rf_off(pn5180_t *pn5180)
 
 int16_t pn5180_mifare_authenticate(pn5180_t *pn5180, uint8_t blockno, const uint8_t *key, uint8_t key_type, const uint8_t uid[4])
 {
-    (void)pn5180;
-    if (s_auth == NULL) {
-        return 0x02; // timeout: nothing in the field answers
+    // As the driver: the status is kept in the device. Without a card nothing in the field answers.
+    int16_t status = PN5180_MIFARE_AUTH_NO_ANSWER;
+    if (s_auth != NULL) {
+        status = s_auth(s_card_ctx, blockno, key, key_type, uid);
     }
-    return s_auth(s_card_ctx, blockno, key, key_type, uid);
+    pn5180->iso14443_last_auth_status = status;
+    return status;
 }
 
 void pn5180_delay_ms(int ms)
 {
     s_time_us += (int64_t)ms * 1000;
+}
+
+void pn5180_sleep_us(pn5180_t *pn5180, uint32_t us)
+{
+    (void)pn5180;
+    s_time_us += us;
 }
 
 void pn5180_delay_us(uint32_t us)

@@ -59,6 +59,9 @@ typedef struct
     uint8_t transfer_buffer[16];
     int     nak_read_block; /**< READ of this block fails ... */
     int     nak_read_count; /**< ... this many more times: the frame is lost, the card falls back to IDLE */
+    int     auth_no_answer_skip;  /**< authentications answered normally before auth_no_answer_count takes effect */
+    int     auth_no_answer_count; /**< then N authentications get no answer (status 2): the card is out of the field for a moment */
+    int     auth_count;           /**< authentications the card was asked for */
 
     /* ISO14443-4 */
     uint8_t ats_fsci;     /**< frame size the card announces */
@@ -85,6 +88,8 @@ typedef struct
     int     selected_file; /**< 0 none, 1 CC, 2 NDEF */
     bool    app_selected;
     bool    refuse_select_p2_0c; /**< mapping version 1.0 card: wants P2=00 */
+    int     short_select_answers; /**< the next N SELECTs are answered with one byte and no status word */
+    bool    refuse_ndef_app;      /**< the card has no NDEF application: its select is answered with 6A82 */
     uint8_t last_apdu[600];      /**< last complete command APDU, for inspection */
     size_t  last_apdu_len;
 } sim_a_card_t;

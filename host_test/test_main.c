@@ -1061,6 +1061,123 @@ static void test_classic_directory_read_error_is_retried(void)
     }
 }
 
+// Formats the card with sim_a_classic_store_ndef() and gives the NDEF sectors the default key and
+// the factory trailer back, as a tool that writes the MAD and the message but not the NFC keys does.
+static void classic_store_ndef_behind_factory_trailers(const uint8_t *ndef, size_t ndef_len)
+{
+    static const uint8_t factory_access[4] = {0xFF, 0x07, 0x80, 0x69}; // GPB 69h
+    sim_a_classic_store_ndef(&s_card_a, ndef, ndef_len);
+    for (int sector = 1; sector < 16; sector++) {
+        if (s_card_a.memory[16 + 2 + (sector - 1) * 2] == 0x03) {
+            memset(s_card_a.sector_key_a[sector], 0xFF, 6);
+            memcpy(&s_card_a.memory[(sector * 4 + 3) * 16 + 6], factory_access, sizeof(factory_access));
+        }
+    }
+}
+
+static void test_classic_sector_with_factory_trailer_is_read(void)
+{
+    sim_a_init_classic_1k(&s_card_a);
+    uint8_t ndef[64];
+    size_t  ndef_len = make_uri_message("https://example.com/factory", ndef, sizeof(ndef));
+    sim_a_classic_store_ndef(&s_card_a, ndef, ndef_len);
+    pn5180_uid_t uid = activate_card_a();
+
+    // NFC formatted: the NFC key opens the sector, its general purpose byte (40h) is read.
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+    int                           frames = fake_frame_count();
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    int nfc_key_frames = fake_frame_count() - frames;
+    assert_uri_message(parsed, "https://example.com/factory");
+    pn5180_ndef_free_parsed_message(parsed);
+    s_proto_a->halt(s_proto_a);
+
+    // Only the default key opens the sector, whose trailer is the factory one: GPB 69h, read access
+    // 10b. The byte says nothing about NDEF and is not read; 0.5.0 to 0.8.0 took it for read
+    // protection.
+    classic_store_ndef_behind_factory_trailers(ndef, ndef_len);
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    parsed = NULL;
+    frames = fake_frame_count();
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    int default_key_frames = fake_frame_count() - frames;
+    assert_uri_message(parsed, "https://example.com/factory");
+    pn5180_ndef_free_parsed_message(parsed);
+    s_proto_a->halt(s_proto_a);
+    // One READ fewer, of the trailer; the refused NFC key costs a new select: HLTA, WUPA, SELECT.
+    TEST_ASSERT_EQUAL(nfc_key_frames - 1 + 3, default_key_frames);
+
+    // Behind the NFC key GPB 69h is still read protection.
+    sim_a_classic_store_ndef(&s_card_a, ndef, ndef_len);
+    s_card_a.memory[7 * 16 + 9] = 0x69;
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    parsed = NULL;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_ACCESS_DENIED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_NULL(parsed);
+}
+
+static void test_classic_refused_key_is_told_from_a_lost_card(void)
+{
+    static const uint8_t private_key[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+    sim_a_init_classic_1k(&s_card_a);
+    uint8_t ndef[64];
+    size_t  ndef_len = make_uri_message("https://example.com/keys", ndef, sizeof(ndef));
+    sim_a_classic_store_ndef(&s_card_a, ndef, ndef_len);
+    pn5180_uid_t                  uid    = activate_card_a();
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+
+    // The card misses the MAD authentication once: a lost card, not one without NDEF. The default
+    // key is not tried on it, and the read is repeated after a new select.
+    s_card_a.auth_count           = 0;
+    s_card_a.auth_no_answer_count = 1;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, "https://example.com/keys");
+    pn5180_ndef_free_parsed_message(parsed);
+    parsed = NULL;
+    TEST_ASSERT_EQUAL(3, s_card_a.auth_count); // MAD (no answer), MAD, NDEF sector
+    s_proto_a->halt(s_proto_a);
+
+    // It misses both: a read error. 0.8.0 reported "no NDEF" after the first.
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    s_card_a.auth_count           = 0;
+    s_card_a.auth_no_answer_count = 2;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_READ_FAILED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_NULL(parsed);
+    TEST_ASSERT_EQUAL(2, s_card_a.auth_count);
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_AUTH_NO_ANSWER, s_pn5180->iso14443_last_auth_status);
+    s_proto_a->halt(s_proto_a);
+
+    // The card misses the authentication of the NDEF sector once: read again, the message arrives.
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    s_card_a.auth_count           = 0;
+    s_card_a.auth_no_answer_skip  = 1;
+    s_card_a.auth_no_answer_count = 1;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, "https://example.com/keys");
+    pn5180_ndef_free_parsed_message(parsed);
+    parsed = NULL;
+    TEST_ASSERT_EQUAL(4, s_card_a.auth_count); // MAD, sector (no answer), MAD, sector
+    s_proto_a->halt(s_proto_a);
+
+    // An NDEF sector that refuses both public keys is read protected: no second attempt. 0.8.0
+    // read the card twice and reported a read error.
+    memcpy(s_card_a.sector_key_a[1], private_key, sizeof(private_key));
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    s_card_a.auth_count = 0;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_ACCESS_DENIED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_NULL(parsed);
+    TEST_ASSERT_EQUAL(3, s_card_a.auth_count); // MAD, NFC key, default key
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_AUTH_REFUSED, s_pn5180->iso14443_last_auth_status);
+    s_proto_a->halt(s_proto_a);
+
+    // A MAD sector that refuses both keys: no public directory, no NDEF, no second attempt.
+    memcpy(s_card_a.sector_key_a[0], private_key, sizeof(private_key));
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    s_card_a.auth_count = 0;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_NO_NDEF, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_EQUAL(2, s_card_a.auth_count);
+}
+
 static void test_authenticate_refuses_what_the_protocol_does_not_know(void)
 {
     static const uint8_t key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -1074,8 +1191,35 @@ static void test_authenticate_refuses_what_the_protocol_does_not_know(void)
     pn5180_uid_t short_uid = uid;
     short_uid.uid_length   = 3;
     TEST_ASSERT_FALSE(s_proto_a->authenticate(s_proto_a, key, PN5180_MIFARE_CLASSIC_KEYA, &short_uid, 4));
+    // Nothing was sent, so there is no status.
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_AUTH_NONE, s_pn5180->iso14443_last_auth_status);
 
     TEST_ASSERT_TRUE(s_proto_a->authenticate(s_proto_a, key, PN5180_MIFARE_CLASSIC_KEYA, &uid, 4));
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_AUTH_OK, s_pn5180->iso14443_last_auth_status);
+}
+
+static void test_authenticate_status_tells_why_it_failed(void)
+{
+    static const uint8_t key[6]       = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    static const uint8_t wrong_key[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+    sim_a_init_classic_1k(&s_card_a);
+    pn5180_uid_t uid = activate_card_a();
+
+    // The card turns the key down and leaves the active state ...
+    TEST_ASSERT_FALSE(s_proto_a->authenticate(s_proto_a, wrong_key, PN5180_MIFARE_CLASSIC_KEYA, &uid, 4));
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_AUTH_REFUSED, s_pn5180->iso14443_last_auth_status);
+    // ... so the next key gets no answer until the card is selected again.
+    TEST_ASSERT_FALSE(s_proto_a->authenticate(s_proto_a, key, PN5180_MIFARE_CLASSIC_KEYA, &uid, 4));
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_AUTH_NO_ANSWER, s_pn5180->iso14443_last_auth_status);
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    TEST_ASSERT_TRUE(s_proto_a->authenticate(s_proto_a, key, PN5180_MIFARE_CLASSIC_KEYA, &uid, 4));
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_AUTH_OK, s_pn5180->iso14443_last_auth_status);
+
+    // A card type without MIFARE authentication sends nothing.
+    sim_a_init_ntag213(&s_card_a);
+    uid = activate_card_a();
+    TEST_ASSERT_TRUE(s_proto_a->authenticate(s_proto_a, key, PN5180_MIFARE_CLASSIC_KEYA, &uid, 4));
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_AUTH_NONE, s_pn5180->iso14443_last_auth_status);
 }
 
 static void test_record_builders_refuse_missing_data(void)
@@ -1374,6 +1518,37 @@ static void test_type4_read_is_repeated_after_a_lost_select(void)
     TEST_ASSERT_EQUAL(rats + 1, s_card_a.rats_count);
     assert_uri_message(parsed, "mailto:a@example.com");
     pn5180_ndef_free_parsed_message(parsed);
+}
+
+static void test_type4_select_answer_without_status_word_is_a_read_error(void)
+{
+    sim_a_init_iso_dep(&s_card_a, 0x20, 8);
+    uint8_t ndef[64];
+    size_t  ndef_len = make_uri_message("mailto:b@example.com", ndef, sizeof(ndef));
+    sim_a_iso_dep_store_ndef(&s_card_a, ndef, ndef_len);
+    pn5180_uid_t                  uid    = activate_card_a();
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+
+    // The answer to the application select carries no status word: the card did not refuse the
+    // application, the answer is damaged. The read is repeated; 0.8.0 reported "no NDEF".
+    s_card_a.short_select_answers = 1;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, "mailto:b@example.com");
+    pn5180_ndef_free_parsed_message(parsed);
+    parsed = NULL;
+
+    // Every SELECT damaged: a read error.
+    s_card_a.short_select_answers = 10;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_READ_FAILED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_NULL(parsed);
+    s_card_a.short_select_answers = 0;
+
+    // A card that refuses the application with a status word has no NDEF: one exchange, no second
+    // attempt.
+    s_card_a.refuse_ndef_app = true;
+    int frames               = fake_frame_count();
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_NO_NDEF, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_EQUAL(1, fake_frame_count() - frames);
 }
 
 static void test_type4_select_falls_back_for_mapping_version_1(void)
@@ -2040,6 +2215,9 @@ int main(void)
     RUN_TEST(test_classic_mad_crc_is_checked);
     RUN_TEST(test_classic_without_mad_has_no_ndef);
     RUN_TEST(test_classic_directory_read_error_is_retried);
+    RUN_TEST(test_classic_sector_with_factory_trailer_is_read);
+    RUN_TEST(test_classic_refused_key_is_told_from_a_lost_card);
+    RUN_TEST(test_authenticate_status_tells_why_it_failed);
     RUN_TEST(test_authenticate_refuses_what_the_protocol_does_not_know);
     RUN_TEST(test_record_builders_refuse_missing_data);
     RUN_TEST(test_classic_block_write_and_value_operations);
@@ -2052,6 +2230,7 @@ int main(void)
     RUN_TEST(test_type4_extended_ndef_file_is_unsupported);
     RUN_TEST(test_type4_capability_container_is_validated);
     RUN_TEST(test_type4_read_is_repeated_after_a_lost_select);
+    RUN_TEST(test_type4_select_answer_without_status_word_is_a_read_error);
     RUN_TEST(test_type4_select_falls_back_for_mapping_version_1);
     RUN_TEST(test_iso_dep_reserved_frame_size_is_accepted);
     RUN_TEST(test_classic_emulation_card_stays_on_layer_3_unless_asked);

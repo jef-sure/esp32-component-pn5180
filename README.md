@@ -19,7 +19,7 @@ ESP-IDF driver for the NXP PN5180 NFC frontend over SPI: find ISO14443A and ISO1
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "jef-sure/pn5180^0.8.0"
+idf.py add-dependency "jef-sure/pn5180^0.8.1"
 ```
 
 Or copy this repository to `components/` in your project. ESP-IDF 5.0.4 or later is required, 6.x included.
@@ -48,6 +48,8 @@ A complete `app_main()` that prints the UID of every ISO14443A card it sees and 
 #include <stdlib.h>
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "pn5180.h"
 #include "pn5180-14443.h"
 #include "pn5180-ndef.h"
@@ -107,7 +109,7 @@ void app_main(void)
         if (status == PN5180_POLL_TRANSPORT_ERROR) {
             pn5180_recover(pn5180);
         }
-        pn5180_delay_ms(250);
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
 ```
@@ -172,9 +174,11 @@ if (result == PN5180_NDEF_OK) {
 }
 ```
 
-`PN5180_NDEF_ERR_NO_NDEF` means that the card works but is not NDEF formatted or carries no message; `PN5180_NDEF_ERR_UNSUPPORTED` that the card type has no NDEF mapping here, or that the tag declares a mapping version or access conditions the driver does not know; `PN5180_NDEF_ERR_ACCESS_DENIED` that the tag protects its message against reading (Type 4 NDEF file, MIFARE Classic NDEF sectors); `PN5180_NDEF_ERR_PARSE_FAILED` that the tag or the message is inconsistent. The checks are those of the NXP reader library.
+`PN5180_NDEF_ERR_NO_NDEF` means that the card works but is not NDEF formatted or carries no message; `PN5180_NDEF_ERR_UNSUPPORTED` that the card type has no NDEF mapping here, or that the tag declares a mapping version or access conditions the driver does not know; `PN5180_NDEF_ERR_ACCESS_DENIED` that the tag protects its message against reading (Type 4 NDEF file; MIFARE Classic NDEF sectors that turn down both public keys, or whose general purpose byte denies reading); `PN5180_NDEF_ERR_PARSE_FAILED` that the tag or the message is inconsistent. The checks are those of the NXP reader library.
 
-A read that fails is repeated once after the card was selected again, because several card families leave the selected state after an error; on a MIFARE Classic card that includes a READ of the directory that fails after the MAD key was accepted. `PN5180_NDEF_ERR_READ_FAILED` means that the second attempt failed too. For Type 4 the NDEF application of mapping 2.0 and later is selected (AID `D2 76 00 00 85 01 01`), as in the NXP reader library; a mapping 1.0 tag has another AID and reads as `PN5180_NDEF_ERR_NO_NDEF`.
+A read that fails is repeated once after the card was selected again, because several card families leave the selected state after an error. On a MIFARE Classic card that includes a card that does not answer the authentication of a directory or NDEF sector (it left the field for a moment), and a READ of the directory that fails after the MAD key was accepted; a card that turns down both keys of a sector answers the same way the second time and is not read again. On a Type 4 card it includes a SELECT whose answer carries no status word. `PN5180_NDEF_ERR_READ_FAILED` means that the second attempt failed too. For Type 4 the NDEF application of mapping 2.0 and later is selected (AID `D2 76 00 00 85 01 01`), as in the NXP reader library; a mapping 1.0 tag has another AID and reads as `PN5180_NDEF_ERR_NO_NDEF`.
+
+MIFARE Classic, step by step: the directory sector is opened with the MAD key `A0 A1 A2 A3 A4 A5` or the default key `FF FF FF FF FF FF`, the NDEF sectors with the NFC key `D3 F7 D3 F7 D3 F7` or the default key. A card that turns down both keys of the directory sector has no public MAD: `PN5180_NDEF_ERR_NO_NDEF`. The general purpose byte of the first NDEF sector (mapping version and read access) is checked when the NFC key opened it; a sector that only the default key opens was never NFC formatted and keeps the factory byte `69h`, which says nothing about NDEF, so it is read without that check.
 
 ### Write a URI to an NTAG
 
@@ -251,7 +255,7 @@ if (proto->authenticate(proto, key, PN5180_MIFARE_CLASSIC_KEYA, card, 4)) {
 }
 ```
 
-After a refused authentication the card stops answering: select it again (`halt`, then `select_by_uid`) before trying another key.
+After a failed authentication the card stops answering: select it again (`halt`, then `select_by_uid`) before trying another key. `pn5180->iso14443_last_auth_status` tells why it failed: `PN5180_MIFARE_AUTH_REFUSED` for a key the card turned down, `PN5180_MIFARE_AUTH_NO_ANSWER` for a card that did not answer (it left the field, or was not selected), `PN5180_MIFARE_AUTH_NONE` when nothing was sent. Try one key per authentication; asking the same key again after a refusal only costs time.
 
 ### Exchange APDUs with a Type 4 card
 
@@ -332,13 +336,14 @@ A PN5180 command is two SPI transfers, each framed by NSS. The driver holds the 
 
 ## Troubleshooting
 
-- **`pn5180_init()` returns NULL** — the PN5180 did not boot or did not report a supported firmware. Check power (5 V and 3.3 V on the usual breakout), ground, and the NSS, BUSY and RST pins. Try a lower SPI clock.
+- **`pn5180_init()` returns NULL** — the PN5180 did not boot or did not report a supported firmware. Check power (5 V and 3.3 V on the usual breakout), ground, and the NSS, BUSY and RST pins. Try a lower SPI clock. It also returns NULL, before it touches the PN5180, for a pin that is not a GPIO of the chip (`GPIO_NUM_NC` among them) or for NSS or RST on an input-only GPIO; `pn5180_spi_init()` does the same for its pins, and the log names the pin.
 - **`PN5180 ... timeout waiting for busy level`** — the BUSY line does not follow the SPI transfers: wrong BUSY pin, or NSS not reaching the module.
 - **No cards found, `PN5180_POLL_NO_TARGET`** — check that the field comes up (`setup_rf()` returns true) and that the antenna is not on a metal surface. A card that was halted by the previous scan answers again only after the field was off for at least 5.1 ms (`PN5180_RF_OFF_TIME_US`); 5 ms is too short.
 - **`RF_ON blocked by external RF field (RFCA)`** — another reader's field is present. Two readers of your own should take turns with the field (see [Ownership and lifetime](#ownership-and-lifetime)); `pn5180_set_rfca(pn5180, false)` switches the field on regardless.
 - **`select_by_uid()` fails on a card that was just read** — the card is still selected and ignores the wake-up. Call `halt()` first, then `select_by_uid()`.
 - **Reads fail after one refused command** — Ultralight and NTAG cards leave the selected state after any NAK (for example a read beyond the last page), MIFARE Classic after a refused authentication. Select the card again.
-- **`PN5180_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, the MAD has a wrong CRC, the card uses non-default keys, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
+- **`PN5180_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, the MAD has a wrong CRC, the directory sector turns down both the MAD key and the default key, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
+- **`PN5180_NDEF_ERR_ACCESS_DENIED` on a MIFARE Classic card** — an NDEF sector the directory lists turns down both the NFC key and the default key, or the first NDEF sector opens with the NFC key and its general purpose byte denies reading.
 - **`pn5180_ndef_write_card_auto()` returns `PN5180_NDEF_ERR_NO_NDEF`** — the tag is not NDEF formatted: it has no capability container, or its data area holds no NDEF TLV for the message to go into. NTAG and ICODE tags usually leave the factory formatted with an empty NDEF TLV; formatting a blank tag is not implemented.
 - **`PN5180_NDEF_ERR_UNSUPPORTED` on an NTAG, Ultralight or ISO15693 tag** — the capability container declares another major mapping version than 1 or access conditions other than the standard ones (read/write, read-only), or a write would touch lock or reserved bytes that a Type 2 tag keeps inside its data area. A read goes around such bytes, a write does not. Read or write the blocks yourself with `block_read` / `block_write`.
 - **A card shows a different UID starting with `08` on every scan** — a random UID, typically a phone. See [Targets with a random UID](#targets-with-a-random-uid).
@@ -366,6 +371,8 @@ Resets the PN5180 and restores the RF configuration and the field state it had. 
 ### RF guard time
 
 After the field is switched on, the driver waits 5.1 ms before the first command, so that cards have powered up. Change it with `pn5180_set_rf_guard_time_us()`; ISO15693 tags need 1 ms.
+
+The driver's own waits — this guard time, the time the field stays off when a protocol is set up again, the start-up frame guard time of ISO14443-4 cards, the reset — sleep on a high-resolution timer of the device (`esp_timer`): the CPU is free meanwhile, and a wait ends at most some tens of microseconds late, never early. `pn5180_delay_ms()` and `pn5180_delay_us()` have no device: they sleep whole RTOS ticks and busy-wait the rest, up to one tick. For a pause that need not be precise, such as the one between polls, use `vTaskDelay()`.
 
 ### Low power card detection
 
@@ -491,7 +498,7 @@ make -C host_test test IDF_PATH=<path to esp-idf>
 
 The Unity sources come from the ESP-IDF checkout, or from a plain Unity checkout with `UNITY_DIR=<path to Unity/src>`. The GitHub workflow in [`.github/workflows/host-test.yml`](.github/workflows/host-test.yml) runs the tests on every push and pull request.
 
-The tests cover polling (also of fields with many cards), selection, card identification, NDEF reading for all four mappings and writing for Type 2 and Type 5, ISO14443-4 chaining and recovery from lost frames, MIFARE value operations, and misbehaving cards (one that ignores HLTA, one that answers with empty chained blocks). They do not cover the SPI layer and RF timing, which need the hardware.
+The tests cover polling (also of fields with many cards), selection, card identification, NDEF reading for all four mappings and writing for Type 2 and Type 5, ISO14443-4 chaining and recovery from lost frames, MIFARE value operations, and misbehaving cards (one that ignores HLTA, one that answers with empty chained blocks, a MIFARE Classic card that misses authentications, a Type 4 card whose SELECT answers lack the status word). They do not cover the SPI layer and RF timing, which need the hardware.
 
 ### API map
 

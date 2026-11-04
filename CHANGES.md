@@ -1,6 +1,32 @@
 # Changelog
 
-## v 0.8.0 - 2026-11-02
+## v 0.8.1 - 2026-11-04
+
+Brought over from the PN532 component (0.8.2 and the fixes after it).
+
+Fixes:
+
+- **MIFARE Classic: an NDEF sector with a factory trailer is read again.** Since 0.5.0 the general purpose byte of the first NDEF sector was checked whichever key opened it. A sector that only the default key `FF FF FF FF FF FF` opens was never NFC formatted (formatting writes the NFC key and GPB `40h`) and keeps its factory trailer, `FF 07 80 69`: GPB `69h` has read access `10b`, so the card was reported as `PN5180_NDEF_ERR_ACCESS_DENIED`. The byte is now checked only on a sector the NFC key `D3 F7 D3 F7 D3 F7` opens, as in NxpNfcRdLib phalTop, which opens NFC sectors with that key only and takes `69h` for a blank sector. A default-key sector costs one READ fewer.
+- **MIFARE Classic: a refused key is told from a lost card.** The PN5180 reports a refused key as authentication status 1 ("permission denied") and a card that did not answer as status 2 (datasheet, table 26), but both counted as a refused key. A card that left the field at the MAD key gave a definite `PN5180_NDEF_ERR_NO_NDEF` without a second attempt, and the second key was tried on a card that was gone. Now only status 1 is a refused key. A card that does not answer the authentication of a directory or NDEF sector is `PN5180_NDEF_ERR_READ_FAILED`, the read is repeated once after a new select, and no second key is tried on it.
+- **MIFARE Classic: NDEF sectors that turn down both public keys are `PN5180_NDEF_ERR_ACCESS_DENIED`.** They were `PN5180_NDEF_ERR_READ_FAILED`, so the whole read ran a second time to the same end. NxpNfcRdLib phalTop takes such a tag as misconfigured, without a retry either.
+- **Type 4: a SELECT answer without a status word is a read error.** An answer shorter than two bytes left the ISO14443-4 session open and was taken for a card that refused the application or file: `PN5180_NDEF_ERR_NO_NDEF` after one exchange. Only a refusal with a status word means no NDEF now; anything else is `PN5180_NDEF_ERR_READ_FAILED` and is repeated once.
+- **Pins are checked.** `pn5180_spi_init()` put MISO into the 64-bit `gpio_config()` mask unchecked, which for `GPIO_NUM_NC` is a shift by -1, and `pn5180_irq_attach()` did the same with its pin. `pn5180_init()` refused only negative numbers. Now `pn5180_init()` and `pn5180_spi_init()` return NULL, and `pn5180_irq_attach()` false, for a pin that is not a GPIO of the chip or for a driven pin (NSS, RST, SCK, MOSI) on an input-only GPIO, before the PN5180 or the SPI host is touched. Results of `gpio_config()` are checked. `pn5180_irq_attach()` and `pn5180_mifare_authenticate()` return at once for a NULL device, the latter also for a NULL key or UID.
+
+New:
+
+- **`pn5180_t.iso14443_last_auth_status`**: the result of the last MIFARE Classic authentication, as `pn5180_mifare_authenticate()` returns it, with the constants `PN5180_MIFARE_AUTH_OK`, `PN5180_MIFARE_AUTH_REFUSED`, `PN5180_MIFARE_AUTH_NO_ANSWER` and `PN5180_MIFARE_AUTH_NONE` (nothing was sent). It tells a refused key from a lost card after the `authenticate` callback returned false.
+
+Changes:
+
+- **The driver's own waits release the CPU.** The guard time after the field goes on (5.1 ms), the time the field stays off when a protocol is set up again (5.1 ms), the start-up frame guard time of ISO14443-4 cards, the inventory jitter of ISO15693 and the waits of reset and field on now sleep on the high-resolution timer the device already has for polling. They ended with a busy wait of up to one RTOS tick, and the waits below a tick, the guard times among them, were busy waits altogether; they now end at most some tens of microseconds late, never early. `pn5180_delay_ms()` and `pn5180_delay_us()` are unchanged.
+- Examples: each key and key type of the MIFARE Classic dump costs one authentication, and the card is selected again only after a refusal. `examples/app_logic` authenticated twice per key with a select in between, the second time with the key just refused, and sent the next key to a card out of the active state. The pause between polls is `vTaskDelay()`, as in the README.
+
+Documentation:
+
+- README and `pn5180-ndef.h`: which keys open which MIFARE Classic sectors, which first NDEF sector has its general purpose byte checked, which failures are read again and which are not; troubleshooting entries for `PN5180_NDEF_ERR_ACCESS_DENIED` on a Classic card and for pins `pn5180_init()` refuses. `pn5180.h` and the README: what `iso14443_last_auth_status` says after a failed authentication, and how the driver waits.
+
+Host tests: a Classic sector behind a factory trailer, read with one READ fewer; GPB `69h` behind the NFC key still read protected; a card that misses the authentication of the directory or of an NDEF sector once (read again) and twice (read error); an NDEF sector and a directory sector that turn down both keys; the authentication status after a refusal, a missing answer and a card type without authentication; Type 4 SELECT answers without a status word, and a card that refuses the NDEF application.
+
 
 Brought over from the PN532 component (0.8.0, 0.8.1).
 

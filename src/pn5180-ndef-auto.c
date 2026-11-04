@@ -101,7 +101,8 @@ static pn5180_ndef_result_t stream_finish(ndef_stream_t *stream, bool found, boo
 }
 
 // Puts the card back into the selected state. Several card families drop out of it after an error:
-// Ultralight and NTAG reset to IDLE after any NAK, MIFARE Classic after a failed authentication.
+// Ultralight and NTAG reset to IDLE after any NAK, MIFARE Classic leaves the active state after a
+// failed authentication.
 static bool ndef_reselect(pn5180_proto_t *proto, pn5180_uid_t *uid)
 {
     if (proto->halt != NULL) {
@@ -661,21 +662,71 @@ static const uint8_t classic_key_mad[6]     = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA
 static const uint8_t classic_key_ndef[6]    = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
 static const uint8_t classic_key_default[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// Authenticates the sector of blockno with key A, trying a second key if the first is refused.
-static bool classic_auth(pn5180_proto_t *proto, pn5180_uid_t *uid, int blockno, const uint8_t *primary_key, const uint8_t *secondary_key)
+typedef enum
 {
-    if (proto->authenticate(proto, primary_key, PN5180_MIFARE_CLASSIC_KEYA, uid, blockno)) {
-        return true;
+    CLASSIC_AUTH_OK,
+    CLASSIC_AUTH_REFUSED, // the card answered and turned the key down
+    CLASSIC_AUTH_LOST     // the card did not answer or could not be selected
+} classic_auth_t;
+
+// Authenticates the sector of blockno with key A.
+static classic_auth_t classic_try_key(pn5180_proto_t *proto, pn5180_uid_t *uid, int blockno, const uint8_t *key)
+{
+    if (proto->authenticate(proto, key, PN5180_MIFARE_CLASSIC_KEYA, uid, blockno)) {
+        return CLASSIC_AUTH_OK;
     }
-    if (secondary_key == NULL) {
-        return false;
+    // A refused key is authentication status 1, "permission denied" (PN5180 datasheet, table 26;
+    // NxpNfcRdLib takes it for PH_ERR_AUTH_ERROR). Status 2, "timeout waiting for card response
+    // (card not present)", an SPI error or no status at all says nothing about the key: the card
+    // left the field or was not in the active state. libnfc and mfoc draw the same line on PN53x
+    // readers. Status 1 does not prove a wrong key either: a weak RF link that loses the card's
+    // answer looks the same. The key is still not tried again, as NxpNfcRdLib phalTop never
+    // repeats a failed authentication; the application reads the card again in its next cycle.
+    const pn5180_t *pn5180 = proto->pn5180;
+    if (pn5180 != NULL && pn5180->iso14443_last_auth_status == PN5180_MIFARE_AUTH_REFUSED) {
+        return CLASSIC_AUTH_REFUSED;
     }
-    // A refused authentication leaves the card unselected.
+    return CLASSIC_AUTH_LOST;
+}
+
+// Tries primary_key and, when the card refuses it, secondary_key (if any). Stops at a lost card:
+// another key would not reach it either. *by_secondary, when given, tells whether secondary_key
+// opened the sector.
+static classic_auth_t classic_auth(pn5180_proto_t *proto, pn5180_uid_t *uid, int blockno, const uint8_t *primary_key, const uint8_t *secondary_key,
+                                   bool *by_secondary)
+{
+    if (by_secondary != NULL) {
+        *by_secondary = false;
+    }
+    classic_auth_t result = classic_try_key(proto, uid, blockno, primary_key);
+    if (result != CLASSIC_AUTH_REFUSED || secondary_key == NULL) {
+        return result;
+    }
+    // A refused authentication leaves the card out of the active state.
     if (!ndef_reselect(proto, uid)) {
         PN5180_LOGD(TAG, "Classic: reselect failed at block %d", blockno);
-        return false;
+        return CLASSIC_AUTH_LOST;
     }
-    return proto->authenticate(proto, secondary_key, PN5180_MIFARE_CLASSIC_KEYA, uid, blockno);
+    result = classic_try_key(proto, uid, blockno, secondary_key);
+    if (by_secondary != NULL) {
+        *by_secondary = (result == CLASSIC_AUTH_OK);
+    }
+    return result;
+}
+
+// Opens a directory sector with the MAD key or the default key. A card that refuses both has no
+// public directory and is no NDEF card, as in NxpNfcRdLib phalTop; a card that is lost is a read
+// error, which pn5180_ndef_read_card_auto() repeats after a new select.
+static pn5180_ndef_result_t classic_auth_mad_sector(pn5180_proto_t *proto, pn5180_uid_t *uid, int blockno)
+{
+    switch (classic_auth(proto, uid, blockno, classic_key_mad, classic_key_default, NULL)) {
+    case CLASSIC_AUTH_OK:
+        return PN5180_NDEF_OK;
+    case CLASSIC_AUTH_REFUSED:
+        return PN5180_NDEF_ERR_NO_NDEF;
+    default:
+        return PN5180_NDEF_ERR_READ_FAILED;
+    }
 }
 
 // CRC of a MIFARE Application Directory: CRC-8 with polynomial x^8 + x^4 + x^3 + x^2 + 1 (1Dh) and
@@ -807,14 +858,35 @@ static pn5180_ndef_result_t classic_read_sectors(pn5180_proto_t *proto, pn5180_u
             read_ok = false;
             break;
         }
-        if (!classic_auth(proto, uid, first_block, classic_key_ndef, classic_key_default)) {
-            PN5180_LOGD(TAG, "Classic: authentication failed for sector %d", sectors[i]);
+        bool           by_default_key = false;
+        classic_auth_t auth           = classic_auth(proto, uid, first_block, classic_key_ndef, classic_key_default, &by_default_key);
+        if (auth == CLASSIC_AUTH_REFUSED) {
+            // A sector the directory lists whose card turns down both public keys is read
+            // protected, and a new attempt would be turned down again: NxpNfcRdLib phalTop takes the
+            // tag for misconfigured, without a retry either. The read ends there, at the first listed
+            // sector too. phalTop alone would go on to the next one and take that for the first;
+            // libnfc-nxp, AOSP rw_mfc, libfreefare and Proxmark3 stop, as here: the message runs
+            // through contiguous sectors from the first one, so a read from the second would start
+            // inside it.
+            PN5180_LOGD(TAG, "Classic: sector %d refuses both public keys", sectors[i]);
+            free(stream.data);
+            return PN5180_NDEF_ERR_ACCESS_DENIED;
+        }
+        if (auth != CLASSIC_AUTH_OK) {
+            PN5180_LOGD(TAG, "Classic: card lost at sector %d", sectors[i]);
             read_ok = false;
             break;
         }
-        if (i == 0) {
-            // General purpose byte of the NDEF sector trailer: mapping version in bits 7..4 (major
-            // in 7..6), read access in bits 3..2, write access in bits 1..0; 00b grants access.
+        // As NxpNfcRdLib phalTop: the general purpose byte in the trailer of the first NDEF sector
+        // holds the mapping version in bits 7..4 (major in 7..6), read access in bits 3..2, write
+        // access in bits 1..0; 00b grants access (AN1304). phalTop opens NFC sectors with the NFC key
+        // only. A sector that only the default key opens was never NFC formatted, which writes the
+        // NFC key and GPB 40h: it keeps the factory trailer, whose GPB 69h (read access 10b)
+        // phalTop's FormatNdef takes for a blank sector (PHAL_MFCTOP_DEFAULT_GPB). That byte says
+        // nothing about NDEF, so such a sector is read without it. The write access bits are not
+        // checked: they do not keep the message from being read, and libnfc-nxp reads a tag with
+        // RFU write access as read only.
+        if (i == 0 && !by_default_key) {
             uint8_t trailer[16];
             if (!proto->block_read(proto, first_block + block_count - 1, trailer, sizeof(trailer))) {
                 read_ok = false;
@@ -864,12 +936,13 @@ static pn5180_ndef_result_t classic_read_ndef(pn5180_proto_t *proto, pn5180_uid_
         return PN5180_NDEF_ERR_UNSUPPORTED;
     }
 
-    // Sector 0 holds MAD1. A card whose MAD sector no key opens is not NDEF formatted. A READ that
-    // fails after the key was accepted means that the card left the field or fell back to IDLE, as in
-    // the NXP reader library: a read error, which pn5180_ndef_read_card_auto() repeats after a new
-    // select.
-    if (!classic_auth(proto, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK, classic_key_mad, classic_key_default)) {
-        return PN5180_NDEF_ERR_NO_NDEF;
+    // Sector 0 holds MAD1. A card that refuses both keys for the MAD sector is not NDEF formatted. A
+    // card that did not answer, or a READ that fails after the key was accepted, means that the card
+    // left the field or fell back to IDLE, as in the NXP reader library: a read error, which
+    // pn5180_ndef_read_card_auto() repeats after a new select.
+    pn5180_ndef_result_t auth_result = classic_auth_mad_sector(proto, uid, CLASSIC_MAD1_FIRST_DATA_BLOCK);
+    if (auth_result != PN5180_NDEF_OK) {
+        return auth_result;
     }
     if (!proto->block_read(proto, CLASSIC_MAD1_TRAILER_BLOCK, trailer, sizeof(trailer))) {
         return PN5180_NDEF_ERR_READ_FAILED;
@@ -896,8 +969,9 @@ static pn5180_ndef_result_t classic_read_ndef(pn5180_proto_t *proto, pn5180_uid_
     if (uid->subtype == PN5180_MIFARE_CLASSIC_4K && mad_version == 2) {
         // Sector 16 holds MAD2 for sectors 17..39.
         uint8_t mad2[48];
-        if (!classic_auth(proto, uid, CLASSIC_MAD2_TRAILER_BLOCK, classic_key_mad, classic_key_default)) {
-            return PN5180_NDEF_ERR_NO_NDEF;
+        auth_result = classic_auth_mad_sector(proto, uid, CLASSIC_MAD2_TRAILER_BLOCK);
+        if (auth_result != PN5180_NDEF_OK) {
+            return auth_result;
         }
         for (int i = 0; i < 3; i++) {
             if (!proto->block_read(proto, CLASSIC_MAD2_FIRST_DATA_BLOCK + i, mad2 + (size_t)i * 16u, 16)) {
@@ -937,11 +1011,12 @@ static pn5180_ndef_result_t classic_read_ndef(pn5180_proto_t *proto, pn5180_uid_
  *        [14]     Write access
  *   3. SELECT the NDEF file, read NLEN (2 bytes at offset 0), then NLEN bytes from offset 2.
  */
-// A card that refuses a SELECT is alive but carries no NDEF application or file. A SELECT that got
-// no usable answer closed the ISO14443-4 session instead, and the read is worth repeating.
-static pn5180_ndef_result_t type4_select_failure_result(const pn5180_t *pn5180)
+// A card that refuses a SELECT with a status word is alive but carries no NDEF application or file.
+// A SELECT that got no usable answer, one that closed the ISO14443-4 session or one without a status
+// word, says nothing about the tag: a read error, which pn5180_ndef_read_card_auto() repeats.
+static pn5180_ndef_result_t type4_select_failure_result(bool card_refused)
 {
-    return pn5180->iso14443_layer4_active ? PN5180_NDEF_ERR_NO_NDEF : PN5180_NDEF_ERR_READ_FAILED;
+    return card_refused ? PN5180_NDEF_ERR_NO_NDEF : PN5180_NDEF_ERR_READ_FAILED;
 }
 
 static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_message_parsed_t **out_msg)
@@ -954,13 +1029,14 @@ static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_m
         PN5180_LOGD(TAG, "T4: ISO14443-4 is not active");
         return PN5180_NDEF_ERR_READ_FAILED;
     }
-    if (!pn5180_14443_4_select_file(pn5180, ndef_aid, sizeof(ndef_aid))) {
+    bool card_refused = false;
+    if (!pn5180_14443_4_select_file_ex(pn5180, ndef_aid, sizeof(ndef_aid), &card_refused)) {
         PN5180_LOGD(TAG, "T4: SELECT NDEF application failed");
-        return type4_select_failure_result(pn5180);
+        return type4_select_failure_result(card_refused);
     }
-    if (!pn5180_14443_4_select_file(pn5180, cc_file_id, sizeof(cc_file_id))) {
+    if (!pn5180_14443_4_select_file_ex(pn5180, cc_file_id, sizeof(cc_file_id), &card_refused)) {
         PN5180_LOGD(TAG, "T4: SELECT capability container failed");
-        return type4_select_failure_result(pn5180);
+        return type4_select_failure_result(card_refused);
     }
 
     uint8_t cc[15];
@@ -1007,9 +1083,9 @@ static pn5180_ndef_result_t type4_read_ndef(pn5180_proto_t *proto, pn5180_ndef_m
     // 260-byte buffer, so 248 data bytes is the ceiling.
     uint16_t chunk_max = (mle > 250) ? 248u : (uint16_t)(mle - 2u);
 
-    if (!pn5180_14443_4_select_file(pn5180, ndef_fid, sizeof(ndef_fid))) {
+    if (!pn5180_14443_4_select_file_ex(pn5180, ndef_fid, sizeof(ndef_fid), &card_refused)) {
         PN5180_LOGD(TAG, "T4: SELECT NDEF file %02X%02X failed", ndef_fid[0], ndef_fid[1]);
-        return type4_select_failure_result(pn5180);
+        return type4_select_failure_result(card_refused);
     }
 
     uint8_t nlen_buf[2];

@@ -13,6 +13,13 @@ extern "C" {
 #define PN5180_MIFARE_CLASSIC_KEYA 0x60 // Mifare Classic key A
 #define PN5180_MIFARE_CLASSIC_KEYB 0x61 // Mifare Classic key B
 
+// Authentication status of MIFARE_AUTHENTICATE (PN5180 datasheet, table 26), as
+// pn5180_mifare_authenticate() returns it and pn5180_t.iso14443_last_auth_status keeps it
+#define PN5180_MIFARE_AUTH_OK        0x00 // key accepted
+#define PN5180_MIFARE_AUTH_REFUSED   0x01 // authentication failed (permission denied): the card turned the key down
+#define PN5180_MIFARE_AUTH_NO_ANSWER 0x02 // timeout waiting for the card response (card not present)
+#define PN5180_MIFARE_AUTH_NONE      (-1) // no status from the PN5180: nothing was sent, or an invalid argument
+
 // PN5180 IRQ_STATUS
 #define PN5180_RX_IRQ_STAT              (1 << 0)  // End of RF reception IRQ
 #define PN5180_TX_IRQ_STAT              (1 << 1)  // End of RF transmission IRQ
@@ -152,6 +159,16 @@ typedef struct _pn5180_t
     uint16_t iso14443_frame_size;       // Max ISO14443-4 frame size excluding CRC bytes
     int64_t  iso14443_fwt_ms;           // Frame waiting time derived from ATS
     bool    iso14443_layer4_active;
+    /**
+     * Result of the last MIFARE Classic authentication, as pn5180_mifare_authenticate() returned
+     * it: PN5180_MIFARE_AUTH_OK, PN5180_MIFARE_AUTH_REFUSED (the card turned the key down),
+     * PN5180_MIFARE_AUTH_NO_ANSWER (the card did not answer: it left the field or was not in the
+     * active state), another status byte, or a negative value when the PN5180 gave no status
+     * (PN5180_MIFARE_AUTH_NONE: no authentication was sent, for example for a card type without
+     * MIFARE authentication; below that an SPI error). It tells a refused key from a lost card
+     * after the authenticate callback of the ISO14443A protocol returned false.
+     */
+    int16_t iso14443_last_auth_status;
 } pn5180_t;
 
 /**
@@ -257,6 +274,11 @@ typedef bool pn5180_func_select_by_uid_t(        //
  * @param blockno Block number to authenticate for (determines sector)
  * @return true if authentication successful, false on failure
  * @note For Ultralight/DESFire, returns true without performing Crypto1 auth
+ * @note ISO14443A: after a failure the card is out of the active state and must be selected
+ *       again before the next key. pn5180_t.iso14443_last_auth_status says why it failed:
+ *       PN5180_MIFARE_AUTH_REFUSED for a key the card turned down, PN5180_MIFARE_AUTH_NO_ANSWER
+ *       for a card that did not answer, PN5180_MIFARE_AUTH_NONE when nothing was sent (block
+ *       number or UID length the protocol does not know).
  */
 typedef bool pn5180_func_authenticate_t(         //
     struct _pn5180_proto_t *pn5180_proto, //
@@ -362,11 +384,13 @@ typedef enum
 /**
  * @brief Initialize SPI interface for PN5180
  * @param host_id SPI host device ID
- * @param sck SPI clock GPIO pin
- * @param miso SPI MISO GPIO pin
- * @param mosi SPI MOSI GPIO pin
+ * @param sck SPI clock GPIO pin, an output-capable GPIO
+ * @param miso SPI MISO GPIO pin, a GPIO
+ * @param mosi SPI MOSI GPIO pin, an output-capable GPIO
  * @param clock_speed_hz SPI clock speed in Hz; a value above PN5180_SPI_MAX_CLOCK_HZ is lowered to it
- * @return Pointer to initialized SPI structure, or NULL on failure
+ * @return Pointer to initialized SPI structure, or NULL on failure. A pin that is not a GPIO of
+ *         the chip (GPIO_NUM_NC among them), SCK or MOSI on an input-only GPIO, or a MISO pin
+ *         gpio_config() refuses returns NULL before the SPI host is touched.
  */
 pn5180_spi_t *pn5180_spi_init(spi_host_device_t host_id, gpio_num_t sck, gpio_num_t miso, gpio_num_t mosi, int clock_speed_hz);
 
@@ -402,12 +426,14 @@ void pn5180_spi_deinit(pn5180_spi_t *spi, bool free_spi_bus);
 /**
  * @brief Initialize PN5180 device
  * @param spi Pointer to initialized SPI structure
- * @param nss NSS (chip select) GPIO pin
- * @param busy BUSY GPIO pin for monitoring device state
- * @param rst RESET GPIO pin
+ * @param nss NSS (chip select) GPIO pin, an output-capable GPIO
+ * @param busy BUSY GPIO pin for monitoring device state, a GPIO
+ * @param rst RESET GPIO pin, an output-capable GPIO
  * @return Pointer to initialized PN5180 structure, or NULL on failure.
  *         On failure @p spi is left untouched and can be passed to pn5180_init() again
- *         or released with pn5180_spi_deinit().
+ *         or released with pn5180_spi_deinit(). A pin that is not a GPIO of the chip
+ *         (GPIO_NUM_NC among them), NSS or RST on an input-only GPIO, or a pin gpio_config()
+ *         refuses returns NULL before the PN5180 is accessed.
  */
 pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_num_t rst);
 
@@ -420,7 +446,8 @@ pn5180_t *pn5180_init(pn5180_spi_t *spi, gpio_num_t nss, gpio_num_t busy, gpio_n
  *
  * @param pn5180 Pointer to PN5180 device structure
  * @param irq GPIO connected to the PN5180 IRQ pin
- * @return true on success, false on failure (the driver keeps polling)
+ * @return true on success, false on failure (the driver keeps polling); false at once for a
+ *         NULL device or a pin that is not a GPIO of the chip, GPIO_NUM_NC among them
  */
 bool pn5180_irq_attach(pn5180_t *pn5180, gpio_num_t irq);
 
@@ -627,7 +654,12 @@ bool pn5180_lpcd_wait(pn5180_t *pn5180, int timeout_ms, uint32_t *irq_status);
  * @param key 6-byte authentication key
  * @param key_type Key type (PN5180_MIFARE_CLASSIC_KEYA or PN5180_MIFARE_CLASSIC_KEYB)
  * @param uid 4-byte card UID
- * @return 0x00 on success, error code otherwise
+ * @return The authentication status (PN5180 datasheet, table 26): PN5180_MIFARE_AUTH_OK,
+ *         PN5180_MIFARE_AUTH_REFUSED (also when the PN5180 reports success but Crypto1 is off),
+ *         PN5180_MIFARE_AUTH_NO_ANSWER, or another status byte the PN5180 sent. A negative value
+ *         when it gave none: PN5180_MIFARE_AUTH_NONE for a NULL argument or a key type other than
+ *         0x60 and 0x61, -3 when the SPI transfer failed, -4 when the result could not be checked.
+ *         The value is kept in pn5180->iso14443_last_auth_status.
  */
 int16_t pn5180_mifare_authenticate(pn5180_t *pn5180, uint8_t blockno, const uint8_t *key, uint8_t key_type, const uint8_t uid[4]);
 
@@ -711,7 +743,10 @@ pn5180_transceive_state_t pn5180_get_transceive_state(pn5180_t *pn5180);
 /**
  * @brief Delay execution for specified milliseconds
  *
- * Precise to well below a FreeRTOS tick: whole ticks are slept, the remainder is a busy wait.
+ * Precise to well below a FreeRTOS tick: whole ticks are slept, the remainder is a busy wait,
+ * which keeps the CPU for up to one tick. For a pause that need not be precise, such as the
+ * one between two polls, vTaskDelay() releases the CPU for the whole time. The driver's own
+ * waits sleep on the timer of the device instead and do not keep the CPU.
  *
  * @param ms Milliseconds to delay
  */
@@ -720,7 +755,7 @@ void pn5180_delay_ms(int ms);
 /**
  * @brief Delay execution for specified microseconds
  *
- * Whole FreeRTOS ticks are slept, the remainder is a busy wait.
+ * Whole FreeRTOS ticks are slept, the remainder is a busy wait (see pn5180_delay_ms()).
  *
  * @param us Microseconds to delay
  */

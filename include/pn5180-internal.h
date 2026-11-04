@@ -49,6 +49,20 @@ extern "C" {
 #define PN5180_TIMEOUT_15693_US             10000u /**< Inventory, Select, Read, Get System Info, Reset to Ready */
 #define PN5180_TIMEOUT_15693_WRITE_US       40000u /**< Write Single Block: the tag answers after programming (up to 20 ms) */
 
+/**
+ * Waits us microseconds with the CPU released: the calling task blocks on the poll timer of the
+ * device and wakes up when it expires, at most some tens of microseconds late and never early.
+ * Waits below about 0.2 ms, and a device without the timer, are left to pn5180_delay_us().
+ */
+void pn5180_sleep_us(pn5180_t *pn5180, uint32_t us);
+
+/**
+ * pn5180_14443_4_select_file() that also tells why it failed: *card_refused is true when the card
+ * answered with an error status word, false when no well-formed answer came back (the session was
+ * closed, or the answer has no status word). card_refused may be NULL.
+ */
+bool pn5180_14443_4_select_file_ex(pn5180_t *pn5180, const uint8_t *file_id, size_t file_id_len, bool *card_refused);
+
 #ifdef __cplusplus
 }
 #endif
