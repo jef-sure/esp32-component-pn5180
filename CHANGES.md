@@ -27,6 +27,7 @@ Documentation:
 
 Host tests: a Classic sector behind a factory trailer, read with one READ fewer; GPB `69h` behind the NFC key still read protected; a card that misses the authentication of the directory or of an NDEF sector once (read again) and twice (read error); an NDEF sector and a directory sector that turn down both keys; the authentication status after a refusal, a missing answer and a card type without authentication; Type 4 SELECT answers without a status word, and a card that refuses the NDEF application.
 
+## v 0.8.0 - 2026-11-02
 
 Brought over from the PN532 component (0.8.0, 0.8.1).
 
