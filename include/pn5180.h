@@ -203,7 +203,7 @@ typedef enum
     PN5180_POLL_FOUND = 0,        /**< At least one card was found; the UID array is returned */
     PN5180_POLL_NO_TARGET,        /**< No card answered */
     PN5180_POLL_TRANSPORT_ERROR,  /**< The PN5180 could not be driven (SPI failure, RF field did not come up) */
-    PN5180_POLL_PROTOCOL_ERROR,   /**< A card answered but anticollision or selection failed */
+    PN5180_POLL_PROTOCOL_ERROR,   /**< A card answered but anticollision or selection failed (ISO14443A only) */
     PN5180_POLL_NO_MEMORY,        /**< Memory allocation for the UID array failed */
     PN5180_POLL_INVALID_ARGUMENT  /**< NULL protocol or device pointer */
 } pn5180_poll_status_t;

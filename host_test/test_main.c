@@ -1990,7 +1990,9 @@ static void test_iso15693_block_write_and_read(void)
 #define SIM_V_FIELD_MAX_TAGS 64
 
 // Several tags in the field: more than one answering an inventory is a collision, as the reader
-// reports it.
+// reports it, unless one tag is at least twice as strong as each of the others: the receiver takes
+// a signal below half of the strongest one for none (PN5180 datasheet), and the strong tag's answer
+// arrives clean.
 typedef struct
 {
     sim_v_card_t tags[SIM_V_FIELD_MAX_TAGS];
@@ -2004,19 +2006,39 @@ static pn5180_rf_result_t sim_v_field(void *ctx, const uint8_t *tx, size_t tx_le
     sim_v_field_t     *field = ctx;
     uint8_t            answers[SIM_V_FIELD_MAX_TAGS][64];
     size_t             lens[SIM_V_FIELD_MAX_TAGS] = {0};
-    int                answered = 0;
-    int                last     = 0;
-    pn5180_rf_result_t result   = PN5180_RF_TIMEOUT;
+    pn5180_rf_result_t results[SIM_V_FIELD_MAX_TAGS];
+    int                answered  = 0;
+    int                last      = 0;
+    int                strongest = -1;
+    pn5180_rf_result_t result    = PN5180_RF_TIMEOUT;
     for (int i = 0; i < field->count; i++) {
-        pn5180_rf_result_t r = sim_v_card(&field->tags[i], tx, tx_len, tx_last_bits, answers[i], sizeof(answers[i]), &lens[i], timeout_us, NULL);
-        if (r != PN5180_RF_TIMEOUT) {
+        results[i] = sim_v_card(&field->tags[i], tx, tx_len, tx_last_bits, answers[i], sizeof(answers[i]), &lens[i], timeout_us, NULL);
+        if (results[i] != PN5180_RF_TIMEOUT) {
             answered++;
             last   = i;
-            result = r;
+            result = results[i];
+            if (strongest < 0 || field->tags[i].strength > field->tags[strongest].strength) {
+                strongest = i;
+            }
         }
     }
     if (answered == 0) {
         return PN5180_RF_TIMEOUT;
+    }
+    if (answered > 1) {
+        int  top     = (field->tags[strongest].strength > 0) ? field->tags[strongest].strength : 1;
+        bool drowned = true;
+        for (int i = 0; i < field->count; i++) {
+            int strength = (field->tags[i].strength > 0) ? field->tags[i].strength : 1;
+            if (i != strongest && results[i] != PN5180_RF_TIMEOUT && 2 * strength > top) {
+                drowned = false;
+            }
+        }
+        if (drowned) {
+            answered = 1;
+            last     = strongest;
+            result   = results[strongest];
+        }
     }
     size_t count = (lens[last] < rx_size) ? lens[last] : rx_size;
     if (rx != NULL) {
@@ -2171,6 +2193,312 @@ static void test_iso15693_block_number_range(void)
     TEST_ASSERT_EQUAL(frames, fake_frame_count());
 }
 
+/* ---- Sessions left open, lost frames, sizes the card does not tell ---- */
+
+static int field_a_index_of(const pn5180_uid_t *uid)
+{
+    for (int c = 0; c < s_field_a.count; c++) {
+        if (memcmp(uid->uid, s_field_a.cards[c].uid, (size_t)uid->uid_length) == 0) {
+            return c;
+        }
+    }
+    TEST_FAIL_MESSAGE("UID of no card in the field");
+    return -1;
+}
+
+// The caller selects a second ISO14443-4 card without halting the first. The first one, still in
+// its session, ignores WUPA and RATS but takes every I-block: unless the driver closes its session,
+// it answers the second card's APDUs as well and, being first in the field, drowns the right answer.
+static void test_select_closes_the_iso_dep_session_of_the_previous_card(void)
+{
+    uint8_t ndef_a[64];
+    uint8_t ndef_b[64];
+    size_t  len_a   = make_uri_message("https://example.org/a", ndef_a, sizeof(ndef_a));
+    size_t  len_b   = make_uri_message("https://example.org/b", ndef_b, sizeof(ndef_b));
+    s_field_a.count = 2;
+    sim_a_init_iso_dep(&s_field_a.cards[0], 0x20, 8);
+    sim_a_init_iso_dep(&s_field_a.cards[1], 0x20, 8);
+    s_field_a.cards[1].uid[1] ^= 0x01;
+    sim_a_iso_dep_store_ndef(&s_field_a.cards[0], ndef_a, len_a);
+    sim_a_iso_dep_store_ndef(&s_field_a.cards[1], ndef_b, len_b);
+    fake_set_card(sim_a_field, sim_a_auth, &s_field_a);
+    TEST_ASSERT_TRUE(s_proto_a->setup_rf(s_proto_a));
+
+    pn5180_uids_array_t *uids = s_proto_a->get_all_uids(s_proto_a);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(2, uids->uids_count);
+    pn5180_uid_t card_a = uids->uids[field_a_index_of(&uids->uids[0]) == 0 ? 0 : 1];
+    pn5180_uid_t card_b = uids->uids[field_a_index_of(&uids->uids[0]) == 0 ? 1 : 0];
+    free(uids);
+
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &card_a));
+    TEST_ASSERT_EQUAL(SIM_A_PROTOCOL, s_field_a.cards[0].state);
+
+    // No halt in between
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &card_b));
+    // Deselected, then woken by the WUPA for card B and dropped by its SELECT: out of its session
+    TEST_ASSERT_EQUAL(1, s_field_a.cards[0].deselect_count);
+    TEST_ASSERT_NOT_EQUAL(SIM_A_PROTOCOL, s_field_a.cards[0].state);
+    TEST_ASSERT_EQUAL(SIM_A_PROTOCOL, s_field_a.cards[1].state);
+
+    card_b.subtype                       = PN5180_MIFARE_DESFIRE;
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &card_b, &parsed));
+    assert_uri_message(parsed, "https://example.org/b");
+    pn5180_ndef_free_parsed_message(parsed);
+}
+
+// A poll with the field left on while an ISO14443-4 card is still in its session. The session is
+// closed first: otherwise the halt of the first card found would go to the other card as
+// S(DESELECT), and the card found would stay selected.
+static void test_poll_closes_the_iso_dep_session_left_open(void)
+{
+    s_field_a.count = 2;
+    sim_a_init_iso_dep(&s_field_a.cards[0], 0x20, 8);
+    sim_a_init_ultralight(&s_field_a.cards[1], false);
+    fake_set_card(sim_a_field, sim_a_auth, &s_field_a);
+    TEST_ASSERT_TRUE(s_proto_a->setup_rf(s_proto_a));
+
+    pn5180_uids_array_t *uids = s_proto_a->get_all_uids(s_proto_a);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(2, uids->uids_count);
+    pn5180_uid_t iso_dep = uids->uids[field_a_index_of(&uids->uids[0]) == 0 ? 0 : 1];
+    free(uids);
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &iso_dep));
+    TEST_ASSERT_TRUE(s_pn5180->iso14443_layer4_active);
+
+    // No other card answers: the session is closed all the same, a poll leaves no card selected.
+    s_field_a.cards[1].state    = SIM_A_HALT;
+    pn5180_poll_status_t status = PN5180_POLL_FOUND;
+    TEST_ASSERT_NULL(pn5180_14443_get_all_uids_ex(s_proto_a, &status));
+    TEST_ASSERT_EQUAL(PN5180_POLL_NO_TARGET, status);
+    TEST_ASSERT_FALSE(s_pn5180->iso14443_layer4_active);
+    TEST_ASSERT_EQUAL(1, s_field_a.cards[0].deselect_count);
+    TEST_ASSERT_EQUAL(SIM_A_HALT, s_field_a.cards[0].state);
+
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &iso_dep));
+    TEST_ASSERT_TRUE(s_pn5180->iso14443_layer4_active);
+    // The Ultralight has just come into the field.
+    s_field_a.cards[1].state = SIM_A_IDLE;
+
+    uids = pn5180_14443_get_all_uids_ex(s_proto_a, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(1, uids->uids_count);
+    TEST_ASSERT_EQUAL(1, field_a_index_of(&uids->uids[0]));
+    free(uids);
+    TEST_ASSERT_FALSE(s_pn5180->iso14443_layer4_active);
+    TEST_ASSERT_EQUAL(2, s_field_a.cards[0].deselect_count);
+    TEST_ASSERT_EQUAL(SIM_A_HALT, s_field_a.cards[1].state);
+}
+
+// One HLTA per poll is lost: the card stays selected, falls back to IDLE at the next REQA and
+// answers the one after. It is halted once more and the poll goes on to the other cards.
+static void test_poll_halts_a_card_again_after_a_lost_hlta(void)
+{
+    put_cards_into_field_a(3);
+    for (int poll = 0; poll < 9; poll++) {
+        for (int c = 0; c < 3; c++) {
+            s_field_a.cards[c].state = SIM_A_IDLE; // field off and on
+        }
+        s_field_a.cards[poll % 3].lost_hlta = 1;
+        TEST_ASSERT_TRUE(s_proto_a->setup_rf(s_proto_a));
+
+        pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+        pn5180_uids_array_t *uids   = pn5180_14443_get_all_uids_ex(s_proto_a, &status);
+        TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+        TEST_ASSERT_NOT_NULL(uids);
+        bool found[SIM_A_FIELD_MAX_CARDS] = {false};
+        mark_found_cards(uids, found);
+        TEST_ASSERT_EQUAL(3, uids->uids_count);
+        free(uids);
+        s_field_a.cards[poll % 3].lost_hlta = 0;
+    }
+}
+
+// An anticollision that fails leaves the card in READY; it would ignore the REQA of the next poll.
+static void test_failed_anticollision_leaves_the_card_ready_for_the_next_poll(void)
+{
+    sim_a_init_ntag213(&s_card_a);
+    s_card_a.damage_anticollision = 1;
+    fake_set_card(sim_a_card, sim_a_auth, &s_card_a);
+    TEST_ASSERT_TRUE(s_proto_a->setup_rf(s_proto_a));
+
+    pn5180_poll_status_t status = PN5180_POLL_FOUND;
+    TEST_ASSERT_NULL(pn5180_14443_get_all_uids_ex(s_proto_a, &status));
+    TEST_ASSERT_EQUAL(PN5180_POLL_PROTOCOL_ERROR, status);
+
+    pn5180_uids_array_t *uids = pn5180_14443_get_all_uids_ex(s_proto_a, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(1, uids->uids_count);
+    free(uids);
+}
+
+// SAK 0x28 with the ISO14443-4 side chosen: type detection after the select keeps that choice, so
+// the NDEF read takes the Type 4 path that the session is open for.
+static void test_detection_keeps_the_iso_dep_side_of_a_classic_emulation_card(void)
+{
+    uint8_t ndef[64];
+    size_t  ndef_len = make_uri_message("https://example.org/t4", ndef, sizeof(ndef));
+    sim_a_init_iso_dep(&s_card_a, 0x28, 8);
+    sim_a_iso_dep_store_ndef(&s_card_a, ndef, ndef_len);
+    pn5180_uid_t uid = activate_card_a();
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_CLASSIC_1K, uid.subtype);
+
+    s_proto_a->halt(s_proto_a);
+    uid.subtype = PN5180_MIFARE_DESFIRE;
+    TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    int blocks_count = 0;
+    int block_size   = 0;
+    if (s_proto_a->detect_card_type_and_capacity(s_pn5180, &uid, &blocks_count, &block_size)) {
+        TEST_ASSERT_TRUE(s_proto_a->select_by_uid(s_proto_a, &uid));
+    }
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_DESFIRE, uid.subtype);
+    TEST_ASSERT_TRUE(s_pn5180->iso14443_layer4_active);
+
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, "https://example.org/t4");
+    pn5180_ndef_free_parsed_message(parsed);
+}
+
+// FWI 15 is reserved and stands for the default 4, not for the longest waiting time.
+static void test_reserved_fwi_is_read_as_the_default(void)
+{
+    sim_a_init_iso_dep(&s_card_a, 0x20, 8);
+    s_card_a.ats_tb1 = 0xF0; // FWI 15, SFGI 0
+    activate_card_a();
+    TEST_ASSERT_TRUE(s_pn5180->iso14443_layer4_active);
+    TEST_ASSERT_EQUAL(9, s_pn5180->iso14443_fwt_ms); // FWI 4: 302 us * 16 plus 3.6 ms, rounded up
+}
+
+// NTAG203 has no GET_VERSION and is detected as Ultralight. That name is a guess, not a size: the
+// capability container tells how large the data area is.
+static void test_type2_without_get_version_takes_its_size_from_the_capability_container(void)
+{
+    sim_a_init_ntag203(&s_card_a);
+    pn5180_uid_t uid = activate_card_a();
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_ULTRALIGHT, uid.subtype);
+
+    // About 90 bytes: more than the 48 of an Ultralight, less than the 144 of the data area
+    const char *uri = "https://example.org/a-message-longer-than-the-forty-eight-bytes-of-an-ultralight-x";
+    uint8_t     payload[128];
+    pn5180_ndef_record_t  record;
+    pn5180_ndef_record_t  records[1];
+    pn5180_ndef_message_t message;
+    TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&record, uri, true, payload, sizeof(payload)));
+    pn5180_ndef_message_init(&message, records, 1);
+    TEST_ASSERT_TRUE(pn5180_ndef_message_add(&message, &record));
+    TEST_ASSERT_TRUE(pn5180_ndef_encode_message(&message, NULL, 0) > 48);
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_write_card_auto(s_proto_a, &uid, &message));
+
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_OK, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    assert_uri_message(parsed, uri);
+    pn5180_ndef_free_parsed_message(parsed);
+}
+
+// A GET_VERSION answer that arrives damaged is not taken for "no GET_VERSION": it is asked again.
+static void test_damaged_get_version_answer_is_asked_again(void)
+{
+    sim_a_init_ntag215(&s_card_a);
+    s_card_a.damage_get_version = 1;
+    pn5180_uid_t uid = activate_card_a();
+    TEST_ASSERT_EQUAL(PN5180_MIFARE_NTAG215, uid.subtype);
+    TEST_ASSERT_EQUAL(135, uid.blocks_count);
+}
+
+// A field that dropped while the RF configuration stayed loaded: setup_rf() switches it on again,
+// and reports a failure when it cannot, instead of leaving the poll to find nothing.
+static void test_setup_checks_that_the_field_is_really_on(void)
+{
+    sim_a_init_ntag213(&s_card_a);
+    fake_set_card(sim_a_card, sim_a_auth, &s_card_a);
+    TEST_ASSERT_TRUE(s_proto_a->setup_rf(s_proto_a));
+
+    fake_drop_field(false);
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_14443_get_all_uids_ex(s_proto_a, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    free(uids);
+
+    fake_drop_field(true);
+    TEST_ASSERT_NULL(pn5180_14443_get_all_uids_ex(s_proto_a, &status));
+    TEST_ASSERT_EQUAL(PN5180_POLL_TRANSPORT_ERROR, status);
+
+    sim_v_init(&s_card_v);
+    fake_set_card(sim_v_card, NULL, &s_card_v);
+    fake_drop_field(false);
+    TEST_ASSERT_TRUE(s_proto_v->setup_rf(s_proto_v));
+    fake_drop_field(true);
+    TEST_ASSERT_NULL(pn5180_15693_get_all_uids_ex(s_proto_v, &status));
+    TEST_ASSERT_EQUAL(PN5180_POLL_TRANSPORT_ERROR, status);
+}
+
+// A MIFARE Classic NDEF TLV longer than the sectors the directory lists is inconsistent, as on
+// Type 2 and Type 5 tags: PARSE_FAILED, not "no NDEF".
+static void test_classic_ndef_longer_than_its_sectors_is_a_parse_error(void)
+{
+    uint8_t ndef[64];
+    size_t  ndef_len = make_uri_message("https://example.org/c", ndef, sizeof(ndef));
+    sim_a_init_classic_1k(&s_card_a);
+    sim_a_classic_store_ndef(&s_card_a, ndef, ndef_len);
+    s_card_a.memory[4 * 16 + 1] = 200; // TLV length; the directory lists one sector of 48 bytes
+    pn5180_uid_t uid = activate_card_a();
+
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_PARSE_FAILED, pn5180_ndef_read_card_auto(s_proto_a, &uid, &parsed));
+    TEST_ASSERT_NULL(parsed);
+}
+
+// A weaker tag hidden by a stronger one under every mask: the inventory asks the whole field again
+// once the stronger one is quiet.
+static void test_iso15693_inventory_finds_a_tag_behind_a_stronger_one(void)
+{
+    s_field_v.count = 2;
+    sim_v_init(&s_field_v.tags[0]);
+    sim_v_init(&s_field_v.tags[1]);
+    s_field_v.tags[1].uid[0] ^= 0x01;
+    s_field_v.tags[0].strength = 3;
+    s_field_v.tags[1].strength = 1;
+    s_field_v.damage_inventory = false;
+    fake_set_card(sim_v_field, NULL, &s_field_v);
+    TEST_ASSERT_TRUE(s_proto_v->setup_rf(s_proto_v));
+
+    pn5180_poll_status_t status = PN5180_POLL_NO_TARGET;
+    pn5180_uids_array_t *uids   = pn5180_15693_get_all_uids_ex(s_proto_v, &status);
+    TEST_ASSERT_EQUAL(PN5180_POLL_FOUND, status);
+    TEST_ASSERT_NOT_NULL(uids);
+    TEST_ASSERT_EQUAL(2, uids->uids_count);
+    free(uids);
+}
+
+// The size query of the encoder needs no buffer, whatever out_len says.
+static void test_ndef_encode_size_query_ignores_out_len(void)
+{
+    pn5180_ndef_record_t  record;
+    pn5180_ndef_record_t  records[1];
+    pn5180_ndef_message_t message;
+    uint8_t               payload[64];
+    TEST_ASSERT_TRUE(pn5180_ndef_make_uri_record(&record, "https://example.org", true, payload, sizeof(payload)));
+    pn5180_ndef_message_init(&message, records, 1);
+    TEST_ASSERT_TRUE(pn5180_ndef_message_add(&message, &record));
+    size_t required = pn5180_ndef_encode_message(&message, NULL, 0);
+    TEST_ASSERT_TRUE(required > 0);
+    TEST_ASSERT_EQUAL(required, pn5180_ndef_encode_message(&message, NULL, 100));
+}
+
+// An Empty record has no payload, also not one assembled from chunks.
+static void test_ndef_chunked_empty_record_is_refused(void)
+{
+    // MB CF SR, TNF Empty, no payload; then ME SR, TNF Unchanged, payload "hi"
+    const uint8_t raw[] = {0xB0, 0x00, 0x00, 0x56, 0x00, 0x02, 'h', 'i'};
+    pn5180_ndef_message_parsed_t *parsed = NULL;
+    TEST_ASSERT_EQUAL(PN5180_NDEF_ERR_PARSE_FAILED, pn5180_ndef_parse_message(raw, sizeof(raw), &parsed));
+    TEST_ASSERT_NULL(parsed);
+}
+
 static void test_ndef_message_add_without_storage(void)
 {
     pn5180_ndef_message_t msg;
@@ -2252,6 +2580,19 @@ int main(void)
     RUN_TEST(test_iso15693_inventory_finds_many_tags);
     RUN_TEST(test_iso15693_inventory_stops_at_the_frame_limit_and_the_next_finds_the_rest);
     RUN_TEST(test_iso15693_block_number_range);
+    RUN_TEST(test_select_closes_the_iso_dep_session_of_the_previous_card);
+    RUN_TEST(test_poll_closes_the_iso_dep_session_left_open);
+    RUN_TEST(test_poll_halts_a_card_again_after_a_lost_hlta);
+    RUN_TEST(test_failed_anticollision_leaves_the_card_ready_for_the_next_poll);
+    RUN_TEST(test_detection_keeps_the_iso_dep_side_of_a_classic_emulation_card);
+    RUN_TEST(test_reserved_fwi_is_read_as_the_default);
+    RUN_TEST(test_type2_without_get_version_takes_its_size_from_the_capability_container);
+    RUN_TEST(test_damaged_get_version_answer_is_asked_again);
+    RUN_TEST(test_setup_checks_that_the_field_is_really_on);
+    RUN_TEST(test_classic_ndef_longer_than_its_sectors_is_a_parse_error);
+    RUN_TEST(test_iso15693_inventory_finds_a_tag_behind_a_stronger_one);
+    RUN_TEST(test_ndef_encode_size_query_ignores_out_len);
+    RUN_TEST(test_ndef_chunked_empty_record_is_refused);
     RUN_TEST(test_ndef_message_add_without_storage);
     return UNITY_END();
 }

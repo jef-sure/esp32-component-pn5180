@@ -14,8 +14,12 @@ extern "C" {
  * @param data_len Length of input buffer in bytes
  * @param search_pos In/out position for continuing a scan across chunks
  * @param ndef_offset Out: offset to NDEF value field within data
- * @param ndef_length Out: length of NDEF value field
- * @return true if an NDEF TLV was found and offsets are valid
+ * @param ndef_length Out: length of NDEF value field, as the TLV declares it
+ * @return true if the type and length of an NDEF TLV were found. The value may still run past
+ *         the end of data (ndef_offset + ndef_length > data_len) when data holds only the first
+ *         part of the tag's memory: check that before reading the value, or read more data and
+ *         call again. false if there is no complete NDEF TLV header (yet), or a Terminator TLV
+ *         came first; *search_pos then points at the TLV where the search stopped.
  */
 bool pn5180_ndef_tlv_find_ndef(        //
     const uint8_t *data,        //

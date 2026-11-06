@@ -1,5 +1,39 @@
 # Changelog
 
+## v 0.8.2 - 2026-11-06
+
+Fixes from a review of 0.8.1.
+
+Fixes:
+
+- **ISO14443-4: a card left in its session no longer answers for the next one.** `select_by_uid()` dropped the session state without telling the card. A card in its ISO14443-4 session ignores WUPA, the anticollision and RATS, but answers every I-block whatever its block number (ISO/IEC 14443-4), so after a second card was selected without `halt()` in between, both answered its APDUs: the NDEF read of the second card could return the message of the first under the second UID, or fail where the answers collided. A poll with the field left on sent the halt of the first card it found to the old card as S(DESELECT), left the new card selected and ended early. `select_by_uid()` and the ISO14443A poll now close such a session with S(DESELECT) before they send anything else. `examples/app_logic` read the cards of a poll one after the other without `halt()`; it now halts each one.
+- **Build: a component that requires pn5180 compiles with ESP-IDF 6.** `pn5180.h` includes `driver/gpio.h` and `driver/spi_master.h`, but `esp_driver_gpio` and `esp_driver_spi` were private requirements, and since ESP-IDF 6.0 `driver` no longer passes them on: a component with `REQUIRES pn5180` failed with `driver/gpio.h: No such file or directory`. The examples name those components themselves, which hid it. They are public requirements now (ESP-IDF 5.3 and later); `driver` stays one too.
+- **Type 2: a tag without GET_VERSION gets the data area its capability container declares.** Such a tag is detected as Ultralight, and the NDEF functions took that for a size of 16 pages: an NTAG203 (144 bytes) read a message above 48 bytes as `PN5180_NDEF_ERR_PARSE_FAILED` and refused to write one with `PN5180_NDEF_ERR_CARD_FULL`. The Ultralight subtype is a guess, so the capability container alone bounds the data area now, as in the PN532 component. A GET_VERSION answer that arrives damaged (anything but no answer or a NAK) is asked for once more, instead of taking an NTAG for an Ultralight.
+- **ISO15693: a tag behind a stronger one is found.** The receiver takes an answer under half as strong as another one for no signal (PN5180 datasheet), so the stronger tag's answer arrived clean, the inventory took it for the only tag under that mask and never asked the field again: with the field reset before each poll the weaker tag never appeared. A pass that found tags is now followed by one more inventory of the whole field, which costs one frame when no tag is left.
+- **ISO14443A: one lost HLTA no longer ends the poll.** A card that answered again after its HLTA ended the scan, and the cards not found yet were missed. It is halted once more and the poll goes on; a second repeat ends it, so a card that ignores HLTA still cannot keep the poll going.
+- **ISO14443A: a failed anticollision leaves no card half-selected.** The cards stayed in the middle of the anticollision and ignored the REQA of the next poll, which reported `PN5180_POLL_NO_TARGET` with the field left on. They are sent back to IDLE with HLTA, as when a poll stops at `max_cards`.
+- **Cards with MIFARE Classic emulation (SAK `28h`, `38h`): the ISO14443-4 side the caller chose survives type detection.** `detect_card_type_and_capacity()` set the subtype back to Classic after the card had been activated as `PN5180_MIFARE_DESFIRE`, so `pn5180_ndef_read_card_auto()`, called as in the Quick Start, sent MIFARE commands into the ISO14443-4 session and failed.
+- **`setup_rf()` checks that the field is really on.** Since 0.6.0 `pn5180_set_rf_on()` does not take the cached flag on trust, but `setup_rf()` of both protocols returned early on that flag when the right RF configuration was loaded: a field that had dropped showed up as `PN5180_POLL_NO_TARGET`. Now the field is switched on again, and the poll reports `PN5180_POLL_TRANSPORT_ERROR` when it cannot be. It costs one register read per call.
+- **ISO14443-4: FWI 15 is read as 4.** The reserved value was taken as 14, the longest frame waiting time, so each lost frame cost about 5 s. ISO/IEC 14443-4 and the NXP reader library read it as the default 4, as the driver already did with SFGI 15.
+- **ISO15693: a failed allocation is `PN5180_POLL_NO_MEMORY`.** The UID was dropped silently and the tag silenced, so it was lost for the poll. The inventory now stops there, leaves the tag unsilenced and reports `PN5180_POLL_NO_MEMORY` if it found nothing.
+- **ISO15693: the inventory needs 0.8 KB of stack instead of 1.7 KB.** An entry of its search stack took 24 bytes and now takes 10.
+- **NDEF: `pn5180_ndef_encode_message(msg, NULL, n)` returns the size for any `n`**, as the header says; it returned 0 for an `n` above 0.
+- **NDEF: a chunked Empty record is refused.** Its chunks gave a record of type Empty a payload, which it must not have.
+- **MIFARE Classic: an NDEF TLV longer than the sectors the directory lists is `PN5180_NDEF_ERR_PARSE_FAILED`**, as on Type 2 and Type 5 tags; it was `PN5180_NDEF_ERR_NO_NDEF`.
+- Examples: the ISO14443A protocol object is freed when the ISO15693 one cannot be created.
+
+Documentation:
+
+- README "Task stack": the driver's frames measured with `-fstack-usage`, about 1.5 KB on the deepest paths; the figure of about 800 bytes was counted from buffer sizes and left out the ISO15693 inventory.
+- `pn5180-15693.h`, `pn5180.h`, README: which statuses the ISO15693 poll reports; there is no `PN5180_POLL_PROTOCOL_ERROR`, because the PN5180 reports noise the way it reports damaged answers.
+- README: sessions that `select_by_uid()` and `get_all_uids()` close, tags without GET_VERSION, the repeated inventory, and that an ISO15693 tag brought back to Ready by `select_by_uid()` and `halt()` is counted again by the next poll.
+- `pn5180-ndef-tlv.h`: `pn5180_ndef_tlv_find_ndef()` returns true once type and length of the NDEF TLV are found; the value may run past the end of the buffer.
+- README "Read NDEF": how much memory a read takes; the driver sets no limit of its own, and a 32 KB Type 4 message of the smallest records takes about 320 KB at the peak.
+
+Host tests of the reader layer: `src/pn5180.c` had none, because the protocol tests replace it. A second program runs it against stand-ins of the ESP-IDF SPI master, GPIO, esp_timer and semaphores, with a model of the PN5180 host interface behind them: SPI framing and BUSY, boot, firmware and pin checks, the field and RF collision avoidance, the results of `pn5180_rf_transceive()` for each receiver status, the Timer1 reload values, MIFARE authentication, recovery, EEPROM writes, the IRQ pin and the length of the driver's waits (29 tests).
+
+Host tests of the protocol code: a second ISO14443-4 card selected without halting the first, a poll with an ISO14443-4 session left open, a lost HLTA, a failed anticollision, the ISO14443-4 side of a SAK `28h` card through type detection, FWI 15, an NTAG203, a damaged GET_VERSION answer, a field that dropped, a Classic NDEF TLV longer than its sectors, an ISO15693 tag behind a stronger one, the size query of the encoder and a chunked Empty record. The simulated ISO14443-4 card ignores everything but valid blocks while in its session, as the standard asks, and the fake field can drop.
+
 ## v 0.8.1 - 2026-11-04
 
 Brought over from the PN532 component (0.8.2 and the fixes after it).

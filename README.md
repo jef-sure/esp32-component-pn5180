@@ -180,6 +180,8 @@ A read that fails is repeated once after the card was selected again, because se
 
 MIFARE Classic, step by step: the directory sector is opened with the MAD key `A0 A1 A2 A3 A4 A5` or the default key `FF FF FF FF FF FF`, the NDEF sectors with the NFC key `D3 F7 D3 F7 D3 F7` or the default key. A card that turns down both keys of the directory sector has no public MAD: `PN5180_NDEF_ERR_NO_NDEF`. The general purpose byte of the first NDEF sector (mapping version and read access) is checked when the NFC key opened it; a sector that only the default key opens was never NFC formatted and keeps the factory byte `69h`, which says nothing about NDEF, so it is read without that check.
 
+Memory: the message is read from the tag into one heap buffer and parsed into one block, which `pn5180_ndef_free_parsed_message()` releases; it holds the message once more and a `pn5180_ndef_record_t` (24 bytes on the ESP32) for every record. The tag decides how large that is, and the driver sets no limit of its own. The worst case is a Type 4 card or a phone acting as one: up to 32 KB of message, and 32 KB of the smallest possible records (3 bytes each) take about 320 KB at the peak. Without PSRAM such an allocation fails and the read returns `PN5180_NDEF_ERR_NO_MEMORY`; with PSRAM and `CONFIG_SPIRAM_USE_MALLOC` it succeeds and stays allocated until the message is freed. A Type 2 tag holds at most about 900 bytes, an ISO15693 tag usually a few KB.
+
 ### Write a URI to an NTAG
 
 ```c
@@ -232,14 +234,16 @@ default:
 
 `get_all_uids()` is the same poll without the status. Cards are returned ordered as found, which for ISO14443A changes from poll to poll; ISO15693 tags are sorted by signal strength (`agc`).
 
+The ISO15693 poll has no `PN5180_POLL_PROTOCOL_ERROR`: answers that arrive damaged or collide and cannot be resolved give `PN5180_POLL_NO_TARGET`, because the PN5180 reports noise in the same way and such an answer does not prove that a tag is there.
+
 ### Several cards in the field
 
 Neither protocol limits the number of cards, the driver does, so that a misbehaving card cannot keep a poll going. A poll that stops at its limit logs a warning and still returns `PN5180_POLL_FOUND` with the cards it has:
 
-- ISO14443A: `max_cards` of `pn5180_14443_init()`, 14 if it is 0. The warning appears only when one more card did answer.
-- ISO15693: 192 inventory frames, which is enough for about 50 tags with unrelated UIDs. Tags that differ only in the last UID bits take more frames each.
+- ISO14443A: `max_cards` of `pn5180_14443_init()`, 14 if it is 0. The warning appears only when one more card did answer. A card that answers again after its HLTA (the frame got lost) is halted once more; a second such repeat ends the poll.
+- ISO15693: 192 inventory frames, which is enough for about 50 tags with unrelated UIDs. Tags that differ only in the last UID bits take more frames each. A pass that found tags is followed by one more inventory of the whole field: the receiver takes an answer under half as strong as another one for no signal (PN5180 datasheet), so a tag far from the antenna turns up only once the nearer tags are quiet.
 
-With the field left on, the next poll finds the cards that were left out. After a field reset all cards answer again: ISO14443A settles collisions at random, so over several polls every card turns up, though not equally often, and ISO15693 finds the same tags again.
+With the field left on, the next poll finds the cards that were left out. For ISO15693 that holds while the tags found stay quiet: `select_by_uid()` and `halt()` bring a tag back to Ready, and the next poll counts it again, which matters only when more tags are in the field than one poll takes. After a field reset all cards answer again: ISO14443A settles collisions at random, so over several polls every card turns up, though not equally often, and ISO15693 finds the same tags again.
 
 ### Read MIFARE Classic blocks
 
@@ -340,7 +344,7 @@ A PN5180 command is two SPI transfers, each framed by NSS. The driver holds the 
 - **`PN5180 ... timeout waiting for busy level`** — the BUSY line does not follow the SPI transfers: wrong BUSY pin, or NSS not reaching the module.
 - **No cards found, `PN5180_POLL_NO_TARGET`** — check that the field comes up (`setup_rf()` returns true) and that the antenna is not on a metal surface. A card that was halted by the previous scan answers again only after the field was off for at least 5.1 ms (`PN5180_RF_OFF_TIME_US`); 5 ms is too short.
 - **`RF_ON blocked by external RF field (RFCA)`** — another reader's field is present. Two readers of your own should take turns with the field (see [Ownership and lifetime](#ownership-and-lifetime)); `pn5180_set_rfca(pn5180, false)` switches the field on regardless.
-- **`select_by_uid()` fails on a card that was just read** — the card is still selected and ignores the wake-up. Call `halt()` first, then `select_by_uid()`.
+- **`select_by_uid()` fails on a card that was just read** — the card is still selected and ignores the wake-up. Call `halt()` first, then `select_by_uid()`. A card still in its ISO14443-4 session is released by `select_by_uid()` itself.
 - **Reads fail after one refused command** — Ultralight and NTAG cards leave the selected state after any NAK (for example a read beyond the last page), MIFARE Classic after a refused authentication. Select the card again.
 - **`PN5180_NDEF_ERR_NO_NDEF` on a MIFARE Classic card** — the card has no NFC Forum MAD, the MAD has a wrong CRC, the directory sector turns down both the MAD key and the default key, or its NDEF sectors are not contiguous. Read raw blocks with your own keys instead.
 - **`PN5180_NDEF_ERR_ACCESS_DENIED` on a MIFARE Classic card** — an NDEF sector the directory lists turns down both the NFC key and the default key, or the first NDEF sector opens with the NFC key and its general purpose byte denies reading.
@@ -412,11 +416,11 @@ Requirements: ESP-IDF 5.0.4 or later (`spi_bus_get_max_transaction_len()` appear
 1. `setup_rf()` loads the protocol's RF configuration and switches the field on.
 2. `get_all_uids()` enumerates the cards. Each ISO14443A card found is halted, each ISO15693 tag silenced, so that the next ones can answer; none is left selected.
 3. `select_by_uid()` wakes one card up and selects it. For an ISO14443-4 card this includes the activation (RATS).
-4. `detect_card_type_and_capacity()` fills `subtype`, `block_size` and `blocks_count` of the `pn5180_uid_t`. It returns true when the card has to be selected again afterwards, which is the case for the Ultralight family.
+4. `detect_card_type_and_capacity()` fills `subtype`, `block_size` and `blocks_count` of the `pn5180_uid_t`. It returns true when the card has to be selected again afterwards, which is the case for the Ultralight family. A tag that does not answer GET_VERSION (the original Ultralight, NTAG203) is reported as `PN5180_MIFARE_ULTRALIGHT` with 16 pages; that is a guess, so the NDEF functions take the size of its data area from the capability container alone. A GET_VERSION answer that arrives damaged is asked for once more.
 5. Block access, authentication, NDEF and APDU functions work on the selected card.
 6. `halt()` ends the session: HLTA for ISO14443-3 cards, S(DESELECT) for ISO14443-4 cards, Reset to Ready for ISO15693 tags. A halted ISO14443A card is found again by `select_by_uid()`, but by `get_all_uids()` only after the field was switched off.
 
-A selected ISO14443A card does not answer a new `select_by_uid()`: call `halt()` first.
+A selected ISO14443A card does not answer a new `select_by_uid()`: call `halt()` first. A card left in its ISO14443-4 session is the exception, and a dangerous one: it ignores the wake-up and the activation of the next card, but answers every I-block, also those meant for that card. `select_by_uid()` and `get_all_uids()` therefore close such a session themselves with S(DESELECT) before they send anything else.
 
 ### Targets with a random UID
 
@@ -444,7 +448,7 @@ if (proto->select_by_uid(proto, &card)) {
 }
 ```
 
-With that subtype `pn5180_ndef_read_card_auto()` also takes the Type 4 path. To switch sides on a selected card, call `halt()` and `select_by_uid()` with the other subtype.
+With that subtype `detect_card_type_and_capacity()` keeps it, and `pn5180_ndef_read_card_auto()` takes the Type 4 path. To switch sides on a selected card, call `halt()` and `select_by_uid()` with the other subtype.
 
 ### APDU utilities
 
@@ -475,7 +479,14 @@ Include `pn5180-mifare.h` for raw block and value operations on the selected car
 
 ### Task stack
 
-The SPI buffers live in `pn5180_t`, but the protocol code keeps frame buffers on the stack. Counted by buffer sizes, the deepest path — an ISO14443-4 exchange inside a Type 4 NDEF read — holds about 800 bytes of driver locals at once (the READ BINARY buffer plus the block buffers of `pn5180_14443_4_transceive()`); a refused MIFARE Classic authentication uses a 512-byte buffer to drain the receiver, and selecting an ISO14443-4 card about 300 bytes for the ATS. Logging and the SPI driver add their own share. Size the stack of the task that calls the driver with that in mind; the figures are not measured high-water marks.
+The SPI buffers live in `pn5180_t`, but the protocol code keeps frame buffers on the stack. Measured with GCC's `-fstack-usage` and call graph on an ESP32 (ESP-IDF 5.5, `-Og`, the default of a new project), the frames of the driver add up to about 1.5 KB on its deepest paths:
+
+- a MIFARE Classic NDEF read, about 1.5 KB: the authentication keeps a 512-byte buffer to drain the receiver after a refusal;
+- an ISO15693 poll, about 1.5 KB: the inventory keeps its search stack, 0.8 KB, in one frame;
+- a Type 4 NDEF read, about 1.4 KB: the READ BINARY buffer and the block buffers of `pn5180_14443_4_transceive()`;
+- selecting an ISO14443-4 card, about 0.9 KB with the ATS buffer; an ISO14443A poll, about 0.8 KB.
+
+The ESP-IDF SPI driver, logging and the calling code come on top. Size the stack of the task that calls the driver with that in mind; the figures are the driver's frames, not a high-water mark of a running task.
 
 ### Ownership and lifetime
 
@@ -490,7 +501,7 @@ The SPI buffers live in `pn5180_t`, but the protocol code keeps frame buffers on
 
 ### Host tests
 
-The tests are in the [GitHub repository](https://github.com/jef-sure/esp32-component-pn5180), not in the component archive. `host_test/` builds the protocol code for the host together with simulated cards (NTAG, Ultralight C, MIFARE Classic, an ISO14443-4 card with a Type 4 application, an ISO15693 tag) and runs it under AddressSanitizer:
+The tests are in the [GitHub repository](https://github.com/jef-sure/esp32-component-pn5180), not in the component archive. `host_test/` builds two programs for the host and runs them under AddressSanitizer: the protocol code together with simulated cards (NTAG, Ultralight C, MIFARE Classic, an ISO14443-4 card with a Type 4 application, an ISO15693 tag), and the reader layer `src/pn5180.c` against stand-ins of the ESP-IDF SPI master, GPIO, esp_timer and semaphores, with a model of the PN5180 host interface behind them (`host_test/chip_sim.c`: commands, BUSY, registers, EEPROM, the field):
 
 ```sh
 make -C host_test test IDF_PATH=<path to esp-idf>
@@ -498,7 +509,7 @@ make -C host_test test IDF_PATH=<path to esp-idf>
 
 The Unity sources come from the ESP-IDF checkout, or from a plain Unity checkout with `UNITY_DIR=<path to Unity/src>`. The GitHub workflow in [`.github/workflows/host-test.yml`](.github/workflows/host-test.yml) runs the tests on every push and pull request.
 
-The tests cover polling (also of fields with many cards), selection, card identification, NDEF reading for all four mappings and writing for Type 2 and Type 5, ISO14443-4 chaining and recovery from lost frames, MIFARE value operations, and misbehaving cards (one that ignores HLTA, one that answers with empty chained blocks, a MIFARE Classic card that misses authentications, a Type 4 card whose SELECT answers lack the status word). They do not cover the SPI layer and RF timing, which need the hardware.
+The tests cover polling (also of fields with many cards), selection, card identification, NDEF reading for all four mappings and writing for Type 2 and Type 5, ISO14443-4 chaining and recovery from lost frames, MIFARE value operations, and misbehaving cards (one that ignores HLTA, one that answers with empty chained blocks, a MIFARE Classic card that misses authentications, a Type 4 card whose SELECT answers lack the status word). For the reader layer they cover the SPI framing and the BUSY handshake, boot and firmware checks, pin checks, the field and RF collision avoidance, how `pn5180_rf_transceive()` maps the receiver status to its results, the Timer1 values of the receive timeout, the MIFARE authentication status, recovery, EEPROM writes, the IRQ pin and the timing of the driver's waits. The model behaves as the datasheet describes the PN5180; real RF timing and real cards still need the hardware.
 
 ### API map
 

@@ -113,6 +113,7 @@ void app_main(void) {
       pn5180_15693_init(pn5180, PN5180_15693_26KASK100);
   if (proto_15693 == NULL) {
     ESP_LOGE(TAG, "Failed to initialize ISO15693 protocol");
+    free(proto_14443);
     pn5180_deinit(pn5180, true);
     return;
   }

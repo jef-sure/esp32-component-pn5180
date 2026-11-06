@@ -41,12 +41,15 @@ typedef struct
     uint8_t       atqa[2];
     int           cascade_done; /**< cascade levels selected so far */
     bool          ignores_hlta; /**< misbehaving card: goes back to IDLE instead of HALT */
+    int           lost_hlta;    /**< the next N HLTA frames do not reach the card: it stays selected */
+    int           damage_anticollision; /**< the next N anticollision answers arrive with a wrong BCC */
 
     /* Type 2 */
     uint8_t memory[1024];    /**< pages of 4 bytes */
     int     page_count;      /**< pages that READ decodes */
     bool    has_get_version; /**< answers GET_VERSION (EV1 / NTAG) */
     uint8_t version[8];      /**< GET_VERSION answer */
+    int     damage_get_version; /**< the next N GET_VERSION answers arrive with a CRC error */
     bool    is_ultralight_c; /**< answers AUTHENTICATE 1Ah with a challenge */
     bool    compat_write_pending;
     uint8_t compat_write_page;
@@ -65,6 +68,7 @@ typedef struct
 
     /* ISO14443-4 */
     uint8_t ats_fsci;     /**< frame size the card announces */
+    uint8_t ats_tb1;      /**< TB1 of the ATS (FWI, SFGI); 0 for the default 81h */
     size_t  picc_max_inf; /**< INF bytes per block the card sends */
     uint8_t block_number;
     uint8_t last_tx[300]; /**< last block sent, for retransmission */
@@ -95,6 +99,10 @@ typedef struct
 } sim_a_card_t;
 
 void sim_a_init_ntag213(sim_a_card_t *card);
+/** NTAG215: 135 pages, 496 bytes of data area. */
+void sim_a_init_ntag215(sim_a_card_t *card);
+/** NTAG203: 42 pages, 144 bytes of data area, no GET_VERSION. */
+void sim_a_init_ntag203(sim_a_card_t *card);
 void sim_a_init_ultralight(sim_a_card_t *card, bool ultralight_c);
 void sim_a_init_classic_1k(sim_a_card_t *card);
 void sim_a_init_iso_dep(sim_a_card_t *card, uint8_t sak, uint8_t ats_fsci);
@@ -135,6 +143,7 @@ typedef struct
     bool    quiet;
     bool    selected;
     bool    supports_reset_to_ready;
+    int     strength; /**< signal strength at the reader relative to other tags, 0 counts as 1 */
 } sim_v_card_t;
 
 void               sim_v_init(sim_v_card_t *card);

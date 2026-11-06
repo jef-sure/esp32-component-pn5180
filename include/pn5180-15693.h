@@ -23,6 +23,13 @@ pn5180_proto_t *pn5180_15693_init(pn5180_t *pn5180, pn5180_15693_rf_config_t rf_
 
 /**
  * @brief Poll for ISO15693 tags and report why nothing was returned
+ *
+ * The status is PN5180_POLL_FOUND, PN5180_POLL_NO_TARGET, PN5180_POLL_TRANSPORT_ERROR (the field
+ * did not come up, or an SPI exchange failed), PN5180_POLL_NO_MEMORY (the UID array could not be
+ * allocated) or PN5180_POLL_INVALID_ARGUMENT. There is no PN5180_POLL_PROTOCOL_ERROR: answers that
+ * arrive damaged or collide without being resolved count as no target, because the PN5180 reports
+ * noise in the same way.
+ *
  * @param proto Protocol interface from pn5180_15693_init()
  * @param status Out: outcome of the poll (may be NULL)
  * @return Heap-allocated UID array for PN5180_POLL_FOUND (caller must free), otherwise NULL

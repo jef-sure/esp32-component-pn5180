@@ -143,7 +143,7 @@ static uint8_t pn5180_ndef_build_header_byte(const pn5180_ndef_record_t *rec, bo
 
 size_t pn5180_ndef_encode_message(const pn5180_ndef_message_t *msg, uint8_t *out, size_t out_len)
 {
-    if (!msg || (!out && out_len > 0)) return 0;
+    if (!msg) return 0;
     size_t required = 0;
     for (size_t i = 0; i < msg->record_count; ++i) {
         size_t record_size = 0;
@@ -397,7 +397,8 @@ static bool ndef_plan_decode(const uint8_t *data, size_t data_len, ndef_decode_p
                 return false;
             }
             if (cf) {
-                if (me) {
+                // The chunks of an Empty record would give it a payload, which it must not have.
+                if (me || physical.tnf == PN5180_NDEF_TNF_EMPTY) {
                     return false;
                 }
                 in_chunk         = true;

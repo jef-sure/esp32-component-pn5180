@@ -51,6 +51,16 @@ static void pn5180_iso14443_4_reset_state(pn5180_t *pn5180)
     pn5180->iso14443_fwt_ms        = 0;
 }
 
+// A card left in its ISO14443-4 session ignores REQA, WUPA and the activation frames, but answers
+// every I-block whatever its block number, also one meant for the next card selected. The session
+// is closed with S(DESELECT) before another activation (HLTA if the card does not acknowledge it).
+static void pn5180_14443_4_close_session(pn5180_t *pn5180)
+{
+    if (pn5180->iso14443_layer4_active) {
+        pn5180_mifare_halt(pn5180);
+    }
+}
+
 // Sends one ISO14443-4 block and receives the answer. timeout_ms is the frame waiting time.
 static rx_result_t pn5180_iso14443_4_exchange_frame(pn5180_t *pn5180, const char *operation, const uint8_t *tx, size_t tx_len, int64_t timeout_ms,
                                                     uint8_t *rx_buf, size_t rx_buf_size, uint16_t *received)
@@ -129,7 +139,8 @@ static bool pn5180_iso14443_4_apply_ats(pn5180_t *pn5180, const uint8_t *ats, ui
 
     pn5180->iso14443_frame_size = (uint16_t)(pn5180_iso14443_4_fs_table[fsci] - 2u);
     if (fwi > 14) {
-        fwi = 14;
+        // FWI 15 is reserved; ISO14443-4 reads it as the default 4, as the NXP reader library does.
+        fwi = 4;
     }
     pn5180->iso14443_fwt_ms = (((302LL << fwi) + 3625LL) + 999LL) / 1000LL;
     if (pn5180->iso14443_fwt_ms < 1) {
@@ -297,7 +308,9 @@ static bool pn5180_14443_setup_rf(pn5180_t *pn5180)
 {
     if (pn5180->is_rf_on) {
         if (pn5180->rf_config_loaded && pn5180->tx_config == PN5180_14443A_RF_CONFIG) {
-            return true;
+            // The cached flag is not taken on trust: pn5180_set_rf_on() checks that the field is
+            // really on and switches it on again if it dropped.
+            return pn5180_set_rf_on(pn5180);
         }
         pn5180_set_rf_off(pn5180);
         // Cards return to their idle state only after the field was off long enough.
@@ -634,6 +647,10 @@ static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, int max_cards, p
         *status = PN5180_POLL_TRANSPORT_ERROR;
         return NULL;
     }
+    // A card left in its ISO14443-4 session ignores REQA, and the halt of the first card found
+    // would go to it as S(DESELECT) instead: the session is closed first.
+    pn5180_14443_4_close_session(pn5180);
+    int repeats = 0;
     while (true) {
         uint8_t atqa[2] = {0, 0};
         bool    fatal   = false;
@@ -659,9 +676,14 @@ static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, int max_cards, p
             if (uids == NULL) {
                 *status = PN5180_POLL_PROTOCOL_ERROR;
             }
+            // Back to IDLE: cards left in the middle of the anticollision would not answer the
+            // REQA of the next poll.
+            pn5180_mifare_halt(pn5180);
             break;
         }
-        // A card that shows up again did not take the HLTA: the scan would find it forever.
+        // A card that shows up again did not take the HLTA, which can be a lost frame: it is
+        // halted once more. A card that keeps coming back would be found forever: the second
+        // repeat ends the scan.
         bool duplicate = false;
         for (int i = 0; uids != NULL && i < uids->uids_count; i++) {
             if (uids->uids[i].uid_length == full_uid_len && memcmp(uids->uids[i].uid, full_uid, (size_t)full_uid_len) == 0) {
@@ -670,9 +692,13 @@ static pn5180_uids_array_t *pn5180_14443_poll(pn5180_t *pn5180, int max_cards, p
             }
         }
         if (duplicate) {
-            ESP_LOGW(TAG, "Card answered again after HLTA, ending the scan");
             pn5180_mifare_halt(pn5180);
-            break;
+            if (++repeats > 1) {
+                ESP_LOGW(TAG, "Card answered again after HLTA, ending the scan");
+                break;
+            }
+            PN5180_LOGD(TAG, "Card answered again after HLTA, halted once more");
+            continue;
         }
         card_count++;
         PN5180_LOGD(TAG, "Found Card %d: UID Len %d", card_count, full_uid_len);
@@ -749,12 +775,27 @@ static bool pn5180_14443_detect_ultralight_variant(pn5180_t *pn5180, pn5180_uid_
     *subtype      = PN5180_MIFARE_ULTRALIGHT;
     *blocks_count = 16;
 
-    // Attempt GET_VERSION command via RF transmission
-    pn5180_enable_crc(pn5180);
-
-    PN5180_LOGD(TAG, "Sending GET_VERSION: 0x%02X", get_version_cmd);
     size_t             rx_len = 0;
-    pn5180_rf_result_t result = pn5180_rf_transceive(pn5180, &get_version_cmd, 1, 0, response, sizeof(response), &rx_len, PN5180_TIMEOUT_MIFARE_READ_US, NULL);
+    pn5180_rf_result_t result = PN5180_RF_TIMEOUT;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        pn5180_enable_crc(pn5180);
+        PN5180_LOGD(TAG, "Sending GET_VERSION: 0x%02X", get_version_cmd);
+        result = pn5180_rf_transceive(pn5180, &get_version_cmd, 1, 0, response, sizeof(response), &rx_len, PN5180_TIMEOUT_MIFARE_READ_US, NULL);
+        // A card without GET_VERSION answers with a 4-bit NAK (one byte with an RX error) or not at
+        // all. Anything else that is not a full answer is an answer damaged on the way: taken for "no
+        // GET_VERSION" it would leave an NTAG with the size of an Ultralight. The card is selected
+        // again, whichever state the damaged exchange left it in, and asked once more.
+        bool damaged = (result != PN5180_RF_OK || rx_len < 8) && result != PN5180_RF_TIMEOUT && result != PN5180_RF_FATAL &&
+                       !(result == PN5180_RF_RX_ERROR && rx_len == 1);
+        if (!damaged || attempt > 0) {
+            break;
+        }
+        PN5180_LOGD(TAG, "GET_VERSION answer damaged (result=%d, rx_len=%u), asking again", (int)result, (unsigned)rx_len);
+        pn5180_disable_crc(pn5180);
+        if (!pn5180_14443_reselect(pn5180, uid)) {
+            break;
+        }
+    }
     if (result != PN5180_RF_OK || rx_len < 8) {
         // No GET_VERSION: an original Ultralight or an Ultralight C. They share ATQA and SAK; only the
         // Ultralight C answers AUTHENTICATE (1Ah) with AFh and an 8-byte challenge. The failed GET_VERSION
@@ -1242,6 +1283,11 @@ static bool _pn5180_14443_detect_card_type_and_capacity( //
     bool need_reselection = false;
     // Determine card type from SAK
     uint8_t card_type = uid->sak & 0x7F;
+    if ((card_type == 0x28 || card_type == 0x38) && uid->subtype == PN5180_MIFARE_DESFIRE) {
+        // MIFARE Classic emulation on an ISO14443-4 card whose ISO14443-4 side the caller chose
+        // (see select_by_uid): the choice stays.
+        card_type = 0x20;
+    }
     switch (card_type) {
     case 0x00: // MIFARE Ultralight or Ultralight C
         uid->subtype  = PN5180_MIFARE_ULTRALIGHT;
@@ -1333,10 +1379,12 @@ static bool pn5180_14443_select_by_uid( //
     uint8_t level_data[5]; // 4 data bytes + 1 BCC
     uint8_t atqa[2] = {0, 0};
 
+    prepare_14443A_activation(pn5180);
+    // The card of the last session would also answer the commands meant for this one.
+    pn5180_14443_4_close_session(pn5180);
     // Reset Layer 4 state for new selection
     pn5180_iso14443_4_reset_state(pn5180);
 
-    prepare_14443A_activation(pn5180);
     if (!pn5180_14443_send_wupa(pn5180, atqa)) {
         ESP_LOGE(TAG, "No card in field for direct selection");
         pn5180_clear_all_irqs(pn5180);

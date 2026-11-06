@@ -460,12 +460,19 @@ done:
 /* ---- Type 2: Ultralight, NTAG ---- */
 
 // Address of the first byte behind the user memory of a detected Type 2 tag: the dynamic lock
-// bytes, the configuration pages or the end of the tag follow there. 0 if the tag was not detected.
+// bytes, the configuration pages or the end of the tag follow there. 0 if the size is not known.
 static size_t type2_user_memory_end(const pn5180_uid_t *uid)
 {
     size_t end_page = 0;
     switch (uid->subtype) {
     case PN5180_MIFARE_ULTRALIGHT:
+        // A guess, not a size: every tag that does not answer GET_VERSION is detected as Ultralight,
+        // the NTAG203 with its 144 bytes among them, and so is an NTAG whose answer was lost. As for a
+        // tag of unknown type, the capability container alone bounds the data area (the PN532
+        // component does the same); behind page 15 of an original Ultralight there is nothing a write
+        // could reach, the card refuses those addresses.
+        end_page = 0;
+        break;
     case PN5180_MIFARE_NTAG210:
         end_page = 16;
         break;
@@ -922,6 +929,13 @@ static pn5180_ndef_result_t classic_read_sectors(pn5180_proto_t *proto, pn5180_u
         }
     }
 
+    if (scan == TLV_SCAN_MORE && read_ok && !no_memory &&
+        pn5180_ndef_tlv_find_ndef(stream.data, stream.len, &tlv_pos, &ndef_offset, &ndef_len)) {
+        // Every sector the directory lists was read and the NDEF TLV runs past the last one: the
+        // tag is inconsistent, as a Type 2 or Type 5 message longer than its data area.
+        free(stream.data);
+        return PN5180_NDEF_ERR_PARSE_FAILED;
+    }
     return stream_finish(&stream, scan == TLV_SCAN_FOUND, read_ok, no_memory, ndef_offset, ndef_len, out_msg);
 }
 

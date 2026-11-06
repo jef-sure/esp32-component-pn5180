@@ -12,6 +12,8 @@ static fake_auth_fn s_auth;
 static void        *s_card_ctx;
 static int          s_frame_count;
 static int          s_rf_on_count;
+static bool         s_field_on;     // the field really is on (pn5180->is_rf_on is the driver's cached view)
+static bool         s_rf_on_fails;  // FIELD_ON does not bring the field up (RF collision avoidance)
 static int64_t      s_time_us;
 static uint32_t     s_registers[64];
 static uint32_t     s_random_state;
@@ -22,6 +24,8 @@ pn5180_t *fake_pn5180_create(void)
     pn5180->hw_rx_timeout = true;
     s_frame_count         = 0;
     s_rf_on_count         = 0;
+    s_field_on            = false;
+    s_rf_on_fails         = false;
     s_card                = NULL;
     s_auth                = NULL;
     s_card_ctx            = NULL;
@@ -52,6 +56,12 @@ int fake_frame_count(void)
 int fake_rf_on_count(void)
 {
     return s_rf_on_count;
+}
+
+void fake_drop_field(bool stays_off)
+{
+    s_field_on    = false;
+    s_rf_on_fails = stays_off;
 }
 
 bool fake_tx_crc_enabled(void)
@@ -104,7 +114,8 @@ pn5180_rf_result_t pn5180_rf_transceive(pn5180_t *pn5180, const uint8_t *tx, siz
 
     s_frame_count++;
     pn5180_rf_result_t result = PN5180_RF_TIMEOUT;
-    if (s_card != NULL) {
+    // Without the field no card can answer.
+    if (s_card != NULL && s_field_on) {
         result = s_card(s_card_ctx, tx, tx_len, tx_last_bits, local_rx, sizeof(local_rx), &local_len, timeout_us, &local_status);
     }
     if (timeout_us == 0) {
@@ -205,8 +216,27 @@ bool pn5180_load_rf_config(pn5180_t *pn5180, uint8_t tx_conf)
     return true;
 }
 
+// As the driver: without field a card loses its ISO14443-4 session.
+static void fake_session_lost(pn5180_t *pn5180)
+{
+    pn5180->iso14443_layer4_active = false;
+    pn5180->iso14443_block_number  = 0;
+}
+
 bool pn5180_set_rf_on(pn5180_t *pn5180)
 {
+    // As the driver: the cached flag is checked against the real field.
+    if (pn5180->is_rf_on) {
+        if (s_field_on) {
+            return true;
+        }
+        pn5180->is_rf_on = false;
+        fake_session_lost(pn5180);
+    }
+    if (s_rf_on_fails) {
+        return false;
+    }
+    s_field_on       = true;
     pn5180->is_rf_on = true;
     s_rf_on_count++;
     return true;
@@ -214,6 +244,8 @@ bool pn5180_set_rf_on(pn5180_t *pn5180)
 
 bool pn5180_set_rf_off(pn5180_t *pn5180)
 {
+    fake_session_lost(pn5180);
+    s_field_on       = false;
     pn5180->is_rf_on = false;
     return true;
 }

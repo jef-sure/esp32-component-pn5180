@@ -28,6 +28,10 @@ int fake_frame_count(void);
 /** How many times the RF field was switched on since the last fake_pn5180_create(). */
 int fake_rf_on_count(void);
 
+/** The field drops without the driver knowing (pn5180->is_rf_on stays true); with stays_off it
+ *  cannot be switched on again either. */
+void fake_drop_field(bool stays_off);
+
 /** True while the fake models the transmit CRC bit of CRC_TX_CONFIG (set by pn5180_enable_tx_crc). */
 bool fake_tx_crc_enabled(void);
 

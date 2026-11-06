@@ -421,6 +421,11 @@ static void scan_protocol(pn5180_proto_t *proto, const char *label)
     for (int i = 0; i < uids->uids_count; i++) {
         printf("Card %d: ", i + 1);
         process_card(proto, &uids->uids[i]);
+        // End the session before the next card: an ISO14443-4 card left in it would answer the
+        // commands meant for the next one too. The driver closes it on the next select as well.
+        if (proto->halt != NULL) {
+            proto->halt(proto);
+        }
         printf("\n");
     }
     free(uids);
@@ -445,6 +450,7 @@ void app_run(void)
     pn5180_proto_t *proto_15693 = pn5180_15693_init(pn5180, PN5180_15693_26KASK100);
     if (proto_15693 == NULL) {
         ESP_LOGE(TAG, "Failed to initialize ISO15693 protocol");
+        free(proto_14443);
         pn5180_deinit(pn5180, true);
         return;
     }

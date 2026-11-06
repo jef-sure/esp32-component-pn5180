@@ -129,6 +129,12 @@ static pn5180_rf_result_t sim_a_type2(sim_a_card_t *card, const uint8_t *tx, siz
         if (tx_len != 1 || !card->has_get_version) {
             return sim_a_nak(card, rx, rx_len);
         }
+        if (card->damage_get_version > 0) {
+            // The answer arrives with a CRC error; the card itself stays selected.
+            card->damage_get_version--;
+            answer(rx, rx_size, rx_len, card->version, sizeof(card->version));
+            return PN5180_RF_RX_ERROR;
+        }
         return answer(rx, rx_size, rx_len, card->version, sizeof(card->version));
     case 0x1A: { // AUTHENTICATE (Ultralight C)
         if (tx_len != 2 || !card->is_ultralight_c) {
@@ -379,6 +385,13 @@ static pn5180_rf_result_t sim_a_iso_dep(sim_a_card_t *card, const uint8_t *tx, s
     uint8_t out[300];
     size_t  out_len = 0;
 
+    // Only valid blocks are taken: I-block 000x xx1x, R-block 101x x01x, S-block 11xx x010. Frames of
+    // ISO14443-3 (anticollision, SELECT, HLTA, RATS) are none of them and are ignored.
+    bool valid_block = (pcb & 0xE2) == 0x02 || (pcb & 0xE6) == 0xA2 || (pcb & 0xC7) == 0xC2;
+    if (!valid_block) {
+        return PN5180_RF_TIMEOUT;
+    }
+
     if (card->sends_empty_chain && (pcb & 0xC0) != 0xC0) {
         // I-block with the chaining bit and no data, block number as the reader expects it
         if ((pcb & 0xC0) == 0x00) {
@@ -475,6 +488,10 @@ pn5180_rf_result_t sim_a_card(void *ctx, const uint8_t *tx, size_t tx_len, uint8
         if (tx[0] != 0x26 && tx[0] != 0x52) {
             return PN5180_RF_TIMEOUT;
         }
+        if (card->state == SIM_A_PROTOCOL) {
+            // ISO14443-4: in its session the card takes valid blocks only and ignores anything else.
+            return PN5180_RF_TIMEOUT;
+        }
         if (card->state != SIM_A_IDLE && card->state != SIM_A_HALT) {
             // A selected card treats the request as an error and falls back without answering.
             sim_a_leave_selected_state(card, false);
@@ -527,6 +544,10 @@ pn5180_rf_result_t sim_a_card(void *ctx, const uint8_t *tx, size_t tx_len, uint8
                 tail[i] = cl[known_bytes + i];
             }
             (void)known_extra; // the split-byte merge happens in the driver
+            if (card->damage_anticollision > 0) {
+                card->damage_anticollision--;
+                tail[tail_len - 1] ^= 0xFF; // the BCC no longer matches
+            }
             return answer(rx, rx_size, rx_len, tail, tail_len); // no CRC in the anticollision answer
         }
         if (tx_len == 7 && tx[1] == 0x70 && memcmp(&tx[2], cl, 5) == 0) { // SELECT
@@ -544,6 +565,10 @@ pn5180_rf_result_t sim_a_card(void *ctx, const uint8_t *tx, size_t tx_len, uint8
 
     case SIM_A_ACTIVE:
         if (tx_len == 2 && tx[0] == 0x50 && tx[1] == 0x00) { // HLTA
+            if (card->lost_hlta > 0) {
+                card->lost_hlta--; // the frame does not reach the card: it stays selected
+                return PN5180_RF_TIMEOUT;
+            }
             sim_a_leave_selected_state(card, !card->ignores_hlta);
             return PN5180_RF_TIMEOUT;
         }
@@ -554,7 +579,7 @@ pn5180_rf_result_t sim_a_card(void *ctx, const uint8_t *tx, size_t tx_len, uint8
             return sim_a_classic(card, tx, tx_len, rx, rx_size, rx_len);
         }
         if (tx_len == 2 && tx[0] == 0xE0) { // RATS
-            const uint8_t ats[5] = {0x05, (uint8_t)(0x70 | card->ats_fsci), 0x80, 0x81, 0x02};
+            const uint8_t ats[5] = {0x05, (uint8_t)(0x70 | card->ats_fsci), 0x80, (card->ats_tb1 != 0) ? card->ats_tb1 : 0x81, 0x02};
             card->state          = SIM_A_PROTOCOL;
             card->block_number   = 1;
             card->command_len    = 0;
@@ -593,6 +618,22 @@ void sim_a_init_ntag213(sim_a_card_t *card)
     // Empty NDEF TLV followed by the terminator
     const uint8_t empty[3] = {0x03, 0x00, 0xFE};
     memcpy(&card->memory[4 * 4], empty, sizeof(empty));
+}
+
+void sim_a_init_ntag215(sim_a_card_t *card)
+{
+    static const uint8_t version[8] = {0x00, 0x04, 0x04, 0x02, 0x01, 0x00, 0x11, 0x03};
+    sim_a_init_ntag213(card);
+    card->page_count = 135;
+    memcpy(card->version, version, sizeof(version));
+    card->memory[3 * 4 + 2] = 0x3E; // 496 bytes of data area
+}
+
+void sim_a_init_ntag203(sim_a_card_t *card)
+{
+    sim_a_init_ntag213(card);
+    card->page_count      = 42;
+    card->has_get_version = false; // NTAG203 predates GET_VERSION: it answers with a NAK
 }
 
 void sim_a_init_ultralight(sim_a_card_t *card, bool ultralight_c)
@@ -675,8 +716,11 @@ pn5180_rf_result_t sim_a_field(void *ctx, const uint8_t *tx, size_t tx_len, uint
     if (answered == 0) {
         return PN5180_RF_TIMEOUT;
     }
-    if (answered == 1 || (tx_len < 2) || (tx[1] == 0x70)) {
+    bool anticollision = tx_len >= 2 && (tx[0] == 0x93 || tx[0] == 0x95 || tx[0] == 0x97) && tx[1] != 0x70;
+    if (answered == 1 || !anticollision) {
         // One card answers on its own; a SELECT with the right UID part reaches one card only.
+        // Other frames that several cards answer (an I-block that a card left in its ISO14443-4
+        // session takes as well) are received from the first card: the nearer one drowns the other.
         int i = answering[0];
         if (rx != NULL && lens[i] > 0) {
             memcpy(rx, answers[i], (lens[i] < rx_size) ? lens[i] : rx_size);

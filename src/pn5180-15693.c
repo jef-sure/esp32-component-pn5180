@@ -66,7 +66,9 @@ static bool pn5180_15693_setup_rf(pn5180_t *pn5180, uint8_t rf_config)
         // The tags keep their Quiet and Selected state when the right configuration is loaded;
         // cycling the field costs about 10 ms of dead time and resets every tag in the field.
         if (pn5180->rf_config_loaded && pn5180->tx_config == rf_config) {
-            return true;
+            // The cached flag is not taken on trust: pn5180_set_rf_on() checks that the field is
+            // really on and switches it on again if it dropped.
+            return pn5180_set_rf_on(pn5180);
         }
         pn5180_set_rf_off(pn5180);
         // Tags drop their Quiet and Selected state only after the field was off long enough.
@@ -131,16 +133,23 @@ static size_t pn5180_iso15693_build_cmd(uint8_t *cmd, size_t cmd_size, uint8_t f
     return 10;
 }
 
-static bool pn5180_iso15693_collect_uid(pn5180_uids_array_t **uids, const uint8_t *uid, uint8_t uid_len, uint16_t agc)
+typedef enum
+{
+    ISO15693_COLLECT_NEW,       /**< the UID was added */
+    ISO15693_COLLECT_KNOWN,     /**< the UID is listed already (its signal strength is updated), or invalid */
+    ISO15693_COLLECT_NO_MEMORY, /**< the array could not grow */
+} iso15693_collect_t;
+
+static iso15693_collect_t pn5180_iso15693_collect_uid(pn5180_uids_array_t **uids, const uint8_t *uid, uint8_t uid_len, uint16_t agc)
 {
     if (uids == NULL) {
         PN5180_LOGD(TAG, "collect_uid: uids container is NULL");
-        return false;
+        return ISO15693_COLLECT_KNOWN;
     }
 
     if (uid == NULL || uid_len == 0 || uid_len > sizeof(((pn5180_uid_t *)0)->uid)) {
         PN5180_LOGD(TAG, "collect_uid: invalid uid");
-        return false;
+        return ISO15693_COLLECT_KNOWN;
     }
 
     if (*uids != NULL) {
@@ -148,7 +157,7 @@ static bool pn5180_iso15693_collect_uid(pn5180_uids_array_t **uids, const uint8_
             if ((*uids)->uids[i].uid_length == uid_len && memcmp((*uids)->uids[i].uid, uid, uid_len) == 0) {
                 (*uids)->uids[i].agc = agc;
                 PN5180_LOGD(TAG, "collect_uid: duplicate UID");
-                return false;
+                return ISO15693_COLLECT_KNOWN;
             }
         }
     }
@@ -157,24 +166,24 @@ static bool pn5180_iso15693_collect_uid(pn5180_uids_array_t **uids, const uint8_
         *uids = calloc(1, sizeof(pn5180_uids_array_t));
         if (*uids == NULL) {
             ESP_LOGE(TAG, "Memory allocation failed for ISO15693 UIDs");
-            return false;
+            return ISO15693_COLLECT_NO_MEMORY;
         }
         PN5180_LOGD(TAG, "collect_uid: first UID stored");
         (*uids)->uids_count = 1;
         pn5180_iso15693_fill_uid(&(*uids)->uids[0], uid, uid_len, agc);
-        return true;
+        return ISO15693_COLLECT_NEW;
     }
 
     pn5180_uids_array_t *new_uids = realloc(*uids, sizeof(pn5180_uids_array_t) + ((*uids)->uids_count * sizeof(pn5180_uid_t)));
     if (new_uids == NULL) {
         ESP_LOGE(TAG, "Memory allocation failed for ISO15693 UIDs");
-        return false;
+        return ISO15693_COLLECT_NO_MEMORY;
     }
     *uids                 = new_uids;
     pn5180_uid_t *new_uid = &(*uids)->uids[(*uids)->uids_count];
     pn5180_iso15693_fill_uid(new_uid, uid, uid_len, agc);
     (*uids)->uids_count++;
-    return true;
+    return ISO15693_COLLECT_NEW;
 }
 
 /**
@@ -216,19 +225,22 @@ static size_t pn5180_iso15693_build_inventory_cmd(pn5180_t *pn5180, uint8_t *sen
  * @brief Try single-slot inventory to read one tag at a time.
  * Uses a Stack-based Depth-First Search (DFS) to resolve collisions.
  */
-static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_array_t **uids, bool *fatal)
+static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_array_t **uids, bool *fatal, bool *no_memory)
 {
     // Safety limit. Two tags that differ only in the last UID bit take 2 * 64 + 1 scans.
     const int max_total_scans = 192;
     int       scan_count      = 0;
     int       total_found     = 0;
+    int       found_in_pass   = 0;
 
-    // Stack for DFS anticollision
-    typedef struct
+    // Stack for DFS anticollision. Packed: 10 bytes per entry instead of 16 (24 with the old field
+    // order), which keeps the stack of this function near 0.8 KB; the members are copied, never
+    // taken by address.
+    typedef struct __attribute__((packed))
     {
-        uint8_t  len;
         uint64_t val;
-        int      retries;
+        uint8_t  len;
+        uint8_t  retries;
     } mask_t;
 
     mask_t stack[ISO15693_MAX_MASK_BITS + 2]; // one branch waits per mask bit, plus the two just pushed
@@ -240,7 +252,22 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
     stack[stack_ptr].retries = 0;
     stack_ptr++;
 
-    while (stack_ptr > 0 && scan_count < max_total_scans) {
+    while (scan_count < max_total_scans) {
+        if (stack_ptr == 0) {
+            // The receiver takes a tag that answers at under half the strength of another one for
+            // no signal (PN5180 datasheet: the bit threshold is 50 % of the start bit), so the
+            // stronger tag's answer arrives clean and hides the weaker one under the same mask. The
+            // tags found are quiet now: after a pass that found new tags the whole field is asked
+            // once more, which costs one frame when nobody is left.
+            if (found_in_pass == 0) {
+                break;
+            }
+            found_in_pass            = 0;
+            stack[stack_ptr].len     = 0;
+            stack[stack_ptr].val     = 0;
+            stack[stack_ptr].retries = 0;
+            stack_ptr++;
+        }
         // Pop the current mask
         stack_ptr--;
         mask_t current = stack[stack_ptr];
@@ -342,35 +369,33 @@ static bool pn5180_15693_inventory_single_slot(pn5180_t *pn5180, pn5180_uids_arr
             continue;
         }
 
-        // Error-free frame, check data
+        // Error-free frame: flags, DSFID and the UID
         if (rx_len >= 10) {
-            {
-                // rx_buf[1]=DSFID, [2..9]=UID
-                // Check flags in rx_buf[0]? Usually 0x00.
+            uint8_t *uid_ptr = &rx_buf[2];
+            PN5180_LOGD(TAG, "Tag Found! UID: %02x%02x%02x%02x%02x%02x%02x%02x", uid_ptr[0], uid_ptr[1], uid_ptr[2], uid_ptr[3], uid_ptr[4], uid_ptr[5],
+                        uid_ptr[6], uid_ptr[7]);
 
-                // PN5180_LOGD(TAG, "scan %d: data received", scan_count);
-                if (1) { // Accept any valid frame structure
-                    uint8_t *uid_ptr = &rx_buf[2];
-                    PN5180_LOGD(TAG, "Tag Found! UID: %02x%02x%02x%02x%02x%02x%02x%02x", uid_ptr[0], uid_ptr[1], uid_ptr[2], uid_ptr[3], uid_ptr[4], uid_ptr[5],
-                                uid_ptr[6], uid_ptr[7]);
+            uint32_t agc_reg = 0;
+            pn5180_read_register(pn5180, PN5180_RF_STATUS, &agc_reg);
+            uint16_t current_agc = (uint16_t)(agc_reg & PN5180_RF_STATUS_AGC_MASK);
+            PN5180_LOGD(TAG, "AGC Value: %u", (unsigned)current_agc);
 
-                    uint32_t agc_reg = 0;
-                    pn5180_read_register(pn5180, PN5180_RF_STATUS, &agc_reg);
-                    uint16_t current_agc = (uint16_t)(agc_reg & PN5180_RF_STATUS_AGC_MASK);
-                    PN5180_LOGD(TAG, "AGC Value: %u", (unsigned)current_agc);
-
-                    bool is_new = pn5180_iso15693_collect_uid(uids, uid_ptr, 8, current_agc);
-                    if (is_new) {
-                        total_found++;
-                    }
-                    // Quiet this tag so we don't see it again in parent recursions
-                    pn5180_iso15693_stay_quiet(pn5180, uid_ptr);
-                }
+            iso15693_collect_t collected = pn5180_iso15693_collect_uid(uids, uid_ptr, 8, current_agc);
+            if (collected == ISO15693_COLLECT_NO_MEMORY) {
+                // The tag is not silenced: it was not listed, and the next poll is to find it.
+                *no_memory = true;
+                break;
             }
+            if (collected == ISO15693_COLLECT_NEW) {
+                total_found++;
+                found_in_pass++;
+            }
+            // Quiet this tag so we don't see it again in parent recursions
+            pn5180_iso15693_stay_quiet(pn5180, uid_ptr);
         }
     }
 
-    if (stack_ptr > 0 && scan_count >= max_total_scans) {
+    if ((stack_ptr > 0 || found_in_pass > 0) && scan_count >= max_total_scans) {
         ESP_LOGW(TAG, "Inventory stopped after %d scans, more tags may be in the field", scan_count);
     }
 
@@ -640,9 +665,10 @@ static bool _pn5180_15693_detect_card_type_and_capacity( //
     return false;
 }
 
-static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180, bool *fatal)
+static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180, bool *fatal, bool *no_memory)
 {
-    *fatal = false;
+    *fatal     = false;
+    *no_memory = false;
     if (pn5180 == NULL) {
         PN5180_LOGD(TAG, "get_all_uids: pn5180 is NULL");
         return NULL;
@@ -662,12 +688,12 @@ static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180, bool *fa
             continue;
         }
 
-        pn5180_15693_inventory_single_slot(pn5180, &uids, fatal);
+        pn5180_15693_inventory_single_slot(pn5180, &uids, fatal, no_memory);
 
         // ASK 100 % is only the fallback: tags found with the first configuration end the search.
         // A second pass would also leave the other RF configuration loaded and mix the signal
         // strength values of two passes.
-        if ((uids != NULL && uids->uids_count > 0) || *fatal) {
+        if ((uids != NULL && uids->uids_count > 0) || *fatal || *no_memory) {
             break;
         }
     }
@@ -697,7 +723,8 @@ static pn5180_uids_array_t *pn5180_15693_get_all_uids(pn5180_t *pn5180, bool *fa
 static pn5180_uids_array_t *_pn5180_15693_get_all_uids(pn5180_proto_t *proto)
 {
     bool fatal;
-    return pn5180_15693_get_all_uids(proto->pn5180, &fatal);
+    bool no_memory;
+    return pn5180_15693_get_all_uids(proto->pn5180, &fatal, &no_memory);
 }
 
 pn5180_uids_array_t *pn5180_15693_get_all_uids_ex(pn5180_proto_t *proto, pn5180_poll_status_t *status)
@@ -705,13 +732,20 @@ pn5180_uids_array_t *pn5180_15693_get_all_uids_ex(pn5180_proto_t *proto, pn5180_
     pn5180_poll_status_t local_status = PN5180_POLL_INVALID_ARGUMENT;
     pn5180_uids_array_t *uids         = NULL;
     if (proto != NULL && proto->pn5180 != NULL) {
-        bool fatal = false;
-        uids       = pn5180_15693_get_all_uids(proto->pn5180, &fatal);
+        bool fatal     = false;
+        bool no_memory = false;
+        uids           = pn5180_15693_get_all_uids(proto->pn5180, &fatal, &no_memory);
         if (uids != NULL) {
             local_status = PN5180_POLL_FOUND;
-        } else {
+        } else if (fatal || !proto->pn5180->is_rf_on) {
             // The inventory tries two RF configurations; if the field is still off, none could be set up.
-            local_status = (proto->pn5180->is_rf_on && !fatal) ? PN5180_POLL_NO_TARGET : PN5180_POLL_TRANSPORT_ERROR;
+            local_status = PN5180_POLL_TRANSPORT_ERROR;
+        } else if (no_memory) {
+            local_status = PN5180_POLL_NO_MEMORY;
+        } else {
+            // Also when only damaged answers or collisions came: the PN5180 reports noise that way
+            // too, so they do not prove that a tag is in the field (no PN5180_POLL_PROTOCOL_ERROR).
+            local_status = PN5180_POLL_NO_TARGET;
         }
     }
     if (status != NULL) {
