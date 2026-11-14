@@ -1,5 +1,24 @@
 # Changelog
 
+## v 0.8.3 - 2026-11-14
+
+The documentation moves into `docs/`, in English and Russian. No code changes.
+
+Documentation:
+
+- `docs/en/` and `docs/ru/`: getting started, how the driver works, finding cards, ISO14443A cards, ISO14443-4 and
+  APDUs, ISO15693 tags, NDEF, wiring with the SPI bus and the IRQ pin, troubleshooting, a reference of every public
+  type, function and constant, and development. The same pages are on https://jef-sure.github.io/pn5180/.
+- `README.md` is the front page: what the component is, a short example, the map of the pages; `README.ru.md` is the
+  same in Russian.
+- Each example has a README: `simple_main`, `app_logic`, `ndef`.
+- Described for the first time: the table of card types with the GET_VERSION storage sizes; that the ISO15693
+  inventory loads ASK 10 % itself, so `setup_rf()` between two polls switches the field off and on when the protocol
+  was created with ASK 100 %; the results of `block_write()` and `pn5180_mifare_block_write()`; which callbacks the
+  ISO15693 object lacks (`authenticate` is `NULL`); leaving LPCD mode with `pn5180_recover()`; GPIO 12 of the
+  classic ESP32 as a strapping pin.
+- The component archive holds the documentation and the READMEs of the examples.
+
 ## v 0.8.2 - 2026-11-06
 
 Fixes from a review of 0.8.1.
